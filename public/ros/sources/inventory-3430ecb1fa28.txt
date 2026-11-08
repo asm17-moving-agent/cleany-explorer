@@ -1,0 +1,181 @@
+ros2_ws/src/cleany_navigation/cleany_navigation/pan_motion_gate_node.py
+Review: 2026-11-02
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: c4acb9766974197c30c59cf5dac140cc51b069500b5b22470ace82fbc2871ed3
+
+1: """Velocity interlock using backend feedback; this node does not own TF."""
+2: from __future__ import annotations
+3: 
+4: import json
+5: import math
+6: import time
+7: import numpy as np
+8: 
+9: import rclpy
+10: from geometry_msgs.msg import Twist
+11: from nav_msgs.msg import Odometry
+12: from rclpy.clock import Clock, ClockType
+13: from rclpy.node import Node
+14: from rclpy.qos import qos_profile_sensor_data
+15: from sensor_msgs.msg import JointState, PointCloud2
+16: from std_msgs.msg import Float64, String
+17: 
+18: from cleany_navigation.pan_motion_gate import PanGate, PanTracker
+19: from cleany_navigation.point_cloud import cloud_xyz
+20: from cleany_navigation.transforms import stamp
+21: 
+22: 
+23: def velocity(msg) -> tuple[float, float, float]:
+24:     return msg.linear.x, msg.linear.y, msg.angular.z
+25: 
+26: 
+27: class PanMotionGate(Node):
+28:     """Align the head with requested motion and optionally gate base commands.
+29: 
+30:     Subscriptions:
+31:         nav2/cmd_vel (geometry_msgs/msg/Twist): Desired motion.
+32:         joint_states (sensor_msgs/msg/JointState): Measured pan position and speed.
+33:         odom (nav_msgs/msg/Odometry) and camera/head/depth/points
+34:             (sensor_msgs/msg/PointCloud2): Stop and freshness evidence in gating mode.
+35: 
+36:     Publishers:
+37:         pan_ready/cmd_vel (geometry_msgs/msg/Twist): Gated base command.
+38:         head_pan/command (std_msgs/msg/Float64): Pan target in radians.
+39:         head_pan/state (std_msgs/msg/String): JSON alignment and gate state.
+40: 
+41:     QoS:
+42:         Joint, odometry and depth inputs use sensor_data.
+43: 
+44:     Notes:
+45:         All endpoint names above are configurable defaults. observation_only
+46:         omits the base command output and odometry/depth subscriptions but still
+47:         commands head pan. Timing checks run on a steady timer.
+48:     """
+49:     def __init__(self) -> None:
+50:         super().__init__('pan_motion_gate')
+51:         defaults = dict(observation_only=False, target_change_rad=math.radians(10.), tracking_minimum_speed=.01,
+52:                         allow_mixed_motion=False, translation_angle_deg=0., allow_reverse=True, allow_lateral=False, angle_tolerance=.04, settle_s=.2,
+53:                         source_timeout_s=.5, command_timeout_s=.5,
+54:                         linear_stopped=.01, angular_stopped=.02,
+55:                         pan_stopped=.05, update_period_s=.05,
+56:                         pan_min_position_rad=-math.pi, pan_max_position_rad=math.pi,
+57:                         command_topic='nav2/cmd_vel', output_topic='pan_ready/cmd_vel',
+58:                         pan_command_topic='head_pan/command', state_topic='head_pan/state',
+59:                         joint_states_topic='joint_states', odom_topic='odom',
+60:                         depth_topic='camera/head/depth/points', pan_joint='head_pan_joint',
+61:                         base_frame='base_link', depth_frame='head_camera_depth_frame')
+62:         for key, value in defaults.items():
+63:             self.declare_parameter(key, value)
+64:         self.p = p = {key: self.get_parameter(key).value for key in defaults}
+65:         for key in ('angle_tolerance', 'settle_s', 'source_timeout_s', 'command_timeout_s',
+66:                     'linear_stopped', 'angular_stopped', 'pan_stopped', 'update_period_s'):
+67:             if not math.isfinite(p[key]) or p[key] <= 0:
+68:                 raise ValueError(f'Invalid {key}')
+69:         if p['command_topic'] == p['output_topic']:
+70:             raise ValueError('Distinct input/output command topics required')
+71:         self.gate = PanGate(**{key: p[key] for key in ('allow_mixed_motion', 'translation_angle_deg', 'allow_reverse', 'allow_lateral', 'angle_tolerance',
+72:             'settle_s', 'source_timeout_s', 'linear_stopped', 'angular_stopped', 'pan_stopped',
+73:             'pan_min_position_rad', 'pan_max_position_rad')})
+74:         self.tracker = PanTracker(self.gate, p['target_change_rad'], p['tracking_minimum_speed'])
+75:         self.command = self.measured = (0., 0., 0.)
+76:         self.command_wall = self.joint_wall = self.odom_wall = self.depth_wall = -math.inf
+77:         self.clock_stamp = None
+78:         self.clock_advanced_wall = time.monotonic()
+79:         self.joint_stamp = self.odom_stamp = self.depth_stamp = -math.inf
+80:         self.pan = self.pan_speed = 0.
+81:         self.output = None if p['observation_only'] else self.create_publisher(Twist, p['output_topic'], 10)
+82:         self.pan_pub = self.create_publisher(Float64, p['pan_command_topic'], 10)
+83:         self.state = self.create_publisher(String, p['state_topic'], 10)
+84:         self.create_subscription(Twist, p['command_topic'], self.on_command, 10)
+85:         self.create_subscription(JointState, p['joint_states_topic'], self.on_joint, qos_profile_sensor_data)
+86:         if not p['observation_only']:
+87:             self.create_subscription(Odometry, p['odom_topic'], self.on_odom, qos_profile_sensor_data)
+88:             self.create_subscription(PointCloud2, p['depth_topic'], self.on_depth, qos_profile_sensor_data)
+89:         self.create_timer(p['update_period_s'], self.update, clock=Clock(clock_type=ClockType.STEADY_TIME))
+90: 
+91:     def on_command(self, msg: Twist) -> None:
+92:         self.command = velocity(msg)
+93:         if any(abs(v) > 1e-8 or not math.isfinite(v) for v in
+94:                (msg.linear.z, msg.angular.x, msg.angular.y)):
+95:             self.command = (math.nan, 0., 0.)
+96:         self.command_wall = time.monotonic()
+97: 
+98:     def on_odom(self, msg: Odometry) -> None:
+99:         if msg.child_frame_id != self.p['base_frame']:
+100:             self.odom_stamp = -math.inf
+101:             return
+102:         self.measured = velocity(msg.twist.twist)
+103:         self.odom_stamp, self.odom_wall = stamp(msg.header.stamp), time.monotonic()
+104: 
+105:     def on_depth(self, msg: PointCloud2) -> None:
+106:         try:
+107:             points = cloud_xyz(msg)
+108:             if msg.header.frame_id != self.p['depth_frame'] or not len(points):
+109:                 raise ValueError('Missing depth geometry or wrong frame')
+110:             if not np.isfinite(points).all():
+111:                 raise ValueError('Invalid depth points')
+112:         except ValueError:
+113:             self.depth_stamp = -math.inf
+114:             return
+115:         self.depth_stamp, self.depth_wall = stamp(msg.header.stamp), time.monotonic()
+116: 
+117:     def on_joint(self, msg: JointState) -> None:
+118:         if self.p['pan_joint'] not in msg.name:
+119:             return
+120:         index = msg.name.index(self.p['pan_joint'])
+121:         if index >= len(msg.position) or index >= len(msg.velocity):
+122:             self.joint_stamp = -math.inf
+123:             return
+124:         self.pan, self.pan_speed = msg.position[index], msg.velocity[index]
+125:         if not all(math.isfinite(v) for v in (self.pan, self.pan_speed)):
+126:             self.joint_stamp = -math.inf
+127:             return
+128:         self.joint_stamp, self.joint_wall = stamp(msg.header.stamp), time.monotonic()
+129: 
+130:     def update(self) -> None:
+131:         now = self.get_clock().now().nanoseconds / 1e9
+132:         wall = time.monotonic()
+133:         if self.p['observation_only']:
+134:             target, reason = self.tracker.target, 'STALE_TRACKING_INPUT'
+135:             if (0 <= now-self.joint_stamp <= self.p['source_timeout_s']
+136:                     and wall-self.joint_wall <= self.p['source_timeout_s']
+137:                     and wall-self.command_wall <= self.p['command_timeout_s']):
+138:                 target, reason = self.tracker.step(self.command, self.pan)
+139:                 self.pan_pub.publish(Float64(data=target))
+140:             self.state.publish(String(data=json.dumps(dict(stamp_s=now, sim_s=now,
+141:                 mode='observation_only', motion_authority=False, target=target,
+142:                 pan=self.pan, reason=reason, requested=self.command))))
+143:             return
+144:         if self.clock_stamp != now:
+145:             self.clock_stamp, self.clock_advanced_wall = now, wall
+146:         target, command, reason = self.gate.step(now, self.command, self.measured,
+147:             self.pan, self.pan_speed, self.joint_stamp, self.odom_stamp, self.depth_stamp)
+148:         if wall-self.command_wall > self.p['command_timeout_s'] or any(
+149:             wall-t > self.p['source_timeout_s'] for t in (self.joint_wall, self.odom_wall, self.depth_wall)):
+150:             command, reason = (0., 0., 0.), 'WALL_TIMEOUT'
+151:         if wall-self.clock_advanced_wall > self.p['command_timeout_s']:
+152:             command, reason = (0., 0., 0.), 'CLOCK_TIMEOUT'
+153:         if reason in ('WALL_TIMEOUT', 'CLOCK_TIMEOUT'):
+154:             self.gate.aligned_since = None
+155:         out = Twist()
+156:         out.linear.x, out.linear.y, out.angular.z = command
+157:         self.output.publish(out)
+158:         self.pan_pub.publish(Float64(data=target))
+159:         self.state.publish(String(data=json.dumps(dict(stamp_s=now, sim_s=now,
+160:             target=target, pan=self.pan, reason=reason, requested=self.command,
+161:             output=command, depth_stamp=self.depth_stamp))))
+162: 
+163: 
+164: def main(args: list[str] | None = None) -> None:
+165:     rclpy.init(args=args)
+166:     node = PanMotionGate()
+167:     try:
+168:         rclpy.spin(node)
+169:     except KeyboardInterrupt:
+170:         pass
+171:     finally:
+172:         if rclpy.ok() and node.output is not None:
+173:             node.output.publish(Twist())
+174:         node.destroy_node()
+175:         if rclpy.ok():
+176:             rclpy.shutdown()

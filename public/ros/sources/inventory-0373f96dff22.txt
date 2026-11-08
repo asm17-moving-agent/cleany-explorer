@@ -1,0 +1,144 @@
+ros2_ws/src/cleany_gazebo_sim/cleany_gazebo_sim/simulated_encoder_node.py
+Review: 2026-11-02
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 84f2adf3db46064fe47721da1deeefec9aa74742abe15de09d31b2c0fa739417
+
+1: from __future__ import annotations
+2: 
+3: import rclpy
+4: from rclpy.executors import ExternalShutdownException
+5: from rclpy.node import Node
+6: from rclpy.qos import qos_profile_sensor_data
+7: from sensor_msgs.msg import JointState
+8: 
+9: from cleany_gazebo_sim.simulated_encoder import SimulatedQuadratureEncoder
+10: 
+11: 
+12: class SimulatedEncoderNode(Node):
+13:     """Quantize simulated wheel angles into synthetic encoder feedback.
+14: 
+15:     Subscriptions:
+16:         joint_states (sensor_msgs/msg/JointState): Cumulative simulated angles.
+17: 
+18:     Publishers:
+19:         wheel_encoder/joint_states (sensor_msgs/msg/JointState): Quantized wheel
+20:             positions after configured scale and tick noise.
+21: 
+22:     QoS:
+23:         Both directions use sensor_data.
+24: 
+25:     Notes:
+26:         Topic and joint names are configurable defaults. Missing wheel samples
+27:         are ignored; synthetic encoder data is not measured hardware feedback.
+28:     """
+29: 
+30:     def __init__(self) -> None:
+31:         super().__init__('simulated_encoder')
+32:         self.declare_parameter('input_topic', 'joint_states')
+33:         self.declare_parameter(
+34:             'output_topic', 'wheel_encoder/joint_states'
+35:         )
+36:         self.declare_parameter('ticks_per_revolution', 3172)
+37:         self.declare_parameter('tick_noise_stddev', 0.0)
+38:         self.declare_parameter('random_seed', 42)
+39:         self.declare_parameter(
+40:             'front_left_joint', 'front_left_wheel_joint'
+41:         )
+42:         self.declare_parameter(
+43:             'front_right_joint', 'front_right_wheel_joint'
+44:         )
+45:         self.declare_parameter('rear_left_joint', 'rear_left_wheel_joint')
+46:         self.declare_parameter('rear_right_joint', 'rear_right_wheel_joint')
+47:         self.declare_parameter('front_left_scale', 1.0)
+48:         self.declare_parameter('front_right_scale', 1.0)
+49:         self.declare_parameter('rear_left_scale', 1.0)
+50:         self.declare_parameter('rear_right_scale', 1.0)
+51: 
+52:         self._joint_names = (
+53:             str(self.get_parameter('front_left_joint').value),
+54:             str(self.get_parameter('front_right_joint').value),
+55:             str(self.get_parameter('rear_left_joint').value),
+56:             str(self.get_parameter('rear_right_joint').value),
+57:         )
+58:         self._encoder = SimulatedQuadratureEncoder(
+59:             ticks_per_revolution=int(
+60:                 self.get_parameter('ticks_per_revolution').value
+61:             ),
+62:             wheel_scales=(
+63:                 float(self.get_parameter('front_left_scale').value),
+64:                 float(self.get_parameter('front_right_scale').value),
+65:                 float(self.get_parameter('rear_left_scale').value),
+66:                 float(self.get_parameter('rear_right_scale').value),
+67:             ),
+68:             tick_noise_stddev=float(
+69:                 self.get_parameter('tick_noise_stddev').value
+70:             ),
+71:             random_seed=int(self.get_parameter('random_seed').value),
+72:         )
+73:         input_topic = str(self.get_parameter('input_topic').value)
+74:         output_topic = str(self.get_parameter('output_topic').value)
+75:         self._publisher = self.create_publisher(
+76:             JointState, output_topic, qos_profile_sensor_data
+77:         )
+78:         self.create_subscription(
+79:             JointState,
+80:             input_topic,
+81:             self._on_joint_state,
+82:             qos_profile_sensor_data,
+83:         )
+84: 
+85:     def _on_joint_state(self, message: JointState) -> None:
+86:         if len(message.position) < len(message.name):
+87:             self.get_logger().warning(
+88:                 'Ignoring JointState with fewer positions than names',
+89:                 throttle_duration_sec=5.0,
+90:             )
+91:             return
+92: 
+93:         position_by_name = dict(zip(message.name, message.position))
+94:         missing = [
+95:             joint_name
+96:             for joint_name in self._joint_names
+97:             if joint_name not in position_by_name
+98:         ]
+99:         if missing:
+100:             self.get_logger().warning(
+101:                 f'Ignoring JointState missing wheel joints: {missing}',
+102:                 throttle_duration_sec=5.0,
+103:             )
+104:             return
+105: 
+106:         stamp = message.header.stamp
+107:         if stamp.sec == 0 and stamp.nanosec == 0:
+108:             stamp = self.get_clock().now().to_msg()
+109:         stamp_s = float(stamp.sec) + float(stamp.nanosec) * 1e-9
+110:         reading = self._encoder.update(
+111:             tuple(
+112:                 float(position_by_name[joint_name])
+113:                 for joint_name in self._joint_names
+114:             ),
+115:             stamp_s,
+116:         )
+117: 
+118:         output = JointState()
+119:         output.header.stamp = stamp
+120:         output.name = list(self._joint_names)
+121:         output.position = list(reading.positions_rad)
+122:         output.velocity = list(reading.velocities_rad_s)
+123:         self._publisher.publish(output)
+124: 
+125: 
+126: def main(args: list[str] | None = None) -> None:
+127:     rclpy.init(args=args)
+128:     node = SimulatedEncoderNode()
+129:     try:
+130:         rclpy.spin(node)
+131:     except (KeyboardInterrupt, ExternalShutdownException):
+132:         pass
+133:     finally:
+134:         try:
+135:             node.destroy_node()
+136:             if rclpy.ok():
+137:                 rclpy.shutdown()
+138:         except KeyboardInterrupt:
+139:             pass

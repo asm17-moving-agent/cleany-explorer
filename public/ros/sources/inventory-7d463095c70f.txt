@@ -1,0 +1,107 @@
+ros2_ws/src/cleany_robot_interface/cleany_robot_interface/robot_state_reader.py
+Review: 2026-11-02
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 5f725fd3422a26c6a4c9e4bc3c85bfe138b6bb813814fddcfd10467fcc237033
+
+1: """Publish both arms and head through exclusive READ-only serial ownership."""
+2: import json
+3: from pathlib import Path
+4: import time
+5: 
+6: import rclpy
+7: from rclpy.node import Node
+8: from sensor_msgs.msg import JointState
+9: import yaml
+10: 
+11: from cleany_robot_interface.core import mappings
+12: from cleany_robot_interface.reader import ReadOnlyBus, verify_arm_calibration
+13: from cleany_robot_interface.state_profile import head_positions
+14: 
+15: 
+16: class RobotStateReader(Node):
+17:     def __init__(self):
+18:         super().__init__('read_only_robot_state')
+19:         self.buses = []
+20:         for name in ('arm_config_file', 'head_config_file', 'head_mapping_file'):
+21:             self.declare_parameter(name, '')
+22:         self.declare_parameter('rate_hz', 20.0)
+23:         read = lambda name: yaml.safe_load(Path(self.get_parameter(name).value).read_text())
+24:         arm, head = read('arm_config_file'), read('head_config_file')
+25:         self.head_mapping = read('head_mapping_file')
+26:         head_positions([0, 0], self.head_mapping)
+27:         if head['motor_ids'] != {'pan': 13, 'tilt': 14}:
+28:             raise ValueError('Expected head pan/tilt motor IDs 13/14')
+29:         shared_bus = Path(arm['port']).resolve() == Path(head['serial_port']).resolve()
+30:         if shared_bus and int(arm['baudrate']) != int(head['baudrate']):
+31:             raise ValueError('Shared arm/head bus requires the same baudrate')
+32:         directory = Path(arm['calibration_dir']).expanduser()
+33:         calibrations = {side: json.loads((directory / cfg['calibration']).read_text())
+34:                         for side, cfg in arm['arms'].items()}
+35:         self.joints = mappings(arm, calibrations)
+36:         rate = float(self.get_parameter('rate_hz').value)
+37:         if not 0 < rate <= 50:
+38:             raise ValueError('rate_hz must be in (0, 50]')
+39:         try:
+40:             self.arm = ReadOnlyBus(arm['port'], int(arm['baudrate']))
+41:             self.buses.append(self.arm)
+42:             verify_arm_calibration(self.arm, self.joints)
+43:             if shared_bus:
+44:                 self.head = self.arm
+45:             else:
+46:                 self.head = ReadOnlyBus(head['serial_port'], int(head['baudrate']))
+47:                 self.buses.append(self.head)
+48:             for motor in (13, 14):
+49:                 if self.head.read(motor, 3, 2) != 777:
+50:                     raise ValueError(f'Head ID {motor}: expected STS3215')
+51:             self.publisher = self.create_publisher(JointState, '/joint_states', 10)
+52:             self.last_warning = 0.0
+53:             self.timer = self.create_timer(1.0 / rate, self.poll)
+54:             self.get_logger().warning(
+55:                 'READ ONLY: 14 live joint positions for provisional planning. '
+56:                 'Absolute calibration and operating limits remain unverified. No motor writes.')
+57:         except Exception:
+58:             self.close_buses()
+59:             raise
+60: 
+61:     def poll(self):
+62:         # Motors are sampled sequentially; this timestamp is the start of the read.
+63:         stamp = self.get_clock().now().to_msg()
+64:         try:
+65:             positions = [joint.radians(self.arm.read(joint.motor_id, 56, 2))
+66:                          for joint in self.joints]
+67:             positions += head_positions([self.head.read(i, 56, 2) for i in (13, 14)],
+68:                                         self.head_mapping)
+69:         except (RuntimeError, ValueError, OSError) as error:
+70:             if time.monotonic() - self.last_warning > 2:
+71:                 self.get_logger().error(f'No complete fresh state published: {error}')
+72:                 self.last_warning = time.monotonic()
+73:             return
+74:         message = JointState()
+75:         message.header.stamp = stamp
+76:         message.name = [joint.name for joint in self.joints] + ['head_pan_joint', 'head_tilt_joint']
+77:         message.position = positions
+78:         # Velocity/effort are absent: no unverified values are manufactured.
+79:         self.publisher.publish(message)
+80: 
+81:     def close_buses(self):
+82:         for bus in reversed(self.buses):
+83:             bus.close()
+84:         self.buses.clear()
+85: 
+86:     def destroy_node(self):
+87:         self.close_buses()
+88:         return super().destroy_node()
+89: 
+90: 
+91: def main(args=None):
+92:     rclpy.init(args=args)
+93:     node = None
+94:     try:
+95:         node = RobotStateReader()
+96:         rclpy.spin(node)
+97:     except KeyboardInterrupt:
+98:         pass
+99:     finally:
+100:         if node:
+101:             node.destroy_node()
+102:         rclpy.try_shutdown()

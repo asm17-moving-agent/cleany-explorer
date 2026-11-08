@@ -1,0 +1,128 @@
+ros2_ws/src/cleany_grasping/cleany_grasping/grasp_node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 8a776de1e0a6507a7feb0f2fcffbfaf592d3827868aefb22736d686bda104552
+
+203:         Request validation or planning failure is returned as a failed response.
+204:     """
+205:     def __init__(self, predictor=None, **kwargs) -> None:
+206:         super().__init__('grasp_server', **kwargs)
+207:         self.declare_parameter('service_name', 'grasp/plan')
+208:         self.declare_parameter('planning_frame', 'base_link')
+209:         self.declare_parameter('tf_cache_time_sec', 180.0)
+210:         self.declare_parameter('optimization_profile', 'optimized')
+211:         self.declare_parameter('cuda_cache_release_threshold_mb', 512.0)
+212:         self.declare_parameter('cuda_gc_interval_calls', 16)
+213:         self.declare_parameter('optimized_adaptive_maximum_points', 8000)
+214:         self.declare_parameter('optimized_adaptive_minimum_region_points', 2000)
+215:         for name, value in {
+216:             'anygrasp_approach_direction': [0.0, 0.0, 0.0],
+217:             'anygrasp_approach_threshold_degrees': 180.0,
+218:             'anygrasp_region_steering_mode': 'workspace',
+219:             'anygrasp_target_region_voxel_m': 0.01,
+224:             'anygrasp_adaptive_maximum_context_ratio': 40.0,
+225:         }.items():
+226:             self.declare_parameter(name, value)
+227:         self.declare_parameter('checkpoint_path', '')
+228:         self.declare_parameter('license_path', '')
+229:         self.declare_parameter('predictor_type', 'geometric')
+230:         self.declare_parameter('anygrasp_worker_enabled', True)
+231:         self.declare_parameter('anygrasp_worker_idle_timeout_sec', 120.0)
+232:         self.declare_parameter('anygrasp_worker_request_timeout_sec', 120.0)
+233:         self.declare_parameter('gpu_lock_path', '')
+234:         self.declare_parameter('anygrasp_prepare_service', '/grasp/prepare_window')
+235:         self.declare_parameter('anygrasp_prepare_hold_sec', 180.0)
+236:         self.declare_parameter('anygrasp_task_status_topic', '/manipulation/execute_skill/_action/status')
+237:         self.declare_parameter('anygrasp_task_hold_sec', 600.0)
+238:         self.declare_parameter('anygrasp_minimum_available_memory_mb', 0.0)
+239:         for name in ('anygrasp_prepare_hold_sec', 'anygrasp_task_hold_sec'):
+240:             value=float(self.get_parameter(name).value)
+241:             if not math.isfinite(value) or value < 0:
+242:                 raise ValueError('AnyGrasp hold durations must be finite and nonnegative')
+243:         self._task_hold_active = False
+244:         self.declare_parameter('anygrasp_preload', False)
+245:         self.declare_parameter('publish_collision_geometry', False)
+246:         self.declare_parameter('collision_geometry_topic', '/grasp/collision_geometry')
+247:         self.declare_parameter('debug_image_topic', 'grasp/debug_image')
+248:         self.declare_parameter('maximum_gripper_width_m', 0.10)
+249:         self.declare_parameter('gripper_height_m', 0.03)
+250:         self.declare_parameter('workspace_margin_m', 0.04)
+251:         self.declare_parameter('target_contact_margin_m', 0.015)
+252:         self.declare_parameter('nms_rotation_threshold_degrees', 20.0)
+253:         self.declare_parameter('geometric.opening_margin_m', 0.008)
+254:         self.declare_parameter('geometric.grasp_depth_m', 0.025)
+255:         self.declare_parameter('geometric.maximum_top_contact_depth_m', 0.0)
+256:         self.declare_parameter('geometric.finger_thickness_m', 0.010)
+257:         self.declare_parameter('geometric.finger_length_m', 0.045)
+258:         self.declare_parameter('geometric.palm_depth_m', 0.018)
+259:         self.declare_parameter('geometric.collision_clearance_m', 0.003)
+260:         self.declare_parameter('geometric.plane_distance_threshold_m', 0.006)
+261:         self.declare_parameter('geometric.plane_ransac_iterations', 160)
+262:         self.declare_parameter('geometric.extent_trim_percentile', 0.5)
+263:         self.declare_parameter('geometric.axis_search_step_degrees', 1.0)
+264:         self.declare_parameter(
+265:             'geometric.yaw_offsets_degrees', [-20.0, -10.0, 0.0, 10.0, 20.0]
+266:         )
+267:         self.declare_parameter('geometric.approach_tilt_degrees', 0.0)
+268:         self.declare_parameter('geometric.search_approach_tilts', False)
+269:         self.declare_parameter('geometric.include_reverse_closing_axis', False)
+270:         self.declare_parameter('geometric.prefer_upward_closing_axis', False)
+271:         self.declare_parameter('geometric.search_longitudinal_contacts', False)
+272:         self.declare_parameter('geometric.longitudinal_offset_fractions', [0.0, -0.25, 0.25])
+273:         self.declare_parameter('geometric.longitudinal_max_height_ratio', 0.4)
+274:         self.declare_parameter('geometric.longitudinal_contact_height_offset_m', 0.0)
+275:         self.declare_parameter('geometric.defer_support_plane_collision', False)
+276:         self.declare_parameter('geometric.approach_reference_positions', [0.0])
+277:         self.declare_parameter(
+278:             'geometric.approach_tilt_options', [0.0, 8.0, 16.0, 24.0]
+279:         )
+280:         self.declare_parameter(
+281:             'geometric.approach_tilt_direction',
+282:             [1.0, 0.0, 0.0],
+283:         )
+284:         self.declare_parameter(
+285:             'geometric.reject_robot_opposite_approach',
+286:             False,
+287:         )
+288:         self.declare_parameter(
+289:             'geometric.robot_reference_position',
+290:             [0.0, 0.0, 0.0],
+291:         )
+292:         self.declare_parameter('geometric.maximum_candidates', 12)
+293:         self.declare_parameter(
+294:             'canonical_to_tcp_rotation',
+295:             [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+296:         )
+297:         self.declare_parameter('tcp_approach_axis', [0.0, -1.0, 0.0])
+298:         self._predictor = predictor or self._create_predictor()
+299:         if bool(self.get_parameter('anygrasp_preload').value):
+300:             prepare = getattr(self._predictor, 'prepare', None)
+301:             if prepare is not None:
+302:                 prepare()
+303:         release_idle = getattr(self._predictor, 'release_if_idle', None)
+304:         self._worker_idle_timer = self.create_timer(5.0, release_idle) if release_idle else None
+305:         self._debug_publisher = self.create_publisher(
+306:             Image,
+307:             str(self.get_parameter('debug_image_topic').value),
+308:             QoSProfile(
+309:                 depth=1,
+310:                 reliability=ReliabilityPolicy.RELIABLE,
+314:         self._tf_buffer = Buffer(cache_time=Duration(seconds=float(self.get_parameter('tf_cache_time_sec').value)))
+315:         self._geometry_publisher = None
+316:         if self.get_parameter('publish_collision_geometry').value:
+317:             self._geometry_publisher = self.create_publisher(ObservedObjectGeometry,
+318:                 str(self.get_parameter('collision_geometry_topic').value),
+319:                 QoSProfile(depth=16, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+320:         self._tf_listener = TransformListener(self._tf_buffer, self)
+321:         self._service = self.create_service(
+322:             PlanGrasp, str(self.get_parameter('service_name').value), self._plan
+323:         )
+324:         self._prepare_service = self.create_service(SetBool,
+325:             str(self.get_parameter('anygrasp_prepare_service').value), self._prepare_window,
+326:             callback_group=ReentrantCallbackGroup())
+327:         self._task_status_subscription = self.create_subscription(GoalStatusArray,
+328:             str(self.get_parameter('anygrasp_task_status_topic').value), self._task_status,
+329:             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+330:             callback_group=ReentrantCallbackGroup())
+331: 
+332:     def _prepare_window(self, request, response):

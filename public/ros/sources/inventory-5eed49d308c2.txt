@@ -1,0 +1,28 @@
+ros2_ws/src/cleany_gazebo_sim/cleany_gazebo_sim/odom_tf_publisher.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 97dde03e106062b4cfd6aa43dd52578bda444cefc4d73f736ef6cd44a96efb06
+
+24:         Both frame names are parameter defaults; coordinates are not converted.
+25:     """
+26:     def __init__(self) -> None:
+27:         super().__init__('gazebo_odom_tf_publisher')
+28:         self.declare_parameter('odom_frame_id', 'odom')
+29:         self.declare_parameter('base_frame_id', 'base_link')
+30:         self.declare_parameter('input_topic', 'gazebo_odom')
+31:         self.declare_parameter('publish_odometry', True)
+32:         self._odom_frame_id = str(self.get_parameter('odom_frame_id').value)
+33:         self._base_frame_id = str(self.get_parameter('base_frame_id').value)
+34:         input_topic = str(self.get_parameter('input_topic').value)
+35:         self._publish_odometry = bool(
+36:             self.get_parameter('publish_odometry').value
+37:         )
+38: 
+39:         self._publisher = self.create_publisher(Odometry, 'odom', 10)
+40:         self._tf_broadcaster = TransformBroadcaster(self)
+41:         self.create_subscription(Odometry, input_topic, self._on_odometry, 10)
+42: 
+43:     def _on_odometry(self, message: Odometry) -> None:
+44:         output = deepcopy(message)
+45:         output.header.frame_id = self._odom_frame_id
+46:         output.child_frame_id = self._base_frame_id

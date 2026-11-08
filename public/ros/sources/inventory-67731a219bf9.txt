@@ -1,0 +1,1185 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/sorting_coordinator.py
+Review: 2026-11-02
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 1a0b3c0e313a54af9fbc6cf7e9426ed8c91126159f906eb805632c254cb27e8d
+
+1: """Sensor-driven pick and place with configurable semantic sorting rules."""
+2: from __future__ import annotations
+3: 
+4: from dataclasses import dataclass
+5: from copy import deepcopy
+6: import json
+7: import math
+8: from pathlib import Path
+9: import time
+10: from uuid import uuid4
+11: 
+12: from ament_index_python.packages import get_package_share_directory
+13: from cleany_interfaces.srv import ObserveWristTarget, VerifyPlacement
+14: from cleany_skill_executor.core.cartesian import validate_pose_endpoint
+15: from cleany_skill_executor.seeded_cartesian import CartesianPlanningError
+16: from cleany_skill_executor.collision_geometry_cache import candidate_bounding_radius
+17: from rcl_interfaces.srv import SetParameters
+18: from rclpy.parameter import Parameter
+19: from geometry_msgs.msg import Pose
+20: from moveit_msgs.msg import CollisionObject, PlanningScene, JointConstraint, RobotTrajectory
+21: from moveit_msgs.srv import ApplyPlanningScene
+22: import numpy as np
+23: import rclpy
+24: from rclpy.qos import DurabilityPolicy, QoSProfile
+25: from rclpy.serialization import serialize_message
+26: from rclpy.time import Time
+27: from sensor_msgs.msg import JointState
+28: from shape_msgs.msg import SolidPrimitive
+29: from std_msgs.msg import String
+30: 
+31: from cleany_mujoco_sim.sorting_scene import load_bins, load_shelf_boxes
+32: from cleany_skill_executor.core.rgbd_projection import CameraProjection, rotation_matrix_from_quaternion
+33: from cleany_skill_executor.core.grasp_selection import REQUIRED_JOINT_NAMES
+34: from cleany_skill_executor.core.nearest_object import ObjectAttempt
+35: from cleany_skill_executor.core.sorting import (
+36:     Category, execute_sort, load_sorting_policy,
+37: )
+38: from cleany_skill_executor.core.reobservation import reobservation_centers
+39: from cleany_skill_executor.moveit_adapter import (
+40:     MoveItAdapterConfig, MoveItGraspAdapter,
+41: )
+42: from cleany_skill_executor.nearest_pregrasp_coordinator import (
+43:     LiftRedetectionError, NearestPregraspCoordinator,
+44: )
+45: 
+46: 
+47: @dataclass
+48: class SortTarget:
+49:     attempt: object
+50:     selected: object
+51: 
+52: 
+53: @dataclass
+54: class HeldObject:
+55:     target: SortTarget
+56:     selected: object
+57:     offset_in_tcp: np.ndarray
+58: 
+59: 
+60: class WristTargetNotDetected(RuntimeError):
+61:     def __init__(self, message: str, stamp_ns: int):
+62:         super().__init__(message)
+63:         self.stamp_ns = stamp_ns
+64: 
+65: 
+66: def held_bounding_radius(node, held: HeldObject) -> float:
+67:     cache = (node._geometry_cache
+68:              if getattr(node, '_geometry_subscription', None) is not None else None)
+69:     return candidate_bounding_radius(held.selected.selected_candidate, cache)
+70: 
+71: 
+72: def rotation(pose: Pose) -> np.ndarray:
+73:     q = pose.orientation
+74:     return rotation_matrix_from_quaternion(q.x, q.y, q.z, q.w)
+75: 
+76: 
+77: def object_in_destination(obj, destination) -> bool:
+78:     if destination is None:
+79:         return False
+80:     center, size = obj.obb_pose.position, obj.obb_size
+81:     half_extent = np.abs(rotation(obj.obb_pose)) @ np.array((size.x,size.y,size.z))/2
+82:     return (destination.contains((center.x,center.y,center.z))
+83:             and all(abs(value-destination.center_xy[i])+half_extent[i]
+84:                     < destination.outside_size[i]/2-destination.wall
+85:                     for i,value in enumerate((center.x,center.y))))
+86: 
+87: 
+88: class SortingCoordinator(NearestPregraspCoordinator):
+89:     """Extend pre-grasp execution into a policy-driven pick and sorting sequence.
+90: 
+91:     Inherits perception, scene, joint and motion interfaces from
+92:     NearestPregraspCoordinator; only additional interfaces are listed here.
+93: 
+94:     Subscriptions:
+95:         /robot_description (std_msgs/msg/String): Transport-planning geometry.
+96: 
+97:     Publishers:
+98:         /sorting/status (std_msgs/msg/String): JSON stage and outcome, reliable
+99:             and transient local with depth 1.
+100: 
+101:     Services:
+102:         /perception/observe_wrist_target (cleany_interfaces/srv/ObserveWristTarget):
+103:             Wrist observation client.
+104:         /sorting_cameras/set_parameters (rcl_interfaces/srv/SetParameters): Camera control.
+105:         /sorting/verify_placement (cleany_interfaces/srv/VerifyPlacement): Placement oracle.
+106:         /apply_planning_scene (moveit_msgs/srv/ApplyPlanningScene): Bin geometry updates.
+107: 
+108:     Notes:
+109:         Policy and bins are loaded from configured files. Placement verification
+110:         is enabled by default and uses a simulation oracle. The inherited default
+111:         ROS node name is nearest_pregrasp_coordinator unless remapped at launch.
+112:     """
+113:     def __init__(self):
+114:         super().__init__()
+115:         skill = Path(get_package_share_directory('cleany_skill_executor'))
+116:         sim = Path(get_package_share_directory('cleany_mujoco_sim'))
+117:         self.declare_parameter('sorting_policy', str(
+118:             skill / 'config' / 'table_sorting_policy.yaml'))
+119:         self.declare_parameter('sorting_bins_config', str(
+120:             sim / 'config' / 'robot_top_bins.yaml'))
+121:         self.declare_parameter('sorting_maximum_objects', 12)
+122:         self.declare_parameter('sorting_empty_confirmations', 2)
+123:         self._placement_verification_enabled = self.declare_parameter(
+124:             'sorting_verify_placement', True).value
+125:         self._geometry_association_lift = self.declare_parameter(
+126:             'sorting_geometry_association_lift', False).value
+127:         self.declare_parameter('sorting_exit_on_finish', True)
+128:         self.declare_parameter('sorting_test_only_label', '')
+129:         self._wrist_enabled = self.declare_parameter('sorting_use_wrist_camera', False).value
+130:         self.declare_parameter('sorting_wrist_check_attempts', 1)
+131:         self.declare_parameter('sorting_wrist_contact_confirmation_sec', 0.3)
+132:         self.declare_parameter('sorting_gripper_feedback_max_age_sec', 0.5)
+133:         self._adaptive_camera_rate = self.declare_parameter(
+134:             'sorting_adaptive_head_rate', False).value
+135:         self.declare_parameter('sorting_approach_acceleration_scaling', 1.0)
+136:         self.declare_parameter('sorting_return_gripper_position_rad', -0.30)
+137:         self.declare_parameter('sorting_carry_wrist_tolerances_deg', [2., 5., 10., 20., 30.])
+138:         self.declare_parameter('sorting_carry_cartesian_rotation_limit_deg', 30.)
+139:         self._carry_wrist_reference = {}
+140:         self._carry_wrist_tolerance = 0.
+141:         steps = self.get_parameter('sorting_carry_wrist_tolerances_deg').value
+142:         if (not steps or any(not math.isfinite(x) or x <= 0 or x > 90 for x in steps)
+143:                 or any(a >= b for a, b in zip(steps, steps[1:]))):
+144:             raise ValueError('Carry wrist tolerances must increase within (0, 90] degrees')
+145:         rotation_limit = float(self.get_parameter('sorting_carry_cartesian_rotation_limit_deg').value)
+146:         if not math.isfinite(rotation_limit) or not 0 < rotation_limit <= 90:
+147:             raise ValueError('Carry Cartesian rotation limit must be within (0, 90] degrees')
+148:         self._wrist_client = self.create_client(ObserveWristTarget, '/perception/observe_wrist_target')
+149:         self._camera_client = self.create_client(SetParameters, '/sorting_cameras/set_parameters')
+150:         self._wrist_reference = None
+151:         self.declare_parameter('sorting_release_ik_attempts', 16)
+152:         self.declare_parameter('sorting_release_ik_iterations', 80)
+153:         self.declare_parameter('sorting_head_reference_refresh_age_sec', 0.0)
+154:         self._return_detection = None
+155:         self.declare_parameter('sorting_verification_timeout_sec', 10.0)
+156:         self.declare_parameter('sorting_artifact_directory', '')
+157:         self.declare_parameter('sorting_reobserve_after_lift', True)
+158:         self.declare_parameter('sorting_reobserve_margin_px', 24.0)
+159:         self.declare_parameter('sorting_reobserve_geometry_padding_m', 0.01)
+160:         self.declare_parameter('sorting_reobserve_max_translation_m', 0.20)
+161:         self.declare_parameter('sorting_reobserve_max_lowering_m', 0.10)
+162:         self.declare_parameter('sorting_reobserve_height_clearance_m', 0.02)
+163:         self.declare_parameter('sorting_held_association_tolerance_m', 0.03)
+164:         self.declare_parameter('sorting_payload_velocity_scaling', 0.01)
+165:         self.declare_parameter('sorting_payload_acceleration_scaling', 0.01)
+166:         self.declare_parameter('sorting_return_velocity_scaling', 0.12)
+167:         self.declare_parameter('sorting_return_acceleration_scaling', 0.15)
+168:         self.declare_parameter(
+169:             'sorting_required_categories', ['trash', 'lost_item'])
+170:         self._require_category_coverage = self.declare_parameter('sorting_require_category_coverage', False).value
+171:         # This executable is currently simulation-only. The inspection and
+172:         # motion ports remain sensor-based; the outcome verifier is an oracle.
+173:         if not self.get_parameter('use_sim_time').value:
+174:             raise RuntimeError('Sorting execution is simulation-only')
+175:         if self.get_parameter('plan_only').value:
+176:             raise RuntimeError('Sorting requires execution, not plan_only')
+177:         self._policy = load_sorting_policy(
+178:             self.get_parameter('sorting_policy').value)
+179:         self._bins = {b.name: b for b in load_bins(
+180:             self.get_parameter('sorting_bins_config').value)}
+181:         self._fixed_release_wrist = {}
+182:         self._fixed_release_cache = {}
+183:         self._fixed_release_points = {}
+184:         self._fixed_release_hold_tolerance = math.radians(float(self.declare_parameter(
+185:             'sorting_fixed_release_wrist_tolerance_deg', .5).value))
+186:         if not 0 < self._fixed_release_hold_tolerance <= math.radians(2.):
+187:             raise ValueError('Fixed release tracking tolerance must be within (0, 2] degrees')
+188:         for name, bin_ in self._bins.items():
+189:             point = np.asarray(self.declare_parameter(
+190:                 f'sorting_fixed_release_{name}_m',
+191:                 [bin_.center_xy[0], bin_.center_xy[1], bin_.top_z+.22]).value, dtype=float)
+192:             if point.shape != (3,) or not np.isfinite(point).all():
+193:                 raise ValueError(f'Invalid fixed release point for {name}')
+194:             self._fixed_release_points[name] = point
+195:         for name in (self._policy.trash_destination,
+196:                      self._policy.lost_item_destination):
+197:             if name not in self._bins:
+198:                 raise ValueError(f'Policy destination has no bin: {name}')
+199:         self._verification = self.create_client(
+200:             VerifyPlacement, '/sorting/verify_placement')
+201:         self._apply_scene = self.create_client(
+202:             ApplyPlanningScene, '/apply_planning_scene')
+203:         self._transport_adapter = MoveItGraspAdapter(
+204:             self, config=MoveItAdapterConfig(preserve_scene_attachments=True,
+205:                 fk_timeout_sec=float(self.get_parameter('tcp_fk_timeout_sec').value),
+206:                 state_validity_timeout_sec=float(self.get_parameter('tcp_fk_timeout_sec').value),
+207:                 ik_response_margin_sec=float(self.get_parameter('tcp_fk_timeout_sec').value)),
+208:             spin_once=lambda t: self._spin_once(timeout_sec=t))
+209:         self._transport_description_subscription = self.create_subscription(
+210:             String, '/robot_description',
+211:             lambda message: self._transport_adapter.set_robot_description(message.data),
+212:             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+213:         self._status = self.create_publisher(
+214:             String, '/sorting/status', QoSProfile(
+215:                 depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+216:         self._completed = []
+217:         self._current = {}
+218:         self._release_stamp_ns = 0
+219:         self._home = {}
+220:         self._held_object: HeldObject | None = None
+221:         directory = str(self.get_parameter('sorting_artifact_directory').value)
+222:         self._artifact_directory = None
+223:         self._artifact_sequence = 0
+224:         if directory:
+225:             path = Path(directory).expanduser()
+226:             if not path.is_absolute():
+227:                 raise ValueError('Sorting artifact directory must be absolute')
+228:             self._artifact_directory = path / f'run-{uuid4().hex}'
+229:             self._artifact_directory.mkdir(parents=True)
+230:             self.get_logger().info(f'Pipeline artifacts: {self._artifact_directory}')
+231: 
+232:     def _record_pipeline_message(self, stage: str, message: object) -> None:
+233:         if self._artifact_directory is None:
+234:             return
+235:         self._artifact_sequence += 1
+236:         path = self._artifact_directory / f'{self._artifact_sequence:03d}_{stage}.cdr'
+237:         path.write_bytes(serialize_message(message))
+238: 
+239:     def _attempts(self, detections):
+240:         attempts = super()._attempts(detections)
+241:         label = self.get_parameter('sorting_test_only_label').value
+242:         # Diagnostic isolation never changes the normal empty-workspace gate:
+243:         # other visible objects remain unresolved, so this cannot report clean.
+244:         return tuple(a for a in attempts if not label or a.label == label)
+245: 
+246:     def _execution_goal(self, arm, joint_state, label):
+247:         goal = super()._execution_goal(arm, joint_state, label)
+248:         if f'{arm}_gripper_joint' in joint_state.name:
+249:             expected = {name for name in REQUIRED_JOINT_NAMES if name.startswith(f'{arm}_')}
+250:             if arm not in ('left', 'right') or set(joint_state.name) != expected or self._held_object is not None:
+251:                 raise ValueError('Combined pregrasp requires only the selected empty arm and gripper')
+252:             # One collision-checked six-joint path, dispatched by MoveIt to
+253:             # disjoint arm/gripper controllers. No concurrent blind open command.
+254:             group = 'return_close' if label.startswith('return from ') else 'pregrasp_open'
+255:             goal.request.group_name = f'{arm}_{group}'
+256:         if label.startswith('return from '):
+257:             # Empty-hand return still has actuator torque/damping limits.
+258:             # Keep coordinated jaw closing and all collision/tracking checks.
+259:             for attribute, parameter in (
+260:                 ('max_velocity_scaling_factor', 'sorting_return_velocity_scaling'),
+261:                 ('max_acceleration_scaling_factor', 'sorting_return_acceleration_scaling'),
+262:             ):
+263:                 value = float(self.get_parameter(parameter).value)
+264:                 if not math.isfinite(value) or not 0. < value <= 1.:
+265:                     raise ValueError('Return motion scaling must be finite and in (0, 1]')
+266:                 setattr(goal.request, attribute, min(getattr(goal.request, attribute), value))
+267:         if self._held_object is not None:
+268:             for attribute, parameter in (
+269:                 ('max_velocity_scaling_factor', 'sorting_payload_velocity_scaling'),
+270:                 ('max_acceleration_scaling_factor', 'sorting_payload_acceleration_scaling'),
+271:             ):
+272:                 value = float(self.get_parameter(parameter).value)
+273:                 if not math.isfinite(value) or not 0. < value <= 1.:
+274:                     raise ValueError('Payload motion scaling must be finite and in (0, 1]')
+275:                 setattr(goal.request, attribute, min(getattr(goal.request, attribute), value))
+276:         if getattr(self, '_carry_wrist_reference', {}) and self._held_object is not None:
+277:             for name, reference in self._carry_wrist_reference.items():
+278:                 goal.request.path_constraints.joint_constraints.append(JointConstraint(
+279:                     joint_name=name, position=reference,
+280:                     tolerance_above=self._carry_wrist_tolerance,
+281:                     tolerance_below=self._carry_wrist_tolerance, weight=1.))
+282:         if getattr(self, '_fixed_release_wrist', {}) and self._held_object is not None:
+283:             goal.request.path_constraints.joint_constraints = [JointConstraint(
+284:                 joint_name=name, position=value, tolerance_above=self._fixed_release_hold_tolerance,
+285:                 tolerance_below=self._fixed_release_hold_tolerance, weight=1.)
+286:                 for name, value in self._fixed_release_wrist.items()]
+287:         return goal
+288: 
+289: 
+290:     def _validate_cartesian_plan(self, arm, trajectory, start, target, label, **kwargs):
+291:         if getattr(self, '_carry_wrist_reference', {}) and self._held_object is not None:
+292:             names = trajectory.joint_trajectory.joint_names
+293:             for name, reference in self._carry_wrist_reference.items():
+294:                 if name not in names:
+295:                     raise RuntimeError('Carry trajectory missing wrist joint')
+296:                 index = names.index(name)
+297:                 for point in trajectory.joint_trajectory.points:
+298:                     if (len(point.positions) != len(names)
+299:                             or not math.isfinite(point.positions[index])
+300:                             or abs(point.positions[index]-reference) > self._carry_wrist_tolerance+1e-6):
+301:                         raise RuntimeError(f'{label}: carry wrist bound exceeded before execution')
+302:         return super()._validate_cartesian_plan(arm, trajectory, start, target, label, **kwargs)
+303: 
+304:     def _joint_corridor_goal(self, arm, joints, start, target, label, velocity_scaling):
+305:         goal = super()._joint_corridor_goal(arm, joints, start, target, label, velocity_scaling)
+306:         if label == 'refreshed grasp approach':
+307:             value = float(self.get_parameter('sorting_approach_acceleration_scaling').value)
+308:             if not math.isfinite(value) or not 0 < value <= 1:
+309:                 raise ValueError('Approach acceleration scaling must be in (0,1]')
+310:             goal.request.max_acceleration_scaling_factor = value
+311:         return goal
+312: 
+313: 
+314:     def _execute_linear(self, arm, target, label, **kwargs):
+315:         if getattr(self, '_carry_wrist_reference', {}) and self._held_object is not None:
+316:             # The base execution path calls our plan-only override. Never catch
+317:             # execution/controller/guard failures to relax a wrist constraint.
+318:             return super()._execute_linear(arm, target, label, **kwargs)
+319:         if (getattr(self, '_direct_vertical_lift', False)
+320:                 and label == 'vertical grasp lift' and kwargs.get('joint_target') is None):
+321:             self._transport_adapter.set_current_state(self._feedback_state())
+322:             solution = self._transport_adapter.solve_position_ik(
+323:                 arm, tuple(self._pose_position(target)), None)
+324:             if solution is None:
+325:                 raise RuntimeError('No IK for direct vertical lift')
+326:             joints = JointState(name=list(solution.names), position=list(solution.positions))
+327:             actual = self._tcp_pose(arm, joints)
+328:             validate_pose_endpoint(self._cartesian_pose(actual), self._cartesian_pose(target),
+329:                 float(self.get_parameter('lin_position_tolerance_m').value),
+330:                 math.radians(float(self.get_parameter('corridor_orientation_tolerance_deg').value)))
+331:             # Explicit position corridor for the five-axis arm; retain full
+332:             # seeded interpolation, FK, collision and angular-drift checks.
+333:             target = actual
+334:             kwargs['joint_target'] = joints
+335:         return super()._execute_linear(arm, target, label, **kwargs)
+336: 
+337:     def _plan_linear_motion(self, arm: str, target: Pose, label: str, **kwargs) -> RobotTrajectory:
+338:         if not getattr(self, '_carry_wrist_reference', {}) or self._held_object is None:
+339:             return super()._plan_linear_motion(arm, target, label, **kwargs)
+340:         self._wait_arm_stationary(arm)
+341:         start = self._tcp_pose(arm)
+342:         position = np.array(self._pose_position(target))
+343:         failures = []
+344:         for degrees in self.get_parameter('sorting_carry_wrist_tolerances_deg').value:
+345:             tolerance = math.radians(degrees)
+346:             if tolerance+1e-9 < self._carry_wrist_tolerance:
+347:                 continue
+348:             self._transport_adapter.set_current_state(self._feedback_state())
+349:             solution = self._transport_adapter.solve_held_region_ik(
+350:                 arm, position-1e-4, position+1e-4, np.zeros(3),
+351:                 attempts=int(self.get_parameter('sorting_release_ik_attempts').value),
+352:                 iterations=int(self.get_parameter('sorting_release_ik_iterations').value),
+353:                 joint_bounds={name: (value-tolerance, value+tolerance)
+354:                               for name, value in self._carry_wrist_reference.items()})
+355:             if solution is None:
+356:                 reason = 'no bounded endpoint IK'
+357:             else:
+358:                 joints = JointState(name=list(solution.names), position=list(solution.positions))
+359:                 actual = self._tcp_pose(arm, joints)
+360:                 try:
+361:                     # A fixed wrist can change the TCP world orientation as
+362:                     # shoulder/elbow move. Do not reuse the empty-arm pregrasp
+363:                     # orientation as a mandatory carry endpoint. Bound the new
+364:                     # rotation, then validate the whole FK corridor below.
+365:                     orientation_reference = deepcopy(start)
+366:                     orientation_reference.position = deepcopy(target.position)
+367:                     validate_pose_endpoint(
+368:                         self._cartesian_pose(actual), self._cartesian_pose(orientation_reference),
+369:                         float(self.get_parameter('lin_position_tolerance_m').value),
+370:                         math.radians(float(self.get_parameter('sorting_carry_cartesian_rotation_limit_deg').value)))
+371:                 except ValueError as error:
+372:                     reason = str(error)
+373:                 else:
+374:                     self._carry_wrist_tolerance = tolerance
+375:                     options = dict(kwargs, joint_target=joints)
+376:                     try:
+377:                         trajectory = super()._plan_linear_motion(arm, actual, label, **options)
+378:                     except CartesianPlanningError as error:
+379:                         reason = str(error)
+380:                     else:
+381:                         self.get_logger().debug(
+382:                             f'Carry Cartesian plan verified: {label} wrist=+/-{degrees:.1f}deg')
+383:                         return trajectory
+384:             failures.append(f'{degrees:.1f}deg: {reason}')
+385:             self.get_logger().info(f'Carry Cartesian replan: {label} {failures[-1]}')
+386:         raise CartesianPlanningError(f'{label}: no bounded carry path; ' + '; '.join(failures))
+387: 
+388: 
+389:     def _plan_grasps(self, inspected, attempt):
+390:         self._record_pipeline_message('inspection', inspected)
+391:         result = super()._plan_grasps(inspected, attempt)
+392:         if result is not None:
+393:             self._record_pipeline_message('grasps', result)
+394:         return result
+395: 
+396:     def _select_reachable(self, candidates, attempt, *, required_arm=''):
+397:         result = super()._select_reachable(
+398:             candidates, attempt, required_arm=required_arm)
+399:         if result is not None:
+400:             self._record_pipeline_message('selection', result)
+401:         return result
+402: 
+403:     def _stage(self, stage, *, error: str | None = None):
+404:         if stage in ('complete', 'complete_unverified'):
+405:             self._current['placement_verified'] = stage == 'complete'
+406:         payload = dict(stage=stage, **self._current, completed=self._completed)
+407:         if error is not None:
+408:             payload['error'] = error
+409:         if self._artifact_directory is not None:
+410:             with (self._artifact_directory / 'stages.jsonl').open('a') as stream:
+411:                 stream.write(json.dumps(dict(wall_time=time.time(), **payload))+'\n')
+412:         self._status.publish(String(data=json.dumps(payload)))
+413:         self.get_logger().debug(f'SORTING {json.dumps(payload)}')
+414:         summary = (f'SORTING stage={stage} label={self._current.get("label", "")} '
+415:                    f'destination={self._current.get("destination", "")} completed={len(self._completed)}')
+416:         if error is not None:
+417:             summary += f' error={error}'
+418:         self.get_logger().info(summary)
+419: 
+420:     def run(self):
+421:         self._stage('starting')
+422:         self._wait_for_pipeline()
+423:         verify_placement = getattr(self, '_placement_verification_enabled', True)
+424:         if verify_placement and not self._verification.wait_for_service(timeout_sec=10.0):
+425:             raise RuntimeError('Placement verification port is unavailable')
+426:         self._register_bins()
+427:         if self._wrist_enabled:
+428:             if not self._wrist_client.wait_for_service(timeout_sec=10):
+429:                 raise RuntimeError('Wrist observation service unavailable')
+430:             self._switch_camera('head')
+431:         self._home = {arm: self._arm_joint_state(arm)
+432:                       for arm in ('left', 'right')}
+433:         self._stage('search')
+434:         maximum = int(self.get_parameter('sorting_maximum_objects').value)
+435:         empty_confirmations = 0
+436:         minimum_total_placements = 0
+437:         for _ in range(maximum):
+438:             detected = self._next_sorting_detection()
+439:             self._record_pipeline_message('detections', detected)
+440:             choices = self._attempts(detected.detections.detections)
+441:             inspections = {}
+442:             def inspect(attempt):
+443:                 if attempt.object_id not in inspections:
+444:                     inspections[attempt.object_id] = self._inspect_selected(
+445:                         detected.detections.snapshot_id, attempt)
+446:                 return inspections[attempt.object_id]
+447:             work_count = len(detected.detections.detections)
+448:             prepared = None
+449:             unresolved = len(detected.detections.detections) - len(choices)
+450:             for attempt in choices:
+451:                 decision = self._policy.classify_model(
+452:                     attempt.label, attempt.confidence,
+453:                     attempt.sorting_category)
+454:                 self._current = dict(label=attempt.label,
+455:                                      distance_m=attempt.distance_m,
+456:                                      category=decision.category.value,
+457:                                      destination=decision.destination,
+458:                                      reason=decision.reason)
+459:                 if decision.category == Category.REVIEW:
+460:                     unresolved += 1
+461:                     self._stage('review')
+462:                     continue
+463:                 inspected = inspect(attempt)
+464:                 if inspected is None:
+465:                     unresolved += 1
+466:                     continue
+467:                 center = inspected.objects.objects[0].obb_pose.position
+468:                 # Already placed items are not picked again, even if a camera
+469:                 # still sees them. This uses the perceived position, not GT.
+470:                 destination = self._bins.get(decision.destination)
+471:                 if object_in_destination(inspected.objects.objects[0],destination):
+472:                     work_count -= 1
+473:                     continue
+474:                 unresolved += 1
+475:                 planned = self._plan_grasps(inspected, attempt)
+476:                 if planned is None:
+477:                     self._stage('no_grasp')
+478:                     continue
+479:                 # Symmetric shoulder bases: target base_link Y determines the
+480:                 # nearer arm. Exhaust its candidates before trying the other arm.
+481:                 # Destination does not constrain picking; transport is still
+482:                 # checked separately by the collision-aware motion planner.
+483:                 arms = ('left', 'right') if center.y >= 0 else ('right', 'left')
+484:                 selected = None
+485:                 for arm in arms:
+486:                     selected = self._select_reachable(
+487:                         planned.candidates, attempt, required_arm=arm)
+488:                     if selected is not None:
+489:                         break
+490:                 if selected is None:
+491:                     self._stage('unreachable')
+492:                     continue
+493:                 prepared = SortTarget(attempt, selected)
+494:                 break
+495:             minimum_total_placements = max(
+496:                 minimum_total_placements, len(self._completed)+work_count)
+497:             if prepared is None:
+498:                 if unresolved:
+499:                     raise RuntimeError(f'Work area is not clear: {unresolved} unresolved objects')
+500:                 if len(self._completed) < minimum_total_placements:
+501:                     raise RuntimeError('Previously observed work objects are missing without verified placement')
+502:                 empty_confirmations += 1
+503:                 self._stage('empty_confirmation')
+504:                 if empty_confirmations >= int(self.get_parameter('sorting_empty_confirmations').value):
+505:                     break
+506:                 continue
+507:             empty_confirmations = 0
+508:             if verify_placement:
+509:                 execute_sort(prepared, decision, self, self._stage)
+510:             else:
+511:                 execute_sort(prepared, decision, self, self._stage, verify_placement=False)
+512:             self._completed.append(dict(self._current))
+513:         else:
+514:             raise RuntimeError('Sorting action/search budget exhausted before clear-workspace confirmation')
+515:         required = (set(self.get_parameter('sorting_required_categories').value)
+516:                     if getattr(self, '_require_category_coverage', False) else set())
+517:         categories = {item['category'] for item in self._completed}
+518:         if not required <= categories:
+519:             self._stage('incomplete')
+520:             raise RuntimeError(
+521:                 'Required sorting paths not verified: '
+522:                 + ', '.join(sorted(required - categories)))
+523:         self._stage('mission_complete' if verify_placement else 'mission_complete_unverified')
+524: 
+525:     def _execute_pregrasp(self, selected, attempt) -> None:
+526:         arm = selected.selected_arm
+527:         expected = {name for name in REQUIRED_JOINT_NAMES
+528:                     if name.startswith(f'{arm}_') and 'gripper' not in name}
+529:         joints = selected.pregrasp_joint_state
+530:         opening = float(self.get_parameter('gripper_open_position_rad').value)
+531:         if (arm not in ('left', 'right') or len(joints.name) != 5 or set(joints.name) != expected
+532:                 or len(joints.position) != 5 or not all(math.isfinite(q) for q in joints.position)
+533:                 or not math.isfinite(opening)):
+534:             raise ValueError('Invalid selected-arm pregrasp/open target')
+535:         combined = deepcopy(selected)
+536:         combined.pregrasp_joint_state.name.append(f'{arm}_gripper_joint')
+537:         combined.pregrasp_joint_state.position.append(opening)
+538:         combined.pregrasp_joint_state.velocity = []
+539:         combined.pregrasp_joint_state.effort = []
+540:         # Preserve source selection and the five-joint grasp/retreat targets.
+541:         # Base implementation registers the OBB, forbids target contacts, and
+542:         # requires feedback convergence for ALL six joints before returning.
+543:         self.get_logger().info(f'Pregrasp with simultaneous {arm} gripper opening')
+544:         super()._execute_pregrasp(combined, attempt)
+545: 
+546:     def pick(self, target: SortTarget) -> HeldObject:
+547:         self._held_object = None
+548:         self._fixed_release_wrist = {}
+549:         self._lift_completion_stamp_ns = None
+550:         self._execute_pregrasp(target.selected, target.attempt)
+551:         # The selected gripper opened along the pregrasp trajectory; do not
+552:         # issue another timed opening after arrival.
+553:         if getattr(self, '_wrist_enabled', False):
+554:             selected, attempt = target.selected, target.attempt
+555:             self._wait_arm_stationary(selected.selected_arm)
+556:             selected, attempt = self._ensure_fresh_head_before_wrist(selected, attempt)
+557:             if selected is not target.selected:
+558:                 target = SortTarget(attempt, selected)
+559:             self._switch_camera(selected.selected_arm)
+560:             self._wrist_reference = self._observe_wrist(selected, ObserveWristTarget.Request.HANDOFF)
+561:             # Preserve the original head 3D estimate. RGB consistency is not new depth.
+562:             self._execution_scene.allow_contacts_for(selected.selected_arm)
+563:         else:
+564:             if getattr(self, '_geometry_association_lift', False):
+565:                 selected, attempt = self._refresh_selected_grasp(
+566:                     target.selected, target.attempt, match_label=False)
+567:             else:
+568:                 selected, attempt = self._refresh_selected_grasp(target.selected, target.attempt)
+569:         self._execute_grasp_and_lift(selected, attempt)
+570:         if self._held_object is None:
+571:             raise RuntimeError('No settled grasp attachment reference')
+572:         self._held_object.target = target
+573:         return self._held_object
+574: 
+575:     def _execute_grasp_and_lift(self, selected, attempt) -> None:
+576:         # Keep the selected wrist active, but refresh head RGB-D throughout approach
+577:         # and closure so attachment does not start with an idle-rate sensor.
+578:         boost = getattr(self, '_wrist_enabled', False)
+579:         if boost:
+580:             self._set_head_depth_boost(True)
+581:         try:
+582:             super()._execute_grasp_and_lift(selected, attempt)
+583:         except Exception:
+584:             if boost:
+585:                 try:
+586:                     self._set_head_depth_boost(False)
+587:                 except Exception as error:
+588:                     self.get_logger().error(f'Could not restore head depth rate: {error}')
+589:             raise
+590:         else:
+591:             if boost:
+592:                 self._set_head_depth_boost(False)
+593: 
+594:     def _set_head_depth_boost(self, enabled: bool) -> None:
+595:         if not self._camera_client.wait_for_service(timeout_sec=3.):
+596:             raise RuntimeError('Camera rate control service unavailable for depth refresh')
+597:         request = SetParameters.Request(parameters=[
+598:             Parameter('head_depth_boost', value=enabled).to_parameter_msg()])
+599:         response = self._future(self._camera_client.call_async(request), 3., 'head depth refresh')
+600:         if len(response.results) != 1 or not response.results[0].successful:
+601:             raise RuntimeError('Head depth refresh request rejected')
+602:         self.get_logger().debug(f'Head depth boost={enabled}; wrist camera selection unchanged')
+603: 
+604:     def _ensure_fresh_head_before_wrist(self, selected, attempt):
+605:         maximum = float(self.get_parameter('sorting_head_reference_refresh_age_sec').value)
+606:         if not math.isfinite(maximum) or not 0 <= maximum <= 30.0:
+607:             raise ValueError('Head reference refresh age must be in [0, 30] seconds')
+608:         if maximum == 0.0:
+609:             return selected, attempt
+610:         def age(selection):
+611:             stamp = selection.selected_candidate.header.stamp
+612:             captured = stamp.sec*10**9 + stamp.nanosec
+613:             now = self.get_clock().now().nanoseconds
+614:             if captured <= 0 or captured > now:
+615:                 raise RuntimeError('Invalid head reference timestamp before wrist handoff')
+616:             return (now-captured)/1e9
+617:         if age(selected) <= maximum:
+618:             return selected, attempt
+619:         self.get_logger().info('Refreshing aged head reference before wrist handoff')
+620:         self._switch_camera('head')
+621:         refreshed, fresh_attempt = self._refresh_selected_grasp(selected, attempt)
+622:         if age(refreshed) > maximum:
+623:             raise RuntimeError('Refreshed head observation expired during replanning')
+624:         previous = self._policy.classify_model(attempt.label, attempt.confidence,
+625:             attempt.sorting_category)
+626:         current = self._policy.classify_model(fresh_attempt.label, fresh_attempt.confidence,
+627:             fresh_attempt.sorting_category)
+628:         if (current.category == Category.REVIEW or current.category != previous.category
+629:                 or current.destination != previous.destination):
+630:             raise RuntimeError('Object classification changed during head reference refresh')
+631:         return refreshed, fresh_attempt
+632: 
+633:     def _on_lift_motion_complete(self) -> None:
+634:         self._lift_completion_stamp_ns = self.get_clock().now().nanoseconds
+635: 
+636:     def _on_grasp_contact(self, selected, attempt) -> None:
+637:         # The actual settled TCP, not the requested grasp endpoint, defines the
+638:         # same rigid attachment assumption that MoveIt will use immediately next.
+639:         tcp = self._tcp_pose(selected.selected_arm)
+640:         object_center = (
+641:             selected.selected_candidate.target_object.obb_pose.position)
+642:         if getattr(self, '_wrist_enabled', False):
+643:             self._contact_tcp_quaternion = deepcopy(tcp.orientation)
+644:         offset = rotation(tcp).T @ (
+645:             np.array((object_center.x, object_center.y, object_center.z))
+646:             - np.array(self._pose_position(tcp)))
+647:         self._held_object = HeldObject(SortTarget(attempt, selected), selected, offset)
+648:         joints = self._arm_joint_state(selected.selected_arm)
+649:         self._carry_wrist_reference = {
+650:             name: float(value) for name, value in zip(joints.name, joints.position, strict=True)
+651:             if name == f'{selected.selected_arm}_wrist_roll_joint'}
+652:         if len(self._carry_wrist_reference) != 1:
+653:             raise RuntimeError('Missing wrist roll feedback at grasp contact')
+654:         self._carry_wrist_tolerance = math.radians(
+655:             self.get_parameter('sorting_carry_wrist_tolerances_deg').value[0])
+656: 
+657:     def _verify_lift_height(self, attempt, *, minimum_center_z_m=None):
+658:         if getattr(self, '_wrist_enabled', False):
+659:             held = self._held_object
+660:             if held is None:
+661:                 raise RuntimeError('Missing held geometry for wrist check')
+662:             self._require_held_contact(held)
+663:             tcp = self._tcp_pose(held.selected.selected_arm)
+664:             predicted = np.array(self._pose_position(tcp)) + rotation(tcp) @ held.offset_in_tcp
+665:             if minimum_center_z_m is not None and predicted[2] < minimum_center_z_m:
+666:                 raise RuntimeError(
+667:                     'Kinematic lift clearance below required height: '
+668:                     f'predicted_center_z={predicted[2]:.4f}m '
+669:                     f'required_center_z={minimum_center_z_m:.4f}m')
+670:             return self._verify_wrist_or_contact(held)
+671:         verify = (self._verify_head_redetection if getattr(self, '_geometry_association_lift', False)
+672:                   else super()._verify_lift_height)
+673:         try:
+674:             inspected = verify(
+675:                 attempt, minimum_center_z_m=minimum_center_z_m)
+676:         except LiftRedetectionError:
+677:             if not self.get_parameter('sorting_reobserve_after_lift').value:
+678:                 raise
+679:             self._reobserve_held_object(minimum_center_z_m)
+680:             # Exactly one physical recovery move; no recursive motion/retries.
+681:             inspected = verify(
+682:                 attempt, minimum_center_z_m=minimum_center_z_m)
+683:         held = self._held_object
+684:         if inspected is None or held is None:
+685:             raise RuntimeError('Sorting requires observed lift and attachment reference')
+686:         self._record_pipeline_message('lift_inspection', inspected)
+687:         frame = held.selected.selected_candidate.header.frame_id
+688:         header = inspected.objects.header
+689:         if header.frame_id != frame:
+690:             raise RuntimeError('Held-object observation frame differs from attachment')
+691:         tcp = self._tcp_pose(held.selected.selected_arm)
+692:         predicted = np.array(self._pose_position(tcp)) + rotation(tcp) @ held.offset_in_tcp
+693:         observed = inspected.objects.objects[0].obb_pose.position
+694:         tolerance = float(self.get_parameter('sorting_held_association_tolerance_m').value)
+695:         if not math.isfinite(tolerance) or tolerance <= 0.:
+696:             raise ValueError('Held-object association tolerance must be finite and positive')
+697:         error = np.linalg.norm(predicted - np.array((observed.x, observed.y, observed.z)))
+698:         if not math.isfinite(error) or error > tolerance:
+699:             raise RuntimeError(f'Observed lifted object does not match held geometry: {error:.4f}m')
+700:         return inspected
+701: 
+702:     def _verify_head_redetection(self, attempt, *, minimum_center_z_m=None):
+703:         """Associate a new YOLOE mask by measured 3D position, not Gemini wording."""
+704:         held = self._held_object
+705:         if held is None:
+706:             raise RuntimeError('No attachment reference for head RGB-D reobservation')
+707:         minimum = float(self.get_parameter('lift_min_center_z_m').value)
+708:         if minimum_center_z_m is not None:
+709:             minimum = max(minimum, float(minimum_center_z_m))
+710:         tolerance = float(self.get_parameter('sorting_held_association_tolerance_m').value)
+711:         if not math.isfinite(minimum) or not math.isfinite(tolerance) or tolerance <= 0:
+712:             raise ValueError('Invalid lift height or association tolerance')
+713:         arm = held.selected.selected_arm
+714:         tcp = self._tcp_pose(arm)
+715:         predicted = np.array(self._pose_position(tcp)) + rotation(tcp) @ held.offset_in_tcp
+716:         detected = self._detect_objects()
+717:         matches = []
+718:         for item in detected.detections.detections:
+719:             if not item.distance_valid:
+720:                 continue
+721:             candidate = ObjectAttempt(
+722:                 object_id=int(item.object_id), label=item.label,
+723:                 confidence=float(item.confidence), distance_m=float(item.distance_m))
+724:             inspected = self._inspect_selected(detected.detections.snapshot_id, candidate)
+725:             if inspected is None:
+726:                 continue
+727:             center = inspected.objects.objects[0].obb_pose.position
+728:             position = np.array((center.x, center.y, center.z))
+729:             error = float(np.linalg.norm(predicted - position))
+730:             if math.isfinite(error) and error <= tolerance:
+731:                 matches.append((inspected, error))
+732:         if not matches:
+733:             raise LiftRedetectionError(
+734:                 f'Head RGB-D could not associate lifted {attempt.label} with the gripper')
+735:         if len(matches) != 1:
+736:             raise RuntimeError('Head RGB-D found multiple objects at the held-object position')
+737:         inspected, error = matches[0]
+738:         center_z = float(inspected.objects.objects[0].obb_pose.position.z)
+739:         self.get_logger().debug(
+740:             f'Head RGB-D lift verification: source={attempt.label} '
+741:             f'observed={inspected.objects.objects[0].label} '
+742:             f'center_z={center_z:.3f}m association_error={error:.3f}m')
+743:         if not math.isfinite(center_z) or center_z < minimum:
+744:             raise RuntimeError(
+745:                 f'{attempt.label} was not retained after lift: '
+746:                 f'center_z={center_z:.3f}m minimum={minimum:.3f}m')
+747:         return inspected
+748: 
+749: 
+750:     def _held_center_joints(self, held: HeldObject, center: np.ndarray,
+751:                             tolerance_m: float) -> JointState | None:
+752:         arm = held.selected.selected_arm
+753:         pose = self._tcp_pose(arm)
+754:         self._transport_adapter.set_current_state(self._feedback_state())
+755:         solution = None
+756:         for _ in range(5):
+757:             target = center - rotation(pose) @ held.offset_in_tcp
+758:             solution = self._transport_adapter.solve_position_ik(
+759:                 arm, tuple(float(v) for v in target), solution)
+760:             if solution is None:
+761:                 self.get_logger().debug(f'Held-center IK unavailable: target={target.tolist()}')
+762:                 return None
+763:             joints = JointState(name=list(solution.names), position=list(solution.positions))
+764:             pose = self._tcp_pose(arm, joints)
+765:             predicted = np.array(self._pose_position(pose)) + rotation(pose) @ held.offset_in_tcp
+766:             if np.linalg.norm(predicted-center) < tolerance_m:
+767:                 valid = self._transport_adapter.state_is_valid(arm, solution)
+768:                 if not valid:
+769:                     self.get_logger().debug('Held-center IK rejected by collision check')
+770:                 return joints if valid else None
+771:         self.get_logger().debug(
+772:             f'Held-center fixed-point IK did not converge: error_m={np.linalg.norm(predicted-center):.5f}')
+773:         return None
+774: 
+775:     def _require_held_contact(self, held: HeldObject) -> None:
+776:         if not self._gripper_contact_stalled(
+777:                 held.selected.selected_arm,
+778:                 float(self.get_parameter('gripper_open_position_rad').value),
+779:                 self._candidate_close_position(held.selected.selected_candidate)):
+780:             raise RuntimeError('Held-object reobservation lost settled gripper contact')
+781: 
+782:     def _confirm_held_contact(self, held: HeldObject) -> None:
+783:         """Require consecutive post-request motor feedback while the arm is held."""
+784:         duration = float(self.get_parameter('sorting_wrist_contact_confirmation_sec').value)
+785:         timeout = float(self.get_parameter('gripper_contact_feedback_timeout_sec').value)
+786:         maximum_age = float(self.get_parameter('sorting_gripper_feedback_max_age_sec').value)
+787:         if (not all(math.isfinite(v) and v > 0 for v in (duration, timeout, maximum_age))
+788:                 or duration > timeout):
+789:             raise ValueError('Invalid held-contact confirmation timing')
+790:         joint = f'{held.selected.selected_arm}_gripper_joint'
+791:         previous = self.get_clock().now().nanoseconds
+792:         first = None
+793:         samples = 0
+794:         deadline = time.monotonic() + timeout
+795:         while time.monotonic() < deadline:
+796:             self._spin_once(timeout_sec=0.05)
+797:             stamp = self._gripper_feedback_stamps.get(joint, 0)
+798:             if stamp <= previous:
+799:                 continue
+800:             now = self.get_clock().now().nanoseconds
+801:             # /joint_states and /clock have separate subscriptions. A joint
+802:             # update can arrive first; leave it uncounted until the clock catches
+803:             # up. A stopped clock or persistently future stamp still times out.
+804:             if stamp > now:
+805:                 continue
+806:             if (now - stamp) / 1e9 > maximum_age:
+807:                 raise RuntimeError('Held-gripper feedback is stale')
+808:             if first is not None and (stamp - previous) / 1e9 > maximum_age:
+809:                 raise RuntimeError('Held-gripper feedback continuity was lost')
+810:             self._require_held_contact(held)
+811:             previous = stamp
+812:             first = stamp if first is None else first
+813:             samples += 1
+814:             if samples >= 3 and (stamp - first) / 1e9 >= duration:
+815:                 return
+816:         raise RuntimeError('No fresh sustained held-gripper feedback before timeout')
+817: 
+818:     def _verify_wrist_or_contact(self, held: HeldObject):
+819:         attempts = int(self.get_parameter('sorting_wrist_check_attempts').value)
+820:         if not 1 <= attempts <= 5:
+821:             raise ValueError('Wrist check attempts must be within [1, 5]')
+822:         after_stamp_ns = None
+823:         for attempt in range(1, attempts + 1):
+824:             self._confirm_held_contact(held)
+825:             try:
+826:                 result = self._observe_wrist(
+827:                     held.selected, ObserveWristTarget.Request.CHECK, held=True,
+828:                     after_stamp_ns=after_stamp_ns)
+829:             except WristTargetNotDetected as error:
+830:                 self._confirm_held_contact(held)
+831:                 after_stamp_ns = error.stamp_ns
+832:                 self.get_logger().warning(
+833:                     f'Wrist target not detected ({attempt}/{attempts}); '
+834:                     f'fresh gripper contact remains stable: {error}')
+835:             else:
+836:                 self._confirm_held_contact(held)
+837:                 self.get_logger().info('Wrist RGB + gripper contact consistent after lift; '
+838:                                        'height is kinematic, not an independent depth measurement')
+839:                 return result
+840:         self.get_logger().warning(
+841:             f'Continuing after {attempts} fresh wrist misses with sustained gripper feedback; '
+842:             'visual grasp confirmation unavailable, lift height remains kinematic')
+843:         return None
+844: 
+845:     def _reobserve_held_object(self, minimum_center_z_m: float | None) -> None:
+846:         held, info = self._held_object, self._camera_info
+847:         if held is None or info is None:
+848:             raise RuntimeError('Reobservation needs camera calibration and settled attachment')
+849:         self._require_held_contact(held)
+850:         arm = held.selected.selected_arm
+851:         self._wait_arm_stationary(arm)
+852:         transform = self._tf_buffer.lookup_transform(
+853:             held.selected.selected_candidate.header.frame_id,
+854:             info.header.frame_id, Time()).transform
+855:         q, t = transform.rotation, transform.translation
+856:         camera = CameraProjection(
+857:             float(info.k[0]), float(info.k[4]), float(info.k[2]), float(info.k[5]),
+858:             (t.x, t.y, t.z), tuple(rotation_matrix_from_quaternion(q.x, q.y, q.z, q.w).flat))
+859:         tcp = self._tcp_pose(arm)
+860:         center = np.array(self._pose_position(tcp)) + rotation(tcp) @ held.offset_in_tcp
+861:         padding = float(self.get_parameter('sorting_reobserve_geometry_padding_m').value)
+862:         if not math.isfinite(padding) or padding < 0.:
+863:             raise ValueError('Reobservation padding must be finite and nonnegative')
+864:         radius = held_bounding_radius(self, held) + padding
+865:         minimum = max(float(self.get_parameter('lift_min_center_z_m').value),
+866:                       minimum_center_z_m if minimum_center_z_m is not None else -math.inf)
+867:         centers = reobservation_centers(
+868:             camera, info.width, info.height, center, radius,
+869:             minimum_z_m=minimum,
+870:             margin_px=float(self.get_parameter('sorting_reobserve_margin_px').value),
+871:             maximum_translation_m=float(self.get_parameter('sorting_reobserve_max_translation_m').value),
+872:             maximum_lowering_m=float(self.get_parameter('sorting_reobserve_max_lowering_m').value),
+873:             height_clearance_m=float(self.get_parameter('sorting_reobserve_height_clearance_m').value))
+874:         self.get_logger().debug(
+875:             f'Held reobservation: predicted_center={center.tolist()} radius={radius:.4f}m '
+876:             f'frustum_candidates={[c.tolist() for c in centers]}')
+877:         if bool(self.get_parameter('require_sensor_scene').value):
+878:             self._wait_for_sensor_scene(float(self.get_parameter('attachment_scene_timeout_sec').value))
+879:         for candidate in centers:
+880:             joints = self._held_center_joints(held, candidate, 0.005)
+881:             if joints is None:
+882:                 self.get_logger().debug(f'Reobservation IK rejected: {candidate.tolist()}')
+883:                 continue
+884:             self._move_to(arm, joints, 'held-object camera reobservation')
+885:             self._verify_feedback(joints)
+886:             self._hold('lift_hold_sec')
+887:             self._require_held_contact(held)
+888:             return
+889:         raise RuntimeError('No collision-valid held-object reobservation pose in camera frustum')
+890: 
+891:     def _feedback_state(self):
+892:         state = JointState()
+893:         state.name = list(REQUIRED_JOINT_NAMES)
+894:         state.position = [self._joint_positions[n] for n in state.name]
+895:         return state
+896: 
+897: 
+898:     def _fixed_release_ik(self, arm, point, offset, wrist):
+899:         """Reuse only an exactly matching pose, with fresh FK and scene validation."""
+900:         key = (arm, tuple(point), tuple(offset), tuple(sorted(wrist.items())))
+901:         self._transport_adapter.set_current_state(self._feedback_state())
+902:         solution = self._fixed_release_cache.get(key)
+903:         if solution is not None:
+904:             joints = JointState(name=list(solution.names), position=list(solution.positions))
+905:             pose = self._tcp_pose(arm, joints)
+906:             center = np.array(self._pose_position(pose))+rotation(pose)@offset
+907:             values = dict(zip(solution.names, solution.positions, strict=True))
+908:             if (np.max(np.abs(center-point)) <= .001
+909:                     and all(values.get(name) == value for name, value in wrist.items())
+910:                     and self._transport_adapter.state_is_valid(arm, solution)):
+911:                 self.get_logger().debug('Reusing fixed release IK after fresh FK/collision checks')
+912:                 return solution
+913:             self._fixed_release_cache.pop(key)
+914:         solution = self._transport_adapter.solve_held_region_ik(
+915:             arm, point-.0005, point+.0005, offset, fixed_joints=wrist,
+916:             attempts=int(self.get_parameter('sorting_release_ik_attempts').value),
+917:             iterations=int(self.get_parameter('sorting_release_ik_iterations').value))
+918:         if solution is not None:
+919:             if len(self._fixed_release_cache) >= 64:
+920:                 self._fixed_release_cache.pop(next(iter(self._fixed_release_cache)))
+921:             self._fixed_release_cache[key] = solution
+922:         return solution
+923: 
+924:     def _transport_fixed_release(self, held, destination):
+925:         arm = held.selected.selected_arm
+926:         point = self._fixed_release_points[destination]
+927:         # Classification already selected the destination before pick. Hold the
+928:         # post-lift wrist and plan directly to that bin, with no shared waypoint.
+929:         self._wait_arm_stationary(arm)
+930:         self._require_held_contact(held)
+931:         feedback = self._arm_joint_state(arm)
+932:         actual = dict(zip(feedback.name, feedback.position, strict=True))
+933:         self._fixed_release_wrist = {name: actual[name] for name in self._carry_wrist_reference}
+934:         drop = self._fixed_release_ik(arm, point, held.offset_in_tcp, self._fixed_release_wrist)
+935:         if drop is None:
+936:             raise RuntimeError(f'Direct fixed release unreachable with post-lift wrist: {arm}/{destination}')
+937:         self.get_logger().info(f'Fixed release: {destination} object_center={point.tolist()} wrist held')
+938:         joints = JointState(name=list(drop.names), position=list(drop.positions))
+939:         self._move_to(arm, joints, f'transport to {destination}')
+940:         self._verify_feedback(joints)
+941:         self._require_held_contact(held)
+942: 
+943:     def transport(self, held: HeldObject, destination: str):
+944:         self._require_held_contact(held)
+945:         # TODO(bin-opening-fit): check that the held object's bounding sphere
+946:         # fits the bin opening before transport. Planned for later development.
+947:         self._transport_fixed_release(held, destination)
+948: 
+949:     def check_release_target(self, held: HeldObject, destination: str) -> None:
+950:         arm = held.selected.selected_arm
+951:         pose = self._tcp_pose(arm)
+952:         center = (np.array(self._pose_position(pose))
+953:                   + rotation(pose) @ held.offset_in_tcp)
+954:         if not np.isfinite(center).all():
+955:             raise RuntimeError('Release object center must be finite')
+956:         if getattr(self, '_fixed_release_wrist', {}):
+957:             if np.max(np.abs(center-self._fixed_release_points[destination])) > .01:
+958:                 raise RuntimeError('Fixed release object center has not reached its destination')
+959:             state = self._arm_joint_state(arm)
+960:             feedback = dict(zip(state.name, state.position, strict=True))
+961:             if any(name not in feedback or not math.isfinite(feedback[name])
+962:                    or abs(feedback[name]-value) > self._fixed_release_hold_tolerance+1e-6
+963:                    for name, value in self._fixed_release_wrist.items()):
+964:                 raise RuntimeError('Fixed release wrist feedback is outside hold tolerance')
+965:         # TODO(bin-opening-fit): legacy automatic sorting still defers this check.
+966:         # The single-object Action adds the check in MujocoOperations.
+967: 
+968:     def release(self, held: HeldObject, destination: str):
+969:         self.check_release_target(held, destination)
+970:         self.open_at_destination(held)
+971:         self.finish_release(held)
+972: 
+973:     def open_at_destination(self, held: HeldObject) -> None:
+974:         self._open_gripper(held.selected.selected_arm)
+975:         self._release_stamp_ns = self.get_clock().now().nanoseconds
+976: 
+977:     def finish_release(self, held: HeldObject) -> None:
+978:         arm = held.selected.selected_arm
+979:         self._hold('grasp_settle_sec')
+980:         self._execution_scene.restore()
+981:         self._held_object = None
+982:         self._carry_wrist_reference = {}
+983:         self._fixed_release_wrist = {}
+984:         if getattr(self, '_wrist_enabled', False) and self._wrist_reference is not None:
+985:             candidate=held.selected.selected_candidate
+986:             request=ObserveWristTarget.Request(operation=ObserveWristTarget.Request.CLEAR,
+987:                 arm=arm,reference_id=self._wrist_reference.reference_id,
+988:                 source_snapshot_id=candidate.snapshot_id,source_object_id=candidate.target_object.object_id)
+989:             response=self._future(self._wrist_client.call_async(request),3.,'clear wrist reference')
+990:             if not response.success:
+991:                 raise RuntimeError(f'Could not clear wrist reference: {response.message}')
+992:             self._wrist_reference=None
+993: 
+994:     def _next_sorting_detection(self):
+995:         if getattr(self, '_adaptive_camera_rate', False):
+996:             self._set_head_high_rate(True)
+997:         pending = getattr(self, '_return_detection', None)
+998:         self._return_detection = None
+999:         try:
+1000:             if pending is None:
+1001:                 return self._detect_objects()
+1002:             self.get_logger().info('Using scene detection requested during return')
+1003:             return self._finish_object_detection(pending)
+1004:         finally:
+1005:             if getattr(self, '_adaptive_camera_rate', False):
+1006:                 self._set_head_high_rate(False)
+1007: 
+1008:     def retreat(self, held: HeldObject, destination: str, *, prefetch: bool = True):
+1009:         arm = held.selected.selected_arm
+1010:         if self._held_object is not None:
+1011:             raise RuntimeError('Cannot close the returning gripper before release completes')
+1012:         joints = deepcopy(self._home[arm])
+1013:         closing = float(self.get_parameter('sorting_return_gripper_position_rad').value)
+1014:         if not math.isfinite(closing):
+1015:             raise ValueError('Return gripper position must be finite')
+1016:         joints.name.append(f'{arm}_gripper_joint')
+1017:         joints.position.append(closing)
+1018:         joints.velocity, joints.effort = [], []
+1019:         if self._wrist_enabled:
+1020:             self._switch_camera('head')
+1021:         # InspectScene waits for a new RGB-D frame after accepting the goal.
+1022:         # Inference proceeds in the perception node while this node executes return.
+1023:         if prefetch:
+1024:             self._return_detection = self._begin_object_detection()
+1025:             self.get_logger().info('Next scene detection submitted before return motion')
+1026:         self.get_logger().info(f'Return with simultaneous {arm} gripper closing')
+1027:         try:
+1028:             self._move_to(arm, joints, f'return from {destination}')
+1029:             self._verify_feedback(joints)
+1030:         except Exception:
+1031:             if self._return_detection is not None:
+1032:                 self._return_detection[0].cancel_goal_async()
+1033:                 self._return_detection = None
+1034:             raise
+1035: 
+1036:     def _switch_camera(self, camera: str):
+1037:         if not self._camera_client.wait_for_service(timeout_sec=3):
+1038:             raise RuntimeError('Camera rate control service unavailable')
+1039:         request = SetParameters.Request(parameters=[Parameter('active_camera', value=camera).to_parameter_msg()])
+1040:         response = self._future(self._camera_client.call_async(request), 3., 'camera source/rate change')
+1041:         if len(response.results)!=1 or not response.results[0].successful:
+1042:             raise RuntimeError('Camera source/rate change rejected')
+1043:         self.get_logger().debug(f'Active inspection camera={camera}; head runs at configured background rate during wrist use')
+1044:         if camera == 'head':
+1045:             self._set_head_high_rate(True)
+1046: 
+1047:     def _set_head_high_rate(self, enabled: bool) -> None:
+1048:         if not getattr(self, '_adaptive_camera_rate', False):
+1049:             return
+1050:         request = SetParameters.Request(parameters=[
+1051:             Parameter('head_high_rate', value=enabled).to_parameter_msg()])
+1052:         response = self._future(self._camera_client.call_async(request), 3.,
+1053:                                 'head camera rate change')
+1054:         if len(response.results) != 1 or not response.results[0].successful:
+1055:             raise RuntimeError('Head camera rate change rejected')
+1056: 
+1057:     def _observe_wrist(self, selected, operation, *, held=False, after_stamp_ns=None):
+1058:         candidate = selected.selected_candidate
+1059:         obj = candidate.target_object
+1060:         request = ObserveWristTarget.Request(operation=operation, arm=selected.selected_arm,
+1061:             source_snapshot_id=candidate.snapshot_id, source_object_id=obj.object_id,
+1062:             label=obj.label, source_confidence=obj.confidence,
+1063:             detector_label=obj.detector_label,
+1064:             reference_id=self._wrist_reference.reference_id if self._wrist_reference else '',
+1065:             size=deepcopy(obj.obb_size), after_stamp_ns=self.get_clock().now().nanoseconds)
+1066:         if operation == ObserveWristTarget.Request.CHECK:
+1067:             completed = getattr(self, '_lift_completion_stamp_ns', None)
+1068:             if completed is None or not 0 < completed <= request.after_stamp_ns:
+1069:                 raise RuntimeError('Missing or invalid lift completion freshness barrier')
+1070:             # Results captured during the existing stabilization hold are valid
+1071:             # post-lift evidence. Do not force another full frame after the hold.
+1072:             request.after_stamp_ns = max(completed, after_stamp_ns or 0)
+1073:         request.expected_pose.header=deepcopy(candidate.header)
+1074:         request.expected_pose.pose=deepcopy(obj.obb_pose)
+1075:         if held:
+1076:             tcp = self._tcp_pose(selected.selected_arm)
+1077:             center = np.array(self._pose_position(tcp))+rotation(tcp)@self._held_object.offset_in_tcp
+1078:             request.expected_pose.pose.position.x, request.expected_pose.pose.position.y, request.expected_pose.pose.position.z = map(float,center)
+1079:             from cleany_skill_executor.core.wrist_pose import carried_orientation
+1080:             request.expected_pose.pose.orientation = carried_orientation(
+1081:                 self._contact_tcp_quaternion, tcp.orientation, obj.obb_pose.orientation)
+1082:         self._record_pipeline_message('wrist_request', request)
+1083:         started = time.monotonic()
+1084:         response = self._future(self._wrist_client.call_async(request), 30., 'wrist RGB verification')
+1085:         self.get_logger().debug(f'WRIST RPC operation={operation} elapsed_sec={time.monotonic()-started:.3f} '
+1086:                                f'after_ns={request.after_stamp_ns}')
+1087:         self._record_pipeline_message('wrist_response', response)
+1088:         missing = (not response.success and response.status == response.NOT_DETECTED
+1089:                    and operation == ObserveWristTarget.Request.CHECK)
+1090:         if not missing and (not response.success or response.status != response.OK):
+1091:             raise RuntimeError(f'Wrist RGB verification failed: {response.message}')
+1092:         stamp=response.header.stamp.sec*10**9+response.header.stamp.nanosec
+1093:         if (response.source_snapshot_id != candidate.snapshot_id
+1094:                 or response.source_object_id != obj.object_id
+1095:                 or response.header.frame_id != f'{selected.selected_arm}_wrist_rgb_optical_frame'
+1096:                 or not request.after_stamp_ns < stamp <= self.get_clock().now().nanoseconds
+1097:                 or not response.reference_id
+1098:                 or (operation==ObserveWristTarget.Request.CHECK and
+1099:                     response.reference_id != request.reference_id)):
+1100:             raise RuntimeError('Wrist response source/frame/timestamp mismatch')
+1101:         if missing:
+1102:             raise WristTargetNotDetected(response.message, stamp)
+1103:         return response
+1104: 
+1105:     def verify_placement(self, target: SortTarget, destination: str) -> bool:
+1106:         request = VerifyPlacement.Request(
+1107:             label=target.attempt.label, destination_id=destination,
+1108:             after_stamp_ns=self._release_stamp_ns)
+1109:         deadline = time.monotonic() + self.get_parameter(
+1110:             'sorting_verification_timeout_sec').value
+1111:         while time.monotonic() < deadline:
+1112:             response = self._future(self._verification.call_async(request),
+1113:                                     2.0, 'placement verification')
+1114:             if response.success:
+1115:                 self.get_logger().info(response.message)
+1116:                 return True
+1117:             self._spin_once(timeout_sec=0.1)
+1118:         return False
+1119: 
+1120:     def _register_bins(self):
+1121:         # Known collection-station calibration only. Desk and item geometry
+1122:         # still comes from the depth sensor, never from the MuJoCo scene.
+1123:         scene = PlanningScene(is_diff=True)
+1124:         scene.robot_state.is_diff = True
+1125:         for bin_ in self._bins.values():
+1126:             item = CollisionObject(id=bin_.name, operation=CollisionObject.ADD)
+1127:             item.header.frame_id = 'base_link'
+1128:             for _, size, center in bin_.boxes():
+1129:                 item.primitives.append(SolidPrimitive(
+1130:                     type=SolidPrimitive.BOX, dimensions=list(size)))
+1131:                 pose = Pose()
+1132:                 pose.position.x, pose.position.y, pose.position.z = center
+1133:                 pose.orientation.w = 1.0
+1134:                 item.primitive_poses.append(pose)
+1135:             scene.world.collision_objects.append(item)
+1136:         for name, size, center in load_shelf_boxes(
+1137:                 self.get_parameter('sorting_bins_config').value):
+1138:             item = CollisionObject(id=name, operation=CollisionObject.ADD)
+1139:             item.header.frame_id = 'base_link'
+1140:             item.primitives.append(SolidPrimitive(type=SolidPrimitive.BOX, dimensions=list(size)))
+1141:             pose = Pose()
+1142:             pose.position.x, pose.position.y, pose.position.z = center
+1143:             pose.orientation.w = 1.0
+1144:             item.primitive_poses.append(pose)
+1145:             scene.world.collision_objects.append(item)
+1146:         if not self._apply_scene.wait_for_service(timeout_sec=5.0):
+1147:             raise RuntimeError('Planning scene is unavailable')
+1148:         request = ApplyPlanningScene.Request(scene=scene)
+1149:         response = self._future(
+1150:             self._apply_scene.call_async(request),
+1151:             5.0, 'bin collision scene')
+1152:         if not response.success:
+1153:             raise RuntimeError('Could not register collection bins')
+1154: 
+1155: 
+1156: def main(args=None):
+1157:     rclpy.init(args=args)
+1158:     node = SortingCoordinator()
+1159:     failed = False
+1160:     try:
+1161:         node.run()
+1162:         if not node.get_parameter('sorting_exit_on_finish').value:
+1163:             rclpy.spin(node)
+1164:     except KeyboardInterrupt:
+1165:         pass
+1166:     except Exception as error:
+1167:         failed = True
+1168:         node._stage('failed', error=str(error))
+1169:         node.get_logger().fatal(f'SORTING FAILED: {error}')
+1170:         try:
+1171:             if not node.get_parameter('sorting_exit_on_finish').value:
+1172:                 rclpy.spin(node)
+1173:         except KeyboardInterrupt:
+1174:             pass
+1175:     finally:
+1176:         node.destroy_node()
+1177:         if rclpy.ok():
+1178:             rclpy.shutdown()
+1179:     if failed:
+1180:         raise SystemExit(1)

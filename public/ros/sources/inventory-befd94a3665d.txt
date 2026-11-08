@@ -1,0 +1,340 @@
+ros2_ws/src/cleany_manipulation_bt/cleany_manipulation_bt/jetson_node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 0b4d68cb2feb314ecba454701ed8121534d6ecc0c5df5555b79fd11e15fe9efd
+
+1: """Jetson Action wrapper. Uses the existing contract and a separate persistent journal."""
+2: from __future__ import annotations
+3: 
+4: import os
+5: import signal
+6: import threading
+7: import time
+8: from pathlib import Path
+9: 
+10: from ament_index_python.packages import get_package_share_directory
+11: from cleany_interfaces.action import ExecuteManipulationSkill
+12: from cleany_interfaces.msg import ManipulationExecutionRecord
+13: from cleany_interfaces.srv import CancelManipulation, ConfirmManipulationRecovery, GetManipulationExecution
+14: from cleany_skill_executor.manipulation_node import ManipulationNode, record_message
+15: from cleany_skill_executor.manipulation.models import RecordState
+16: from cleany_skill_executor.core.collection import temporary_return_mode
+17: from .store import BTExecutionStore
+18: import rclpy
+19: from rclpy.action import ActionServer
+20: from rclpy.callback_groups import ReentrantCallbackGroup
+21: from rclpy.clock import Clock, ClockType
+22: from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
+23: from rclpy.node import Node
+24: from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+25: from rclpy.signals import SignalHandlerOptions
+26: from std_msgs.msg import String
+27: from std_srvs.srv import Trigger
+28: import json
+29: import zmq
+30: 
+31: from ._bt_runner import Runner
+32: from .backend import WorkerBackend
+33: from .core import ExecutionCore
+34: from .monitor import LiveMonitor
+35: from .jetson_operations import JetsonOperations
+36: from .arm_return_server import ArmReturnServer
+37: from rclpy.parameter import Parameter
+38: 
+39: 
+40: def default_database_path() -> str:
+41:     state = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state')
+42:     return str(state / 'cleany/manipulation_jetson/executions.sqlite3')
+43: 
+44: 
+45: class JetsonManipulationNode(ManipulationNode):
+46:     def __init__(self, *, backend=None, operations=None, **kwargs) -> None:
+47:         self._closing = False
+48:         Node.__init__(self, 'manipulation_jetson_server', **kwargs)
+49:         self.operations, self.backend = operations, backend
+50:         try:
+51:             self._initialize(backend=backend, operations=operations, **kwargs)
+52:         except Exception:
+53:             # A failed bind or invalid config must release physical ownership
+54:             # before another constructor is attempted in the same process.
+55:             self.destroy_node()
+56:             raise
+57: 
+58:     def _initialize(self, *, backend=None, operations=None, **kwargs) -> None:
+59:         share = Path(get_package_share_directory('cleany_manipulation_bt'))
+60:         self.declare_parameter('database_path', default_database_path())
+61:         self.declare_parameter('tree_xml', str(share / 'trees/collect_trash_mujoco.xml'))
+62:         self.declare_parameter('monitor_port', 1667)
+63:         self.declare_parameter('bt_operation_timeout_sec', 180.0)
+64:         self.declare_parameter('bt_selection_timeout_sec', 600.0)
+65:         self.declare_parameter('bt_stop_timeout_sec', 10.0)
+66:         self.declare_parameter('collection_config', '')
+67:         self.declare_parameter('arm_return_pose_file', '')
+68:         port = int(self.get_parameter('monitor_port').value)
+69:         if not 1 <= port <= 65535:
+70:             raise ValueError('monitor_port must be between 1 and 65535')
+71:         self.operations = operations
+72:         if backend is None:
+73:             if operations is None:
+74:                 config = json.loads(Path(self.get_parameter('collection_config').value).expanduser().read_text())
+75:                 overrides = list(kwargs.get('parameter_overrides', []))
+76:                 overrides += [Parameter('require_sensor_scene', value=True),
+77:                               Parameter('use_sim_time', value=False)]
+78:                 self.operations = JetsonOperations(config, context=self.context,
+79:                                                     parameter_overrides=overrides)
+80:             else:
+81:                 self.operations = operations
+82:             backend = WorkerBackend(self.operations.execute, quiescent=self.operations.quiescent)
+83:         self.backend = backend
+84:         self.store = BTExecutionStore(self.get_parameter('database_path').value)
+85:         self.core = ExecutionCore(self.backend, self.store, self.get_parameter('tree_xml').value, Runner,
+86:                                   timeout_sec=float(self.get_parameter('bt_operation_timeout_sec').value),
+87:                                   stop_timeout_sec=float(self.get_parameter('bt_stop_timeout_sec').value) + 2.,
+88:                                   execution_profile='jetson',
+89:                                   operation_timeouts={'SelectArmAndPath': float(
+90:                                       self.get_parameter('bt_selection_timeout_sec').value)},
+91:                                   allow_assumed_placement=temporary_return_mode(
+92:                                       getattr(self.operations, 'config', {})))
+93:         self._handle = self._result_future = None
+94:         self._closing = False
+95:         self._futures = {}
+96:         group = ReentrantCallbackGroup()
+97:         qos = QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE,
+98:                          durability=DurabilityPolicy.TRANSIENT_LOCAL)
+99:         self._events = self.create_publisher(ManipulationExecutionRecord, 'manipulation/execution_events', qos)
+100:         self._bt_events = self.create_publisher(String, 'manipulation/bt_transitions', qos)
+101:         self._service = self.create_service(GetManipulationExecution, 'manipulation/get_execution', self._get,
+102:                                             callback_group=group)
+103:         self._operator_state = self.create_service(Trigger, 'manipulation/control_state',
+104:                                                    self._control_state, callback_group=group)
+105:         self._recovery_service = self.create_service(ConfirmManipulationRecovery,
+106:             'manipulation/confirm_recovery', self._confirm_recovery, callback_group=group)
+107:         action_name = self.resolve_topic_name('manipulation/execute_skill')
+108:         self._action = ActionServer(self, ExecuteManipulationSkill, action_name,
+109:                                     execute_callback=self._execute, goal_callback=self._goal,
+110:                                     handle_accepted_callback=self._accepted, cancel_callback=self._cancel,
+111:                                     callback_group=group)
+112:         self._setup_cancel_service(group, action_name)
+113:         self.arm_return = ArmReturnServer(self, group, self.get_parameter('arm_return_pose_file').value)
+114:         self.monitor = LiveMonitor()
+115:         # Even the idle tree is a real native tree. It is never ticked or used
+116:         # for motion until an accepted execution creates its own context.
+117:         self.monitor.update(Runner(self.get_parameter('tree_xml').value, self.core, '').snapshot())
+118:         self.zmq_context = zmq.Context()
+119:         self.socket = self.zmq_context.socket(zmq.REP)
+120:         self.socket.setsockopt(zmq.LINGER, 0)
+121:         self.socket.bind(f'tcp://127.0.0.1:{port}')
+122:         self._monitor_execution = ''
+123:         self._monitor_failed_execution = ''
+124:         self._timer = self.create_timer(0.05, self._tick, callback_group=group,
+125:                                        clock=Clock(clock_type=ClockType.STEADY_TIME))
+126:         self._progress_timer = self.create_timer(1.0, self._publish_progress, callback_group=group,
+127:                                                 clock=Clock(clock_type=ClockType.STEADY_TIME))
+128:         self._publish_events()
+129:         self.get_logger().info(f'Jetson BT ready; database={self.store.path}; monitor=127.0.0.1:{port}; '
+130:                                f'inhibited={self.core.inhibited}')
+131: 
+132:     def _control_state(self, _request, response):
+133:         """Report current executor ownership without commanding or clearing faults."""
+134:         with self.core.lock:
+135:             record = self.core.record
+136:             active = record is not None and record.result is None and record.record_state == RecordState.ACTIVE
+137:             operations = self.operations
+138:             real = getattr(operations, 'real', None)
+139:             guard = getattr(real, 'guard', None)
+140:             guard_time = getattr(real, 'guard_time', None)
+141:             max_age = real.value('hardware_guard_max_age_sec') if real is not None else 1.
+142:             fresh = guard_time is not None and time.monotonic() - guard_time < max_age
+143:             response.message = json.dumps(dict(schema=1,
+144:                 active_execution_id=record.goal.execution_id if active else '',
+145:                 active_stage=record.stage.value if active else '',
+146:                 active_substage=record.substage if active else '',
+147:                 arm_return_active=self.core.arm_return_active,
+148:                 recovery_active=self.core._recovery_in_progress,
+149:                 backend_ready=self.backend.ready(), inhibited=self.core.inhibited,
+150:                 blocked=[dict(execution_id=item.goal.execution_id, revision=item.revision)
+151:                          for item in self.core.recovery_blocks()],
+152:                 guard=guard if fresh else None, guard_fresh=fresh,
+153:                 hardware_fault=getattr(real, 'fault', ''),
+154:                 payload_attached=getattr(operations, 'carrying', None) is not None,
+155:                 operation_mode=getattr(operations, 'config', {}).get('operation_mode', ''),
+156:                 last_result=record_message(record).status if record is not None and record.result is not None else '',
+157:                 last_stop_confirmed=record.stop_confirmed if record is not None and record.result is not None else False))
+158:             response.success = True
+159:         return response
+160: 
+161:     def _publish_progress(self) -> None:
+162:         """Repeat active evidence for observers without advancing durable progress."""
+163:         with self.core.lock:
+164:             record = self.core.record
+165:             if record is not None and record.result is None and record.record_state == RecordState.ACTIVE:
+166:                 self._events.publish(record_message(record))
+167: 
+168:     def _confirm_recovery(self, request, response):
+169:         if not request.robot_stopped_confirmed and not request.gripper_empty_confirmed:
+170:             response.success, response.message = True, 'Recovery status; no state changed'
+171:         else:
+172:             verify = getattr(self.operations, 'confirm_recovery_stationary', None)
+173:             if verify is None:
+174:                 response.success, response.message = False, 'Physical stop verification unavailable'
+175:             else:
+176:                 response.success, response.message = self.core.confirm_recovery(
+177:                     request.execution_id, request.expected_revision,
+178:                     stopped=request.robot_stopped_confirmed,
+179:                     gripper_empty=request.gripper_empty_confirmed,
+180:                     note=request.operator_note, verify_stationary=verify)
+181:                 if response.success:
+182:                     self.get_logger().info(f'Recovery confirmed for {request.execution_id}: {response.message}')
+183:         with self.core.lock:
+184:             blocked = self.core.recovery_blocks()
+185:             response.inhibited = self.core.inhibited
+186:             response.blocked_execution_ids = [record.goal.execution_id for record in blocked]
+187:             response.blocked_revisions = [record.revision for record in blocked]
+188:         return response
+189: 
+190:     def _tick(self) -> None:
+191:         with self.core.lock:
+192:             if self._closing:
+193:                 return
+194:             if self.core.record is not None:
+195:                 super()._tick()
+196:                 self._update_operation_progress()
+197:             if self.core.tree is not None:
+198:                 execution = self.core.record.goal.execution_id
+199:                 if execution != self._monitor_failed_execution:
+200:                     try:
+201:                         self.monitor.update(self.core.tree.snapshot(), new_execution=execution != self._monitor_execution)
+202:                     except Exception as error:
+203:                         self._monitor_failed_execution = execution
+204:                         self.get_logger().warning(f'BT monitor unavailable for {execution}: {error}')
+205:                     else:
+206:                         self._monitor_execution = execution
+207:                 for event in self.core.transitions:
+208:                     self._bt_events.publish(String(data=json.dumps(dict(execution_id=execution, **event))))
+209:                 self.core.transitions.clear()
+210:             for _ in range(10):
+211:                 try:
+212:                     frames = self.socket.recv_multipart(flags=zmq.NOBLOCK)
+213:                 except zmq.Again:
+214:                     break
+215:                 self.socket.send_multipart(self.monitor.reply(frames))
+216: 
+217:     def _update_operation_progress(self) -> None:
+218:         record = self.core.record
+219:         context = getattr(getattr(self, 'operations', None), 'execution_context', None)
+220:         if (record is not None and record.result is None
+221:                 and record.substage == 'SelectArmAndPath' and context is not None
+222:                 and context.goal.execution_id == record.goal.execution_id
+223:                 and not context.abort.is_set() and context.progress
+224:                 and context.progress != record.message):
+225:             self.core._save(message=context.progress)
+226: 
+227:     def destroy_node(self):
+228:         core = getattr(self, 'core', None)
+229:         if core is not None:
+230:             with core.lock:
+231:                 self._closing = True
+232:         arm_return = getattr(self, 'arm_return', None)
+233:         if arm_return is not None:
+234:             arm_return.destroy()
+235:         timer, action, core = (getattr(self, name, None) for name in ('_timer', '_action', 'core'))
+236:         if timer is not None:
+237:             timer.cancel()
+238:         progress_timer = getattr(self, '_progress_timer', None)
+239:         if progress_timer is not None:
+240:             progress_timer.cancel()
+241:         if action is not None:
+242:             action.destroy()
+243:         # Shutdown only halts work; the ACTIVE record remains for recovery.
+244:         if core is not None and core.tree is not None and core.record.result is None:
+245:             core.tree.halt()
+246:         if self.backend is not None:
+247:             self.backend.close()
+248:         if self.operations is not None:
+249:             self.operations.destroy_node()
+250:         for name, method in (('socket', 'close'), ('zmq_context', 'term'), ('store', 'close')):
+251:             resource = getattr(self, name, None)
+252:             if resource is not None:
+253:                 getattr(resource, method)()
+254:         return Node.destroy_node(self)
+255: 
+256: 
+257: def drain_shutdown(node: JetsonManipulationNode, executor: MultiThreadedExecutor) -> bool:
+258:     """Keep DDS alive for IMMEDIATE cancellation and independent stop assessment."""
+259:     with node.core.lock:
+260:         node.core.inhibited = True
+261:     arm_return = getattr(node, 'arm_return', None)
+262:     if arm_return is not None:
+263:         arm_return.request_shutdown()
+264:         if node.core.arm_return_active:
+265:             if not arm_return.drain(executor, node.core.stop_timeout_sec + 2.):
+266:                 return False
+267:     with node.core.lock:
+268:         record = node.core.record
+269:         if record is None or record.result is not None:
+270:             return True
+271:         execution_id = record.goal.execution_id
+272:     request = CancelManipulation.Request(execution_id=execution_id, mode='IMMEDIATE')
+273:     deadline = time.monotonic() + node.core.stop_timeout_sec + 2.0
+274:     task = receipt = None
+275:     # The application future completing precedes rclpy dispatching its Result
+276:     # responses. A standard GetResult round trip keeps those callbacks alive.
+277:     result_client = node.create_client(ExecuteManipulationSkill.Impl.GetResultService,
+278:                                        'manipulation/execute_skill/_action/get_result')
+279:     try:
+280:         while node.context.ok() and time.monotonic() < deadline:
+281:             with node.core.lock:
+282:                 record = node.core.record
+283:                 if (record.result is not None and node._handle is None and not node._futures
+284:                         and receipt is not None and receipt.done() and receipt.exception() is None):
+285:                     return record.result.stop_confirmed
+286:                 if node._handle is not None:
+287:                     if receipt is None:
+288:                         receipt = result_client.call_async(ExecuteManipulationSkill.Impl.GetResultService.Request(
+289:                             goal_id=node._handle.goal_id))
+290:                     if task is None or (task.done() and (
+291:                             task.exception() is not None or not task.result().accepted)):
+292:                         task = executor.create_task(node._request_cancel, request, CancelManipulation.Response())
+293:             executor.spin_once(timeout_sec=0.05)
+294:         node.backend.abort()
+295:         node.get_logger().error('Shutdown stop unconfirmed; inspect the execution journal and physical state')
+296:         return False
+297:     finally:
+298:         node.destroy_client(result_client)
+299: 
+300: 
+301: def main(args=None) -> None:
+302:     # ROS's default handlers shut the context down before controller cancellation
+303:     # can receive its acknowledgement or fresh feedback. Retain DDS until drained.
+304:     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
+305:     shutdown = threading.Event()
+306:     previous_handlers = {sig: signal.signal(sig, lambda *_: shutdown.set())
+307:                          for sig in (signal.SIGINT, signal.SIGTERM)}
+308:     node = None
+309:     executor = MultiThreadedExecutor(num_threads=4)
+310:     try:
+311:         node = JetsonManipulationNode()
+312:         executor.add_node(node)
+313:         if node.operations is not None:
+314:             executor.add_node(node.operations)
+315:         while rclpy.ok() and not shutdown.is_set():
+316:             executor.spin_once(timeout_sec=0.1)
+317:     except (KeyboardInterrupt, ExternalShutdownException):
+318:         pass
+319:     finally:
+320:         try:
+321:             try:
+322:                 if node is not None and rclpy.ok():
+323:                     drain_shutdown(node, executor)
+324:             finally:
+325:                 # launch may repeat signals while resources are being released.
+326:                 for sig in previous_handlers:
+327:                     signal.signal(sig, signal.SIG_IGN)
+328:                 executor.shutdown()
+329:                 if node is not None:
+330:                     node.destroy_node()
+331:                 if rclpy.ok():
+332:                     rclpy.shutdown()
+333:         finally:
+334:             for sig, handler in previous_handlers.items():
+335:                 signal.signal(sig, handler)

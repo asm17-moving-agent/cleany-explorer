@@ -1,0 +1,17 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/planning_scene.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 67a0da6f1513f6a0428ba704123068ab32d7b68197daefbeda0fd196943b4b1e
+
+91:         self._support_id = ''
+92:         self._support_acm = None
+93:         self._geometry_lookup = geometry_lookup
+94:         self._apply_client = apply_client or node.create_client(
+95:             ApplyPlanningScene, '/apply_planning_scene'
+96:         )
+97:         self._get_client = get_client or node.create_client(
+98:             GetPlanningScene, '/get_planning_scene'
+99:         )
+100:         self._timeout = timeout_sec
+101:         self._spin_once = spin_once or (lambda duration: time.sleep(duration))
+102:         self._object_id = ''

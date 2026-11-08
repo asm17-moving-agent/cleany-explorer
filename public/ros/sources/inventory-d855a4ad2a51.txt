@@ -1,0 +1,22 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/sensor_scene.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: c43b4a5ba61641cc1406c475722fee05bc54d6ac31446068128698e717327072
+
+46:             period = float(node.get_parameter('sensor_scene_snapshot_period_sec').value)
+47:             if not math.isfinite(period) or not 0 < period < self.maximum_age:
+48:                 raise ValueError('Map snapshot period must be shorter than its maximum age')
+49:             self._snapshot_client = node.create_client(GetPlanningScene,
+50:                 str(node.get_parameter('sensor_scene_service').value), callback_group=group)
+51:             self._snapshot_future = None
+52:             self._snapshot_sent = 0.
+53:             self._snapshot_timer = node.create_timer(period, self._request_snapshot, callback_group=group)
+54:             self._subscriptions = [
+55:                 node.create_subscription(Header, str(node.get_parameter('sensor_scene_receipt_topic').value),
+56:                                          self.on_receipt, 1, callback_group=group),
+57:                 node.create_subscription(PlanningScene, str(node.get_parameter('sensor_scene_topic').value),
+58:                                          self.on_scene, 1, callback_group=group),
+59:             ]
+60: 
+61:     def _request_snapshot(self):
+62:         # Static occupancy may not appear in state-only scene diffs, and a new

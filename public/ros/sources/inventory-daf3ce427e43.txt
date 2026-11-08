@@ -1,0 +1,682 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/pregrasp_pipeline.py
+Review: 2026-11-01
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: b5e0191edd5f0515118d4657c0e5ccb4e77e25f236b961badc3b0621e2c773eb
+
+1: """One-shot validation, optional MuJoCo pregrasp arrival, and YOLOE-seg observation.
+2: 
+3: The default mode only calls read-only perception/planning services. Physical
+4: execution is exposed exclusively by the configured collection_pipeline subclass.
+5: This CLI continues to expose only plan_only and mujoco.
+6: """
+7: from __future__ import annotations
+8: 
+9: import argparse
+10: from copy import deepcopy
+11: import json
+12: import math
+13: from pathlib import Path
+14: import threading
+15: import time
+16: 
+17: import rclpy
+18: from action_msgs.msg import GoalStatus
+19: from cleany_interfaces.action import ValidatePick
+20: from cleany_interfaces.srv import ObserveObjectReference, ObserveWristTarget
+21: from controller_manager_msgs.srv import ListHardwareComponents, ListControllers
+22: from control_msgs.action import FollowJointTrajectory
+23: from rclpy.action import ActionClient
+24: from rclpy.executors import MultiThreadedExecutor
+25: from rclpy.node import Node
+26: from rclpy.qos import QoSProfile, DurabilityPolicy
+27: from sensor_msgs.msg import JointState
+28: from std_msgs.msg import String
+29: from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+30: 
+31: from cleany_skill_executor.core.physical_grasp_selection import ARM_JOINT_NAMES, JointSolution, PlannedPath, REQUIRED_JOINT_NAMES
+32: from cleany_skill_executor.core.cartesian import CartesianPose, execution_wall_timeout
+33: from cleany_skill_executor.physical_moveit_adapter import MoveItAdapterConfig, MoveItGraspAdapter
+34: from cleany_skill_executor.execution_timing import timed_operation
+35: from cleany_skill_executor.planning_scene import TargetSceneTransaction
+36: from cleany_skill_executor.sensor_scene import SensorSceneMonitor
+37: from cleany_skill_executor.trajectory_io import path_to_message
+38: 
+39: 
+40: def check_joint_snapshot(state, now_ns, *, maximum_age=0.5):
+41:     stamp = state.header.stamp.sec*10**9+state.header.stamp.nanosec
+42:     age = (now_ns-stamp)/1e9
+43:     if (stamp <= 0 or not 0 <= (now_ns-stamp)/1e9 <= maximum_age
+44:             or len(state.name) != len(state.position) or len(set(state.name)) != len(state.name)
+45:             or not set(REQUIRED_JOINT_NAMES) <= set(state.name)
+46:             or not all(math.isfinite(q) for q in state.position)):
+47:         raise RuntimeError(f'Missing, stale, or malformed measured joint state (age={age:.3f}s)')
+48:     return dict(zip(state.name, state.position))
+49: 
+50: 
+51: def check_start_state(measured, planned, tolerance=0.02, *, commanded=(), commanded_tolerance=None):
+52:     if not set(REQUIRED_JOINT_NAMES) <= set(planned) or not set(planned) <= measured.keys():
+53:         raise RuntimeError('Incomplete planning start state')
+54:     commanded = set(commanded)
+55:     if any(not math.isfinite(q) or abs(measured[name]-q) > (
+56:             commanded_tolerance if name in commanded and commanded_tolerance is not None else tolerance)
+57:            for name, q in planned.items()):
+58:         raise RuntimeError('Robot moved since planning; request a new plan')
+59: 
+60: 
+61: def check_path_start(trajectory, planned, tolerance=0.002):
+62:     """Reject an unvalidated jump from the measured state to the first knot."""
+63:     if not trajectory.points:
+64:         raise RuntimeError('Empty pregrasp trajectory')
+65:     first = trajectory.points[0]
+66:     if (len(first.positions) != len(trajectory.joint_names)
+67:             or any(name not in planned or not math.isfinite(q)
+68:                    or abs(planned[name]-q) > tolerance
+69:                    for name, q in zip(trajectory.joint_names, first.positions))):
+70:         raise RuntimeError('Trajectory does not begin at the planning start state')
+71: 
+72: 
+73: def reference_observation_metrics(observation):
+74:     return {
+75:         'stamp_ns': observation.header.stamp.sec*10**9+observation.header.stamp.nanosec,
+76:         'frame_id': observation.header.frame_id,
+77:         'center_m': [
+78:             observation.observed_center.x,
+79:             observation.observed_center.y,
+80:             observation.observed_center.z,
+81:         ],
+82:         'extent_m': [
+83:             observation.observed_extent.x,
+84:             observation.observed_extent.y,
+85:             observation.observed_extent.z,
+86:         ],
+87:         'mask_pixels': int(observation.mask_pixels),
+88:         'valid_depth_points': int(observation.valid_depth_points),
+89:         'valid_depth_fraction': float(observation.valid_depth_fraction),
+90:     }
+91: 
+92: 
+93: class ReferenceObservationFailure(RuntimeError):
+94:     """Preserve reference-service error codes for bounded occlusion handling."""
+95: 
+96:     def __init__(self, response: ObserveObjectReference.Response) -> None:
+97:         super().__init__(response.message or 'Reference observation failed')
+98:         self.response = response
+99:         self.error_code = int(response.error_code)
+100: 
+101: 
+102: class PregraspPipeline(Node):
+103:     def __init__(self, *, mode='plan_only', **kwargs):
+104:         if mode not in ('plan_only', 'mujoco', 'hardware'):
+105:             raise ValueError('Unknown execution mode')
+106:         super().__init__('pregrasp_pipeline', **kwargs)
+107:         self.mode = mode
+108:         defaults = {'pipeline_timeout_sec': 360., 'maximum_joint_age_sec': .5,
+109:                     'execution_use_verified_local_fk': False, 'execution_timing_enabled': False,
+110:                     'execution_defer_pregrasp_validation': False,
+111:                     'maximum_target_translation_m': .01, 'wrist_checks': 3,
+112:                     'planning_scene_timeout_sec': 5.,
+113:                     'planning_timeout_sec': 4., 'planning_response_margin_sec': 1.,
+114:                     'execution_timeout_factor': 10., 'execution_timeout_margin_sec': 10.,
+115:                     'execution_timeout_minimum_sec': 60., 'wrist_camera_control_timeout_sec': 5.}
+116:         for name, value in defaults.items():
+117:             self.declare_parameter(name, value)
+118:         self._execution_timing_enabled = self.get_parameter('execution_timing_enabled').value
+119:         self._defer_pregrasp_validation = self.get_parameter('execution_defer_pregrasp_validation').value
+120:         if type(self._defer_pregrasp_validation) is not bool:
+121:             raise ValueError('execution_defer_pregrasp_validation must be boolean')
+122:         for name in ('planning_timeout_sec', 'planning_response_margin_sec'):
+123:             value = self.get_parameter(name).value
+124:             if not math.isfinite(value) or value <= 0:
+125:                 raise ValueError(f'{name} must be finite and positive')
+126:         self.scene_monitor = SensorSceneMonitor(self)
+127:         self.validation = ActionClient(self, ValidatePick, '/grasp/validate_pick')
+128:         self.reference = self.create_client(ObserveObjectReference, '/perception/observe_object_reference')
+129:         self.wrist = self.create_client(ObserveWristTarget, '/perception/observe_wrist_target')
+130:         self.state, self.description = None, ''
+131:         self.lock = threading.Lock()
+132:         self.create_subscription(JointState, '/joint_states', self.on_state, 20)
+133:         self.create_subscription(String, '/robot_description', self.on_description,
+134:             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+135:         self.motion = None
+136:         self.real = None
+137:         self._grasp_scene_freeze_held = False
+138:         self.wrist_cameras = None
+139:         if mode in ('mujoco', 'hardware'):
+140:             if mode == 'mujoco' and not self.get_parameter('use_sim_time').value:
+141:                 raise ValueError('MuJoCo execution requires use_sim_time')
+142:             self.hardware = self.create_client(ListHardwareComponents, '/controller_manager/list_hardware_components')
+143:             self.controllers = self.create_client(ListControllers, '/controller_manager/list_controllers')
+144:             self.motion = MoveItGraspAdapter(self, MoveItAdapterConfig(
+145:                 validate_motion_paths=True,
+146:                 use_verified_local_fk=self.get_parameter('execution_use_verified_local_fk').value,
+147:                 planning_timeout_sec=float(self.get_parameter('planning_timeout_sec').value),
+148:                 planning_response_margin_sec=float(
+149:                     self.get_parameter('planning_response_margin_sec').value)),
+150:                 spin_once=lambda delay: time.sleep(min(delay, .01)))
+151:             self.scene = TargetSceneTransaction(
+152:                 self,
+153:                 timeout_sec=float(
+154:                     self.get_parameter('planning_scene_timeout_sec').value),
+155:                 support_patch_margin_m=.08,
+156:             )
+157:         if mode == 'hardware':
+158:             from .wrist_camera_control import WristCameraSession
+159:             from .hardware_execution import HardwareExecution
+160:             from .core.execution_ownership import ExecutionOwnership
+161:             self.real = HardwareExecution(self)
+162:             self._execution_ownership = ExecutionOwnership()
+163:             self.wrist_cameras = WristCameraSession(self,
+164:                 float(self.get_parameter('wrist_camera_control_timeout_sec').value), self.wait)
+165: 
+166:     def start_wrist_camera(self, arm: str) -> None:
+167:         if self.wrist_cameras is not None:
+168:             self.wrist_cameras.activate(arm)
+169: 
+170:     def stop_wrist_camera(self) -> None:
+171:         if self.wrist_cameras is not None:
+172:             self.wrist_cameras.close()
+173: 
+174:     def request_wrist_camera_stop(self) -> None:
+175:         if self.wrist_cameras is not None:
+176:             self.wrist_cameras.request_close()
+177: 
+178:     def destroy_node(self):
+179:         cameras = getattr(self, 'wrist_cameras', None)
+180:         if cameras is not None:
+181:             try:
+182:                 cameras.request_close()
+183:             except Exception as error:
+184:                 self.get_logger().error(f'Wrist camera shutdown request failed: {error}')
+185:         ownership = getattr(self, '_execution_ownership', None)
+186:         if ownership is not None:
+187:             ownership.close()
+188:         return super().destroy_node()
+189: 
+190:     def on_state(self, message):
+191:         with self.lock:
+192:             self.state = message
+193: 
+194:     def create_motion_client(self, action_type, name):
+195:         """Let an execution owner track even late goal acknowledgements."""
+196:         return ActionClient(self, action_type, name)
+197: 
+198:     def on_description(self, message):
+199:         with self.lock:
+200:             self.description = message.data
+201: 
+202:     def measured(self):
+203:         with self.lock:
+204:             state = deepcopy(self.state)
+205:         if state is None:
+206:             raise RuntimeError('No measured joint state')
+207:         # JointState and /clock travel independently. Give a simulation clock
+208:         # callback a bounded chance to catch up; never accept a future stamp.
+209:         stamp = state.header.stamp.sec*10**9+state.header.stamp.nanosec
+210:         deadline = time.monotonic()+.05
+211:         while (self.mode == 'mujoco'
+212:                and 0 < stamp-self.get_clock().now().nanoseconds <= 50_000_000
+213:                and time.monotonic() < deadline):
+214:             time.sleep(.001)
+215:         check_joint_snapshot(state, self.get_clock().now().nanoseconds,
+216:                              maximum_age=self.get_parameter('maximum_joint_age_sec').value)
+217:         return state
+218: 
+219:     def wait(self, future, timeout, *, monitor=False, cancel_on_timeout=True):
+220:         deadline = time.monotonic()+timeout
+221:         completed = threading.Event()
+222:         future.add_done_callback(lambda _: completed.set())
+223:         while not future.done():
+224:             if not rclpy.ok() or time.monotonic() >= deadline:
+225:                 if cancel_on_timeout:
+226:                     future.cancel()
+227:                 raise RuntimeError('Pipeline operation timed out or was interrupted')
+228:             if monitor:
+229:                 real = getattr(self, 'real', None)
+230:                 if real is None or not real.sensor_scene_frozen:
+231:                     self.scene_monitor.check()
+232:                 self.measured()
+233:                 if real is not None:
+234:                     real.monitor()
+235:             # Wake on the response instead of adding up to 10 ms to every
+236:             # sequential collision check. Keep the same monitoring cadence.
+237:             completed.wait(max(0., min(.01, deadline-time.monotonic())))
+238:         return future.result()
+239: 
+240:     @timed_operation('service_call')
+241:     def call(self, client, request, timeout=30., *, monitor=False):
+242:         if not client.wait_for_service(timeout_sec=5.):
+243:             raise RuntimeError(f'Service unavailable: {client.srv_name}')
+244:         response = self.wait(client.call_async(request), timeout, monitor=monitor)
+245:         if response is None or (hasattr(response, 'success') and not response.success):
+246:             if response is None:
+247:                 raise RuntimeError('Empty service response')
+248:             if isinstance(response, ObserveObjectReference.Response):
+249:                 raise ReferenceObservationFailure(response)
+250:             detail = getattr(response, 'message', '')
+251:             raise RuntimeError(detail or f'Service call failed: {client.srv_name}')
+252:         return response
+253: 
+254:     @timed_operation('action_wait')
+255:     def run_action(self, client, goal, timeout, *, monitor=False, allow_aborted=False,
+256:                    feedback_callback=None):
+257:         if not client.wait_for_server(timeout_sec=10.):
+258:             raise RuntimeError('Action server unavailable')
+259:         send_options = {} if feedback_callback is None else {
+260:             'feedback_callback': feedback_callback}
+261:         handle = self.wait(client.send_goal_async(goal, **send_options), 10.)
+262:         if handle is None or not handle.accepted:
+263:             raise RuntimeError('Action goal rejected')
+264:         result_future = handle.get_result_async()
+265:         try:
+266:             wrapped = self.wait(result_future, timeout, monitor=monitor, cancel_on_timeout=False)
+267:             if wrapped.status != GoalStatus.STATUS_SUCCEEDED and not (
+268:                     allow_aborted and wrapped.status == GoalStatus.STATUS_ABORTED):
+269:                 detail = getattr(wrapped.result, 'message', None) or getattr(wrapped.result, 'error_string', '')
+270:                 raise RuntimeError(f'Action failed: {detail or wrapped.status}')
+271:             return wrapped.result
+272:         except BaseException as interrupted:
+273:             from .core.hardware_execution import CommunicationRecovered
+274:             if isinstance(interrupted, CommunicationRecovered):
+275:                 real = getattr(self, 'real', None)
+276:                 if real is not None:
+277:                     # Carrying keeps hardware monitoring active during cancel
+278:                     # waits. Consume this event so those waits can prove stop.
+279:                     real._active_recovery_generation = None
+280:             try:
+281:                 self.wait(handle.cancel_goal_async(), 5.)
+282:                 if not result_future.done():
+283:                     self.wait(result_future, 5., cancel_on_timeout=False)
+284:                 if isinstance(interrupted, CommunicationRecovered):
+285:                     interrupted.cancellation_confirmed = result_future.result().status in (
+286:                         GoalStatus.STATUS_SUCCEEDED, GoalStatus.STATUS_CANCELED, GoalStatus.STATUS_ABORTED)
+287:             except Exception as error:
+288:                 self.get_logger().error(f'Could not confirm action cancellation: {error}')
+289:             raise
+290: 
+291:     def observe(self, reference_id, after):
+292:         request = ObserveObjectReference.Request(operation=ObserveObjectReference.Request.OBSERVE,
+293:                                                 reference_id=reference_id, after_stamp_ns=after)
+294:         return self.call(self.reference, request, 60.)
+295: 
+296:     def verify_simulator(self, arm):
+297:         if getattr(self, 'real', None) is not None:
+298:             self.real.verify(arm)
+299:             return
+300:         hardware = self.call(self.hardware, ListHardwareComponents.Request())
+301:         if (len(hardware.component) != 1
+302:                 or hardware.component[0].class_type != 'mujoco_ros2_control/MujocoSystemInterface'
+303:                 or hardware.component[0].state.label != 'active'):
+304:             raise RuntimeError('Execution requires exactly one active MuJoCo hardware component')
+305:         controllers = self.call(self.controllers, ListControllers.Request())
+306:         active = {item.name for item in controllers.controller if item.state == 'active'}
+307:         if not {f'{arm}_arm_controller', f'{arm}_gripper_controller'} <= active:
+308:             raise RuntimeError('MuJoCo arm/gripper controllers are not active')
+309:         if not self.description:
+310:             raise RuntimeError('No runtime robot_description')
+311:         self.motion.set_robot_description(self.description)
+312: 
+313:     def execute_trajectory(self, arm, trajectory, controller, *, check_orientation=True,
+314:                            check_collisions=True, allow_endpoint_error=False,
+315:                            held_command=None, command_path_validator=None,
+316:                            defer_height_shortfall: bool = False, minimum_duration_sec=1.,
+317:                            start_from_measured: bool = False,
+318:                            endpoint_pose: CartesianPose | None = None):
+319:         if getattr(self, 'real', None) is not None:
+320:             endpoint_options = {'allow_endpoint_error': True} if allow_endpoint_error else {}
+321:             if held_command is not None:
+322:                 endpoint_options['held_command'] = held_command
+323:             if endpoint_pose is not None:
+324:                 endpoint_options['endpoint_pose'] = endpoint_pose
+325:             if command_path_validator is not None:
+326:                 endpoint_options['command_path_validator'] = command_path_validator
+327:             if type(defer_height_shortfall) is not bool:
+328:                 raise ValueError('defer_height_shortfall must be boolean')
+329:             if defer_height_shortfall:
+330:                 endpoint_options['defer_height_shortfall'] = True
+331:             if minimum_duration_sec != 1.:
+332:                 endpoint_options['minimum_duration_sec'] = minimum_duration_sec
+333:             if type(start_from_measured) is not bool:
+334:                 raise ValueError('start_from_measured must be boolean')
+335:             if start_from_measured:
+336:                 endpoint_options['start_from_measured'] = True
+337:             return self.real.execute(
+338:                 arm, trajectory, controller,
+339:                 check_orientation=check_orientation, check_collisions=check_collisions,
+340:                 **endpoint_options)
+341:         if allow_endpoint_error or defer_height_shortfall:
+342:             raise ValueError('Relaxed grasp arrival requires physical collection mode')
+343:         self.verify_simulator(arm)
+344:         client = ActionClient(self, FollowJointTrajectory, f'/{arm}_{controller}_controller/follow_joint_trajectory')
+345:         try:
+346:             end = trajectory.points[-1].time_from_start
+347:             duration = end.sec+end.nanosec/1e9
+348:             timeout = execution_wall_timeout(duration,
+349:                 self.get_parameter('execution_timeout_factor').value,
+350:                 self.get_parameter('execution_timeout_margin_sec').value,
+351:                 self.get_parameter('execution_timeout_minimum_sec').value)
+352:             result = self.run_action(client, FollowJointTrajectory.Goal(trajectory=trajectory), timeout, monitor=True)
+353:             if result.error_code != result.SUCCESSFUL:
+354:                 raise RuntimeError(f'MuJoCo trajectory rejected: {result.error_string}')
+355:             deadline = time.monotonic()+5.
+356:             while True:
+357:                 state = self.measured()
+358:                 actual = dict(zip(state.name, state.position))
+359:                 if all(abs(actual[name]-q) <= .02 for name, q in zip(trajectory.joint_names, trajectory.points[-1].positions)):
+360:                     return state
+361:                 if time.monotonic() >= deadline:
+362:                     raise RuntimeError('Controller completed without measured arrival')
+363:                 time.sleep(.02)
+364:         finally:
+365:             client.destroy()
+366: 
+367:     def execute_pregrasp(self, selected):
+368:         arm = selected.selected_arm
+369:         real = getattr(self, 'real', None)
+370:         defer = real is not None and getattr(self, '_defer_pregrasp_validation', False)
+371:         if not defer:
+372:             self.verify_simulator(arm)
+373:         measured = self.measured()
+374:         planned = dict(zip(selected.planning_start_state.name, selected.planning_start_state.position))
+375:         start_options = ({} if real is None else {
+376:             'commanded': (*ARM_JOINT_NAMES[arm], f'{arm}_gripper_joint'),
+377:             'commanded_tolerance': real.value('hardware_start_blend_max_rad')})
+378:         check_start_state(dict(zip(measured.name, measured.position)), planned, **start_options)
+379:         trajectory = selected.pregrasp_trajectory
+380:         if (tuple(trajectory.joint_names) != ARM_JOINT_NAMES[arm] or len(trajectory.points) < 2
+381:                 or not all(len(p.velocities) == len(trajectory.joint_names) for p in trajectory.points)):
+382:             raise RuntimeError('Selection does not contain a validated executable cubic path')
+383:         check_path_start(trajectory, planned)
+384:         self.scene.begin(selected.selected_candidate, f'pregrasp_execution_{time.monotonic_ns()}')
+385:         primary_error = None
+386:         try:
+387:             capture_barrier = getattr(real, 'capture_scene_barrier', None)
+388:             scene_barrier = capture_barrier(arm) if capture_barrier is not None else None
+389:             # Final dispatch requires a frame captured after the settled pose.
+390:             # An unchanged pose can reuse the barrier captured before preparation;
+391:             # A deferred path has no preliminary scene-dependent work. Its
+392:             # mandatory scene wait remains in the final hardware dispatch.
+393:             if not defer:
+394:                 if real is not None:
+395:                     self.scene_monitor.wait()
+396:                 else:
+397:                     self.scene_monitor.wait(after_stamp_ns=self.get_clock().now().nanoseconds)
+398:             self.motion.set_current_state(measured)
+399:             current = JointSolution(ARM_JOINT_NAMES[arm], tuple(planned[n] for n in ARM_JOINT_NAMES[arm]))
+400:             minimum_opening = float(selected.gripper_joint_position)
+401:             commanded_opening = minimum_opening
+402:             if getattr(self, 'real', None) is not None:
+403:                 required_width = float(selected.selected_candidate.required_opening_m)
+404:                 margin = float(self.config['pregrasp_opening_margin_m'])
+405:                 commanded_opening = self.arm_config.opening(
+406:                     min(self.arm_config.width, required_width + margin))
+407:             if not defer and not self.motion.gripper_sweep_is_valid(
+408:                     arm, current, planned[f'{arm}_gripper_joint'], commanded_opening, .05):
+409:                 raise RuntimeError('Opening the gripper intersects the current scene')
+410:             self.motion.set_gripper_position(arm, commanded_opening)
+411:             path = PlannedPath(tuple(trajectory.joint_names), tuple(tuple(p.positions) for p in trajectory.points))
+412:             checked = None if defer else self.motion._validated_cubic_path(arm, path)
+413:             if not defer and checked is None:
+414:                 raise RuntimeError('Pregrasp path is no longer collision-free')
+415:             # Recheck the original start after potentially slow scene validation.
+416:             state = self.measured()
+417:             check_start_state(dict(zip(state.name, state.position)), planned, **start_options)
+418:             jaw = JointTrajectory(joint_names=[f'{arm}_gripper_joint'])
+419:             first = JointTrajectoryPoint(positions=[planned[f'{arm}_gripper_joint']], velocities=[0.])
+420:             last = JointTrajectoryPoint(positions=[commanded_opening], velocities=[0.])
+421:             last.time_from_start.sec = 5
+422:             jaw.points = [first, last]
+423:             # Hardware validates the final combined, retimed command before any
+424:             # goal submission. Its geometry includes measured-start/hold changes.
+425:             arm_command = trajectory if defer else path_to_message(checked)
+426:             if getattr(self, 'real', None) is not None:
+427:                 # Continuous depth is the default collection policy. The
+428:                 # updater masks measured robot/attached geometry each frame.
+429:                 if not getattr(self, 'config', {}).get('continuous_scene_updates', True):
+430:                     self.real.begin_sensor_scene_freeze()
+431:                     self._grasp_scene_freeze_held = True
+432:                 try:
+433:                     state = self.real.execute_pregrasp_parallel(
+434:                         arm, arm_command, jaw, minimum_opening,
+435:                         1 if self.arm_config.opened > self.arm_config.closed else -1,
+436:                         **({'scene_barrier': scene_barrier} if scene_barrier is not None else {}))
+437:                 except BaseException as motion_error:
+438:                     try:
+439:                         self.release_grasp_scene_freeze()
+440:                     except Exception as cleanup_error:
+441:                         self._scene_cleanup_error = str(cleanup_error)
+442:                         self.get_logger().error(
+443:                             'Scene-freeze cleanup failed after primary error '
+444:                             f'{type(motion_error).__name__}: {motion_error}; '
+445:                             f'cleanup={cleanup_error}'
+446:                         )
+447:                     raise
+448:             else:
+449:                 self.execute_trajectory(arm, jaw, 'gripper')
+450:                 state = self.execute_trajectory(arm, arm_command, 'arm')
+451:             return state.header.stamp.sec*10**9+state.header.stamp.nanosec
+452:         except BaseException as error:
+453:             primary_error = error
+454:             raise
+455:         finally:
+456:             # A hardware execution failure may already have latched controller
+457:             # stop.  MoveIt's scene service then depends on stopped joint/TF
+458:             # publishers and can time out, masking the actionable motion error.
+459:             # The collection process is exiting and control recovery restarts
+460:             # MoveIt, so defer this cleanup instead of replacing the primary
+461:             # exception with a secondary planning-scene timeout.
+462:             real = getattr(self, 'real', None)
+463:             if primary_error is not None and real is not None and real.fault:
+464:                 self._scene_cleanup_error = (
+465:                     'Planning-scene restore deferred after latched physical stop; '
+466:                     'recover control before replanning'
+467:                 )
+468:                 self.get_logger().error(self._scene_cleanup_error)
+469:             else:
+470:                 try:
+471:                     self.scene.restore()
+472:                 except Exception as cleanup_error:
+473:                     self._scene_cleanup_error = str(cleanup_error)
+474:                     if primary_error is None:
+475:                         raise
+476:                     self.get_logger().error(
+477:                         'Planning-scene cleanup failed after primary error '
+478:                         f'{type(primary_error).__name__}: {primary_error}; '
+479:                         f'cleanup={cleanup_error}'
+480:                     )
+481: 
+482:     def before_execution(self, selected):
+483:         if getattr(self, 'real', None) is not None:
+484:             raise RuntimeError('Physical execution requires the configured collection_pipeline entrypoint')
+485: 
+486:     def release_grasp_scene_freeze(self):
+487:         """Resume OctoMap updates after the full collection cycle or failure."""
+488:         if not getattr(self, '_grasp_scene_freeze_held', False):
+489:             return
+490:         self.real.end_sensor_scene_freeze()
+491:         self._grasp_scene_freeze_held = False
+492: 
+493:     def target_translation_limit(self) -> float:
+494:         return float(self.get_parameter('maximum_target_translation_m').value)
+495: 
+496:     def validate_target_translation(self, selected, before, after,
+497:                                     displacement: float, report: dict) -> None:
+498:         """Reject a changed target before handing control to an execution subclass."""
+499:         del selected, before, after, report
+500:         if displacement > self.target_translation_limit():
+501:             raise RuntimeError('Target surface changed; a new grasp plan is required')
+502: 
+503:     def after_pregrasp(self, selected, wrist_request, report,
+504:                        before_observation=None, after_observation=None):
+505:         pass
+506: 
+507:     def wrist_observation_required(self) -> bool:
+508:         return True
+509: 
+510:     def head_reobservation_required(self) -> bool:
+511:         return True
+512: 
+513:     def observe_arrival(self, selected, before, arrival, report):
+514:         return self.observe(selected.reference_id, arrival)
+515: 
+516:     def run(self, query):
+517:         report = {'mode': self.mode, 'success': False, 'pregrasp_executed': False,
+518:                   'grasp_executed': False, 'wrist_checks': 0}
+519:         self._scene_cleanup_error = ''
+520:         selected, wrist_request = None, None
+521:         try:
+522:             self.scene_monitor.wait()
+523:             selected = self.run_action(self.validation, ValidatePick.Goal(query=query),
+524:                                        self.get_parameter('pipeline_timeout_sec').value, allow_aborted=True)
+525:             report['capture_stamp_ns'] = selected.detections.header.stamp.sec*10**9+selected.detections.header.stamp.nanosec
+526:             if not selected.success:
+527:                 report.update(error_code=selected.error_code, detection_count=len(selected.detections.detections))
+528:                 raise RuntimeError(selected.message)
+529:             report.update(arm=selected.selected_arm, candidate_index=selected.selected_candidate_index,
+530:                           planner_id=selected.planner_id, evidence_json_path=selected.evidence_json_path)
+531:             report['pregrasp_joint_state'] = dict(zip(
+532:                 selected.pregrasp_joint_state.name,
+533:                 (float(value) for value in selected.pregrasp_joint_state.position),
+534:                 strict=True,
+535:             ))
+536:             report['grasp_joint_state'] = dict(zip(
+537:                 selected.grasp_joint_state.name,
+538:                 (float(value) for value in selected.grasp_joint_state.position),
+539:                 strict=True,
+540:             ))
+541:             if not selected.reference_id:
+542:                 raise RuntimeError('Enable pin_object_reference and YOLOE-seg reference observation')
+543:             before = after = None
+544:             head_reobservation = self.head_reobservation_required()
+545:             if head_reobservation:
+546:                 before = self.observe(selected.reference_id, self.get_clock().now().nanoseconds)
+547:                 report['reference_capture_ns'] = before.header.stamp.sec*10**9+before.header.stamp.nanosec
+548:                 report['target_observation_before'] = reference_observation_metrics(before)
+549:             else:
+550:                 report.update(target_motion_assumed_stationary=True,
+551:                               head_reobservation_performed=False)
+552:             if self.mode == 'plan_only':
+553:                 report.update(success=True, message='Plan and current-view observation verified; no motion requested')
+554:                 return report
+555:             if head_reobservation:
+556:                 center = selected.selected_object.obb_pose.position
+557:                 observed = before.observed_center
+558:                 extent = selected.selected_object.obb_size
+559:                 # A visible-surface center is not the object's completed center.
+560:                 # Require it to remain inside the planned OBB's enclosing sphere.
+561:                 bound = math.sqrt(extent.x**2+extent.y**2+extent.z**2)/2
+562:                 if math.dist((center.x, center.y, center.z),
+563:                              (observed.x, observed.y, observed.z)) > bound + .01:
+564:                     raise RuntimeError('Fresh target surface is outside the planned object; replan required')
+565:             self.before_execution(selected)
+566:             if self.wrist_observation_required():
+567:                 self.start_wrist_camera(selected.selected_arm)
+568:             arrival = self.execute_pregrasp(selected)
+569:             report['pregrasp_executed'] = getattr(self, 'config', {}).get(
+570:                 'pregrasp_motion_enabled', True)
+571:             report['arrival_stamp_ns'] = arrival
+572:             if report['pregrasp_executed'] and getattr(self, 'real', None) is not None:
+573:                 report['pregrasp_execution_metrics'] = deepcopy(
+574:                     self.real.last_execution_metrics)
+575:             if head_reobservation:
+576:                 after = self.observe_arrival(selected, before, arrival, report)
+577:                 report['target_observation_after'] = reference_observation_metrics(after)
+578:                 old = (before.observed_center.x, before.observed_center.y, before.observed_center.z)
+579:                 new = (after.observed_center.x, after.observed_center.y, after.observed_center.z)
+580:                 displacement = math.dist(old, new)
+581:                 report['observed_surface_displacement_m'] = displacement
+582:                 self.validate_target_translation(
+583:                     selected, before, after, displacement, report)
+584:             if self.wrist_observation_required():
+585:                 wrist_request = ObserveWristTarget.Request(operation=ObserveWristTarget.Request.HANDOFF,
+586:                     arm=selected.selected_arm, source_snapshot_id=after.source_snapshot_id,
+587:                     source_object_id=after.source_object_id, label=after.source_label,
+588:                     detector_label=after.source_detector_label,
+589:                     source_confidence=float(after.source_confidence), after_stamp_ns=arrival)
+590:                 wrist_request.expected_pose.header = deepcopy(after.header)
+591:                 wrist_request.expected_pose.pose.position = deepcopy(after.observed_center)
+592:                 wrist_request.expected_pose.pose.orientation.w = 1.
+593:                 wrist_request.size = deepcopy(after.observed_extent)
+594:                 handoff = self.call(self.wrist, wrist_request, 60.)
+595:                 wrist_request.reference_id = handoff.reference_id
+596:                 wrist_request.operation = wrist_request.CHECK
+597:                 wrist_request.after_stamp_ns = handoff.header.stamp.sec*10**9+handoff.header.stamp.nanosec
+598:                 for _ in range(int(self.get_parameter('wrist_checks').value)):
+599:                     observation = self.call(self.wrist, wrist_request, 60.)
+600:                     stamp = observation.header.stamp.sec*10**9+observation.header.stamp.nanosec
+601:                     if stamp <= wrist_request.after_stamp_ns:
+602:                         raise RuntimeError('Wrist tracking did not advance')
+603:                     wrist_request.after_stamp_ns = stamp
+604:                     report['wrist_checks'] += 1
+605:             self.after_pregrasp(
+606:                 selected, wrist_request, report,
+607:                 before_observation=before,
+608:                 after_observation=after,
+609:             )
+610:             message = (f'{self.mode} execution and fresh observations verified' if head_reobservation else
+611:                        f'{self.mode} execution completed; stationary target assumed without head reobservation')
+612:             report.update(success=True, message=message)
+613:         except Exception as error:
+614:             report['message'] = str(error)
+615:             report['error_type'] = type(error).__name__
+616:             if self._scene_cleanup_error:
+617:                 report['cleanup_error'] = self._scene_cleanup_error
+618:             real = getattr(self, 'real', None)
+619:             if real is not None and real.last_execution_metrics:
+620:                 report['pregrasp_motion_attempted'] = True
+621:                 report['pregrasp_execution_metrics'] = deepcopy(
+622:                     real.last_execution_metrics)
+623:             if (getattr(self, 'real', None) is not None
+624:                     and not (report.get('error_code') == 2 and report.get('detection_count') == 0)):
+625:                 report['stop'] = self.real.fail_stop()
+626:         finally:
+627:             try:
+628:                 self.stop_wrist_camera()
+629:             except Exception as error:
+630:                 report.setdefault('cleanup_error', str(error))
+631:                 report['success'] = False
+632:             try:
+633:                 self.release_grasp_scene_freeze()
+634:             except Exception as error:
+635:                 report.setdefault('cleanup_error', str(error))
+636:                 report['success'] = False
+637:             for client, request in (
+638:                 (self.reference, ObserveObjectReference.Request(operation=ObserveObjectReference.Request.CLEAR,
+639:                     reference_id=selected.reference_id) if selected and selected.reference_id else None),
+640:                 (self.wrist, wrist_request if wrist_request and wrist_request.reference_id else None)):
+641:                 if request is not None:
+642:                     request.operation = request.CLEAR
+643:                     try:
+644:                         self.call(client, request, 10.)
+645:                     except Exception as error:
+646:                         report.setdefault('cleanup_error', str(error))
+647:                         report['success'] = False
+648:         return report
+649: 
+650: 
+651: def main(args=None):
+652:     parser = argparse.ArgumentParser(description=__doc__)
+653:     parser.add_argument('--mode', choices=('plan_only', 'mujoco'), default='plan_only')
+654:     parser.add_argument('--query', default='')
+655:     parser.add_argument('--output', required=True)
+656:     options, ros_args = parser.parse_known_args(args)
+657:     rclpy.init(args=ros_args)
+658:     node = PregraspPipeline(mode=options.mode)
+659:     executor = MultiThreadedExecutor(num_threads=4)
+660:     executor.add_node(node)
+661:     thread = threading.Thread(target=executor.spin, daemon=True)
+662:     thread.start()
+663:     report = {'success': False, 'message': 'Interrupted'}
+664:     try:
+665:         report = node.run(options.query)
+666:     finally:
+667:         output = Path(options.output).expanduser()
+668:         output.parent.mkdir(parents=True, exist_ok=True)
+669:         output.write_text(json.dumps(report, indent=2, ensure_ascii=False)+'\n')
+670:         print(json.dumps(report, ensure_ascii=False))
+671:         node.scene_monitor.close()
+672:         executor.remove_node(node)
+673:         executor.shutdown(timeout_sec=5.)
+674:         thread.join(timeout=5.)
+675:         node.destroy_node()
+676:         rclpy.try_shutdown()
+677:     raise SystemExit(0 if report['success'] else 1)

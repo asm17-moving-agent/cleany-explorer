@@ -1,0 +1,761 @@
+{
+  "reviewedAt": "2026-11-02",
+  "commit": "707538de9d28291c679fcfd954f5587368d5a460",
+  "basis": "working-tree",
+  "sources": {
+    "index": {
+      "path": "docs/ROS_INTERFACES.md",
+      "sha256": "d219dcf3d1db5501dcc485616299bd16584ebf9cf9c75ab35abb9afcc2c08a8c",
+      "ranges": [
+        [
+          1,
+          186
+        ],
+        [
+          302,
+          315
+        ]
+      ],
+      "href": "/ros/sources/index.txt",
+      "excerptSha256": "55bb0ebe9d0c2e5a06e8b8bf4aa0abc0bb186163d24573859310a77341bf213f"
+    },
+    "base": {
+      "path": "ros2_ws/src/cleany_base_driver/docs/interfaces.md",
+      "sha256": "4c8ead2f6c9cb4406fed6ec6cccaf5857bd51725125f60b6dc8925fec2097afb",
+      "ranges": [
+        [
+          1,
+          59
+        ]
+      ],
+      "href": "/ros/sources/base.txt",
+      "excerptSha256": "051a009328a903d8deb9070a5d1f5e22ab7a3d8a6d7d0aa9252ef30325f6f483"
+    },
+    "odom": {
+      "path": "ros2_ws/src/cleany_base_odometry/docs/interfaces.md",
+      "sha256": "ec1bdb8b60956c506ce55c34f20ce4fd84594c979b25f758317a8039c22604c6",
+      "ranges": [
+        [
+          1,
+          14
+        ]
+      ],
+      "href": "/ros/sources/odom.txt",
+      "excerptSha256": "aa20637d8224b0e02485e23ae4f22b497868295ad09321e1c7e129492885eaa2"
+    },
+    "mcu": {
+      "path": "esp32/README.md",
+      "sha256": "8ebc2dfc1f7d00c23abb1b92442b6629be199c48382d9dcd3ebbca33248a4c19",
+      "ranges": [
+        [
+          17,
+          48
+        ]
+      ],
+      "href": "/ros/sources/mcu.txt",
+      "excerptSha256": "c9c1fe148a5ddadd90a9406a20524c8e68404eb8acf1ee91f9f229af38d7646f"
+    },
+    "robot": {
+      "path": "ros2_ws/src/cleany_robot_interface/docs/interfaces.md",
+      "sha256": "b271a4c1b5f9090ce3a7c91dbdabcc2dcebf8c1b1983122d5ac8c5286331d5dc",
+      "ranges": [
+        [
+          1,
+          43
+        ]
+      ],
+      "href": "/ros/sources/robot.txt",
+      "excerptSha256": "9ea0183c67492c2fdcd87daa39ca05bc958a16ac558b1787299e542297db7a25"
+    },
+    "guard": {
+      "path": "ros2_ws/src/cleany_robot_interface/cleany_robot_interface/control_state_guard.py",
+      "sha256": "abf57a42f0367f8867f70c40814fcb738560a51d9d6c48acf3c7adc84d8a3948",
+      "ranges": [
+        [
+          31,
+          85
+        ]
+      ],
+      "href": "/ros/sources/guard.txt",
+      "excerptSha256": "3ce5449c729a5e06209500e8746e89297d93de0c8854b02d185a61adfd43439b"
+    },
+    "control": {
+      "path": "ros2_ws/src/cleany_robot_interface/cleany_robot_interface/control_profile.py",
+      "sha256": "5fe4d7ac4b1732c61f27429165473c9544147b32f747b8ba240cafc300f93270",
+      "ranges": [
+        [
+          147,
+          186
+        ],
+        [
+          217,
+          218
+        ]
+      ],
+      "href": "/ros/sources/control.txt",
+      "excerptSha256": "90d4675ad53ee27540f24671b4eec9646212f40a80e54fe7b30d8c35ed43e419"
+    },
+    "real-launch": {
+      "path": "ros2_ws/src/cleany_robot_interface/launch/real_control.launch.py",
+      "sha256": "2afb44725b1cc86ff0924fdcbc4d0e3b635aa116b94ca4a871e966164644e40f",
+      "ranges": [
+        [
+          1,
+          91
+        ]
+      ],
+      "href": "/ros/sources/real-launch.txt",
+      "excerptSha256": "5e269c496eebfed7f5b9bf387c54b96fc8f1d911748c1204f805d719930d20b9"
+    },
+    "wrist": {
+      "path": "ros2_ws/src/cleany_robot_interface/cleany_robot_interface/wrist_rgb_camera.py",
+      "sha256": "370465887b06826d5dfea0eab3a410b39a07f4d86e5f34040ff9b8a9055dcede",
+      "ranges": [
+        [
+          38,
+          92
+        ]
+      ],
+      "href": "/ros/sources/wrist.txt",
+      "excerptSha256": "c766e98211ed4ffa8ffa127b0c5b92eda39a348beefefec80a903681bb345df0"
+    },
+    "perception": {
+      "path": "ros2_ws/src/cleany_perception/cleany_perception/inspection_node.py",
+      "sha256": "de66f5af1abc495d2e7615d813ac38dcda7284eb620c7c09e31129d8b1c83e85",
+      "ranges": [
+        [
+          138,
+          172
+        ],
+        [
+          636,
+          640
+        ],
+        [
+          775,
+          795
+        ]
+      ],
+      "href": "/ros/sources/perception.txt",
+      "excerptSha256": "72f1769d99668bbcc99ed71c93743a583c7dd30e8a25eeaa4c0aa857be2a2ac2"
+    },
+    "realsense": {
+      "path": "ros2_ws/src/cleany_perception/launch/realsense.launch.py",
+      "sha256": "3ae9a40591793e82f20986afa96a0aecb9b7384f65ef48cef343f92c94b7dbcc",
+      "ranges": [
+        [
+          1,
+          45
+        ]
+      ],
+      "href": "/ros/sources/realsense.txt",
+      "excerptSha256": "3733680ebc2548e0455243b2113bdc38779eb675f06a39768b9108c6608eb21f"
+    },
+    "sim": {
+      "path": "ros2_ws/src/cleany_mujoco_sim/docs/interfaces.md",
+      "sha256": "df04a0a6c7dd6124b1f768bd09170f27ab53df468259a9adb29f50a991217953",
+      "ranges": [
+        [
+          1,
+          43
+        ]
+      ],
+      "href": "/ros/sources/sim.txt",
+      "excerptSha256": "13a5af482f6c4e5aff41fdaa315e0fe99df0bb8ed743ae4feeec05b073684ab0"
+    },
+    "lidar": {
+      "path": "tools/odometry_evaluation/evaluation_stack.py",
+      "sha256": "bdbe067a54b5e2bb2b1523fd22e1c0a5c8f1980503cf15456ba77d049cb1b49e",
+      "ranges": [
+        [
+          71,
+          91
+        ]
+      ],
+      "href": "/ros/sources/lidar.txt",
+      "excerptSha256": "0f7ae0897de45d0b4743b94b05055c9c5b55a38678ddb233c7f8b8300e0f1ff4"
+    },
+    "lidar-guide": {
+      "path": "tools/odometry_evaluation/README.md",
+      "sha256": "bfddc25e3e22fee2731a27c29a0c438a20f26395b40b29bc38c68f64a93f92d8",
+      "ranges": [
+        [
+          95,
+          112
+        ]
+      ],
+      "href": "/ros/sources/lidar-guide.txt",
+      "excerptSha256": "47c09ffbbe161f994ab66a7e91e4a5cb1bb9ae22936e4f80a6b1c5a38fa41034"
+    },
+    "inventory-a96c21035499": {
+      "path": "docs/ROS_INTERFACES.md",
+      "sha256": "6205430f8e44144f97dd2ac6f99e3a5a8f2aa69c87ee0816b26db632f95ab929",
+      "href": "/ros/sources/inventory-a96c21035499.txt",
+      "excerptSha256": "2ace3e39cf3063cf83f756745a63530fb3287e149081914515a1d639ee569ddf"
+    },
+    "inventory-92b5857f29bf": {
+      "path": "ros2_ws/src/cleany_base_driver/cleany_base_driver/driver_node.py",
+      "sha256": "d8c15c894ea877f24385b313570e84d56df89dbd563749e487f2f082840a521e",
+      "href": "/ros/sources/inventory-92b5857f29bf.txt",
+      "excerptSha256": "d1f3f2f408ca83e57f160378c884561e4608eafa7c6f5c5b5894161c122042b8"
+    },
+    "inventory-df2db47da574": {
+      "path": "ros2_ws/src/cleany_base_driver/cleany_base_driver/imu_node.py",
+      "sha256": "957fc59e0e6da7db34f3530f31168cea34afb824f187363158578ca412ff8d0b",
+      "href": "/ros/sources/inventory-df2db47da574.txt",
+      "excerptSha256": "a4a1d1be427903c23fd5d24c575c5e96c79bd07b1c7a0aec2586f3b1963ff15b"
+    },
+    "inventory-0b9d0f71c154": {
+      "path": "ros2_ws/src/cleany_base_driver/cleany_base_driver/mock_node.py",
+      "sha256": "e98f2f420dbcbde3f125446ef2af8bf0641186291ac2f8c686555d2b69404f69",
+      "href": "/ros/sources/inventory-0b9d0f71c154.txt",
+      "excerptSha256": "0285381e28ec1e5c8e55e21fdd4694eef0531acb412d893713b0caa6a38c3cb5"
+    },
+    "inventory-6c0a846b6a55": {
+      "path": "ros2_ws/src/cleany_base_driver/cleany_base_driver/odom_relay.py",
+      "sha256": "5f010db23c86acd95f81b28b44e7f48a7fd2a7b5d6e82d87bba997628158a9e1",
+      "href": "/ros/sources/inventory-6c0a846b6a55.txt",
+      "excerptSha256": "e54af4d1765246297258df2641fe926063d0281c920e7a3c066393fedc747db9"
+    },
+    "inventory-4594afac3f66": {
+      "path": "ros2_ws/src/cleany_base_odometry/cleany_base_odometry/wheel_odom_node.py",
+      "sha256": "ee4ed8a21ce13f7376e1b0aa16950eb6949186929511016d0eef5446d04a869f",
+      "href": "/ros/sources/inventory-4594afac3f66.txt",
+      "excerptSha256": "371aa6aa23ac91e8256184fc6654a021fd7d470492113e235d85d2b0c37b86e2"
+    },
+    "inventory-7d94352106d2": {
+      "path": "ros2_ws/src/cleany_control_bridge/cleany_control_bridge/node.py",
+      "sha256": "0de78916609bc21fdfccac767436550238cd66b960f896ec186af54ff847ab73",
+      "href": "/ros/sources/inventory-7d94352106d2.txt",
+      "excerptSha256": "0ccd0d2f95c728a67cebf68163245ba6a703a161f15270f8ed38c46e4d89ce7d"
+    },
+    "inventory-1c0c07a73c78": {
+      "path": "ros2_ws/src/cleany_dev_monitor/cleany_dev_monitor/io_probe_node.py",
+      "sha256": "c434bba10f13b477ea7cc57dc4dc7aaebd7f1e3ab6f76b26e2babae007352624",
+      "href": "/ros/sources/inventory-1c0c07a73c78.txt",
+      "excerptSha256": "2e6ebb23b048181290ac36ecacb2f0b81f1aa96040421ed039b4d71713cb8de1"
+    },
+    "inventory-d61c39b1bf8e": {
+      "path": "ros2_ws/src/cleany_dev_monitor/cleany_dev_monitor/node.py",
+      "sha256": "264640e3c6a119de60d36237af7110d29e0df81db1accdd674a414ed580519d3",
+      "href": "/ros/sources/inventory-d61c39b1bf8e.txt",
+      "excerptSha256": "af5ede0a6626e78706098f5c321f34cde3ea180cc594e2147a7c22399466737f"
+    },
+    "inventory-9fbce5303e2b": {
+      "path": "ros2_ws/src/cleany_dev_monitor/cleany_dev_monitor/operator_ros.py",
+      "sha256": "ec713ebd51cbcd5bb86316bc5cd3bdb780108ca462582ab8b3ed4037c5eea45d",
+      "href": "/ros/sources/inventory-9fbce5303e2b.txt",
+      "excerptSha256": "b1285fbdeb5a44f0c5e6a2424e4d8ca2da562af261e65e8dc6ced2b3eead4648"
+    },
+    "inventory-09d22f12e008": {
+      "path": "ros2_ws/src/cleany_dev_monitor/cleany_dev_monitor/proposal_ros.py",
+      "sha256": "bcc6f1abc9447cd8f78a2de30b3088774934b5832468cae714c06bcfa591cbb7",
+      "href": "/ros/sources/inventory-09d22f12e008.txt",
+      "excerptSha256": "f9e943b022debc2b594882d3864897923999fd50cdc6495703fe94d37ce557ce"
+    },
+    "inventory-a046f523a065": {
+      "path": "ros2_ws/src/cleany_dev_monitor/cleany_dev_monitor/slam_reader.py",
+      "sha256": "d24c893d8c438739ea35caf5e1299f2db9e190a5c3d4aa2e4e024d046adf4cc8",
+      "href": "/ros/sources/inventory-a046f523a065.txt",
+      "excerptSha256": "7dfe7d9e5bd84dfb6d55348d552d15bfffb1d57657954090da806de695055432"
+    },
+    "inventory-708c2633d961": {
+      "path": "ros2_ws/src/cleany_display/cleany_display/node.py",
+      "sha256": "3c36a9b181a60b32b85efc66bea273c13999342583d5024c88d5ef880b8debb3",
+      "href": "/ros/sources/inventory-708c2633d961.txt",
+      "excerptSha256": "8c3fe52c4940103345c321fbc852bd3a0f63fbdb1467389cda743d8ea6b83ee0"
+    },
+    "inventory-d371e4870d5f": {
+      "path": "ros2_ws/src/cleany_gazebo_sim/cleany_gazebo_sim/command_guard.py",
+      "sha256": "5ee40e67b04d6e92d8f942e5b36957d6f0d6d61af59eaba2af3c4cbfc6b3f4a2",
+      "href": "/ros/sources/inventory-d371e4870d5f.txt",
+      "excerptSha256": "b3891db5abbe1f395db02f9773c20ef0b6837cac4932926a6094e1c240aa1a52"
+    },
+    "inventory-c974c8d5eea3": {
+      "path": "ros2_ws/src/cleany_gazebo_sim/cleany_gazebo_sim/feedback_sampler.py",
+      "sha256": "afe08c39c14e627db893758cee336e67912fee2099c940a896a5293f4562a794",
+      "href": "/ros/sources/inventory-c974c8d5eea3.txt",
+      "excerptSha256": "67483b1013415458d7500ea3fdf4f288faa300fd5af86f7eef1550f58f142674"
+    },
+    "inventory-c55f3813fec3": {
+      "path": "ros2_ws/src/cleany_gazebo_sim/cleany_gazebo_sim/ground_truth_route_follower.py",
+      "sha256": "6e11a397a6647d83803975c2a26d4a4e9e90588efc65ce1aab50d514fb626157",
+      "href": "/ros/sources/inventory-c55f3813fec3.txt",
+      "excerptSha256": "00fc32964afcc48513bc77bc839475c7156af91ded1d32a6ac848bb86add0595"
+    },
+    "inventory-5eed49d308c2": {
+      "path": "ros2_ws/src/cleany_gazebo_sim/cleany_gazebo_sim/odom_tf_publisher.py",
+      "sha256": "97dde03e106062b4cfd6aa43dd52578bda444cefc4d73f736ef6cd44a96efb06",
+      "href": "/ros/sources/inventory-5eed49d308c2.txt",
+      "excerptSha256": "d00666d9a5d3d2d5bedbdc906e21e678d6e4464f6db9274adb5b0852572e3d66"
+    },
+    "inventory-a55537de5d2e": {
+      "path": "ros2_ws/src/cleany_gazebo_sim/cleany_gazebo_sim/pan_tf_publisher.py",
+      "sha256": "e0de5981d9cf8708e9cf4ee807d589683ee76a90ddb36ddb3586b32cbaae993b",
+      "href": "/ros/sources/inventory-a55537de5d2e.txt",
+      "excerptSha256": "8051b45429d785a2f8c744f4ec4917521a51292070be69d371db1f344feef0c4"
+    },
+    "inventory-0373f96dff22": {
+      "path": "ros2_ws/src/cleany_gazebo_sim/cleany_gazebo_sim/simulated_encoder_node.py",
+      "sha256": "84f2adf3db46064fe47721da1deeefec9aa74742abe15de09d31b2c0fa739417",
+      "href": "/ros/sources/inventory-0373f96dff22.txt",
+      "excerptSha256": "3bdf72ffd762e8cbca2e270c03da993f59912ff380cf2b2b35fac61eea708478"
+    },
+    "inventory-13903b3da8d2": {
+      "path": "ros2_ws/src/cleany_gazebo_sim/cleany_gazebo_sim/simulated_odometry_error_node.py",
+      "sha256": "a3ad5c239b5c4c479a07bc9e989bf389dedd15331d26233939e57d6ca71ae0f0",
+      "href": "/ros/sources/inventory-13903b3da8d2.txt",
+      "excerptSha256": "e980ecbad58a5b6775b2b4aef1fa1afd1da69568be7a732c515e8f6af030f809"
+    },
+    "inventory-13ed3504b538": {
+      "path": "ros2_ws/src/cleany_grasping/cleany_grasping/grasp_node.py",
+      "sha256": "8a776de1e0a6507a7feb0f2fcffbfaf592d3827868aefb22736d686bda104552",
+      "href": "/ros/sources/inventory-13ed3504b538.txt",
+      "excerptSha256": "10240315dd522bfd3a03d5d8360eee7dade2742965af5bdd52c21f21435def9c"
+    },
+    "inventory-b82bd00aba22": {
+      "path": "ros2_ws/src/cleany_handeye_calibration/cleany_handeye_calibration/ik_port.py",
+      "sha256": "9d4a0b8348b46a309279aa743d60f1afef1c9adced5899f17c7ee560e694b857",
+      "href": "/ros/sources/inventory-b82bd00aba22.txt",
+      "excerptSha256": "68cb6cc4596cac902762116aaf35691e483d1150e7f15e2d85958698bacc2ddc"
+    },
+    "inventory-ac33d02acd30": {
+      "path": "ros2_ws/src/cleany_handeye_calibration/cleany_handeye_calibration/motion_port.py",
+      "sha256": "74dd28945003e41950d10124fc53812a989c3643fe7628ed211aec8d58367628",
+      "href": "/ros/sources/inventory-ac33d02acd30.txt",
+      "excerptSha256": "e146f44dda9c01d9a594e74bfbc55ec76ce18a987e71c2faa9ab46acadc45b54"
+    },
+    "inventory-07750af704b4": {
+      "path": "ros2_ws/src/cleany_handeye_calibration/cleany_handeye_calibration/moveit_fk.py",
+      "sha256": "e3f35c90b205d814d6cc3315dfee69f9940e81a1883362e7d8796bcecfd11098",
+      "href": "/ros/sources/inventory-07750af704b4.txt",
+      "excerptSha256": "5ca322fe01e5b99b4224f9e67eebf108a84ec7e74c47257b8e19d760626bf4f0"
+    },
+    "inventory-4fe15f8adb5d": {
+      "path": "ros2_ws/src/cleany_handeye_calibration/cleany_handeye_calibration/multi_pose_runtime.py",
+      "sha256": "01d44df47993f83615570e1558bd2f8446adf33f210404ddc2cf441987a254e2",
+      "href": "/ros/sources/inventory-4fe15f8adb5d.txt",
+      "excerptSha256": "5d658cbc7ba3e68e09b0ac1789988c158d5b7f2ea06f7453125ee67e1f8bc36e"
+    },
+    "inventory-acc4d6d6474c": {
+      "path": "ros2_ws/src/cleany_handeye_calibration/cleany_handeye_calibration/single_pose_runtime.py",
+      "sha256": "b86caee2af9d7c7e99f759316cb98dc3195aaf94744a971dace32fe8272e2b94",
+      "href": "/ros/sources/inventory-acc4d6d6474c.txt",
+      "excerptSha256": "7f33ceffe42d5037796d32d24bef0579caed418c72cee195a63503e5d88d5333"
+    },
+    "inventory-9f50133634f7": {
+      "path": "ros2_ws/src/cleany_manipulation_bt/cleany_manipulation_bt/arm_return_client.py",
+      "sha256": "afa2acdbff40326f5e4698ce2a75ec88ad68b9d2bf6e1a1b494943d3254c2083",
+      "href": "/ros/sources/inventory-9f50133634f7.txt",
+      "excerptSha256": "613fe479c72208de247bfcf626f84e455eadf6b049a9551ab722ab465cb5e4e4"
+    },
+    "inventory-856409bd461b": {
+      "path": "ros2_ws/src/cleany_manipulation_bt/cleany_manipulation_bt/arm_return_recovery.py",
+      "sha256": "b4847787bd65c858d449d4dcc10ba73d09d6d20abaa486857bbb23dd128637bd",
+      "href": "/ros/sources/inventory-856409bd461b.txt",
+      "excerptSha256": "94e9721d1626c56756d0af20b3a5ba266018ffc36cfe1fd7fbba54b0f650e692"
+    },
+    "inventory-1e3c7d0da498": {
+      "path": "ros2_ws/src/cleany_manipulation_bt/cleany_manipulation_bt/arm_return_server.py",
+      "sha256": "ffb1af74878211acbe5232258f1fe6e96ebc3d0df62816dc7aef5a65e082e096",
+      "href": "/ros/sources/inventory-1e3c7d0da498.txt",
+      "excerptSha256": "1db07fd7acf9d79ff8df56e2452bdeb4d8757a91d081acff4526d5ebcf44ac50"
+    },
+    "inventory-befd94a3665d": {
+      "path": "ros2_ws/src/cleany_manipulation_bt/cleany_manipulation_bt/jetson_node.py",
+      "sha256": "0b4d68cb2feb314ecba454701ed8121534d6ecc0c5df5555b79fd11e15fe9efd",
+      "href": "/ros/sources/inventory-befd94a3665d.txt",
+      "excerptSha256": "985fe2bc6f9bbc95c2aa24ca5e0f736a7ae06f6a420cba4ada76f1e95b94ada2"
+    },
+    "inventory-8a986450335f": {
+      "path": "ros2_ws/src/cleany_manipulation_bt/cleany_manipulation_bt/jetson_operations.py",
+      "sha256": "4f1eaf1d92d6196de2367ccc5204ebfd6602d18241cc9dcd7e856676179b41f0",
+      "href": "/ros/sources/inventory-8a986450335f.txt",
+      "excerptSha256": "4cd9e872501068a034b8a409846bba626a19bfbcaaea159b22057f3215fa9da5"
+    },
+    "inventory-dacc4adfaade": {
+      "path": "ros2_ws/src/cleany_manipulation_bt/cleany_manipulation_bt/node.py",
+      "sha256": "09b6f96057d0e360a6e7d9c58b2eb53ebb7656c026c4a3813f3fe3b924f089f9",
+      "href": "/ros/sources/inventory-dacc4adfaade.txt",
+      "excerptSha256": "68a3ac33a3fe684c8fe3a4af757f9b8dd8ea86122c441f668f39c6af3afd3f63"
+    },
+    "inventory-05c265bb729c": {
+      "path": "ros2_ws/src/cleany_manipulation_bt/cleany_manipulation_bt/recovery_client.py",
+      "sha256": "7015134d4a5f7629d154dbe260d4f935d9859fc8e30de07fe101afa1900c9464",
+      "href": "/ros/sources/inventory-05c265bb729c.txt",
+      "excerptSha256": "b8519aa83bc49c04a5f82ccd7cf82bf08ed23bb365d78e7e446a1d80403c08a1"
+    },
+    "inventory-94647fb5427c": {
+      "path": "ros2_ws/src/cleany_manipulation_bt/cleany_manipulation_bt/ros_operations.py",
+      "sha256": "dab8d28be54465868a16c69897594d0075c9cb4500d282c9ac29e1b3c0657ca1",
+      "href": "/ros/sources/inventory-94647fb5427c.txt",
+      "excerptSha256": "7524eedddd9b5dd7ab6392eaf477bf21d48c022450e6a810a4ee9c47cfa97fc3"
+    },
+    "inventory-d694e6f4aaec": {
+      "path": "ros2_ws/src/cleany_mission_manager/cleany_mission_manager/adapters/manipulation.py",
+      "sha256": "433c3ab4e4f84ce7119842058d0f19d9f1f3508ffe1b222ea8f4e94f0760754b",
+      "href": "/ros/sources/inventory-d694e6f4aaec.txt",
+      "excerptSha256": "f89f98c29d6086098da907f4ba0739f23b86898882cca760431655200bfc77c6"
+    },
+    "inventory-25ce6efa40e6": {
+      "path": "ros2_ws/src/cleany_mission_manager/cleany_mission_manager/adapters/nav2.py",
+      "sha256": "18d128c91fda3a8ae1cd84ed5317d0b7637be3033a3ad5c7ad06c0e8a940c6b9",
+      "href": "/ros/sources/inventory-25ce6efa40e6.txt",
+      "excerptSha256": "6f7ac7652032efa8a69e05031929c7f38bbc19b0994ceef15c80cf2ef67e309d"
+    },
+    "inventory-e0d12418fe58": {
+      "path": "ros2_ws/src/cleany_mission_manager/cleany_mission_manager/node.py",
+      "sha256": "6f523ebde09edd8cac733260eed2da745898bd70d2eef2a0ac0d8344884cf7f9",
+      "href": "/ros/sources/inventory-e0d12418fe58.txt",
+      "excerptSha256": "bf31179aa16e5a2f567171b85fd9a49f0026b781a099a746d76cb4d504eb4687"
+    },
+    "inventory-839643694e6e": {
+      "path": "ros2_ws/src/cleany_moveit_config/cleany_moveit_config/apply_collision_scene.py",
+      "sha256": "e9a5fdda3ea911a89d854e124c75ed15ccdbdaf2d0d8d621c6ddc588622d6d51",
+      "href": "/ros/sources/inventory-839643694e6e.txt",
+      "excerptSha256": "1a81bfe0150b7e91373278869f47dd2617c01be738841b155ec7958a9a677bc2"
+    },
+    "inventory-ab66a8db82a7": {
+      "path": "ros2_ws/src/cleany_mujoco_sim/cleany_mujoco_sim/camera_contract_adapter.py",
+      "sha256": "cb445d9c4e7becfbe03fea8930274897601587d0eedcefe8d06f45a488a52fa9",
+      "href": "/ros/sources/inventory-ab66a8db82a7.txt",
+      "excerptSha256": "64fd5c0d83d30033eb7c1cc46001887dc907920bba3c8cecc536607db7704d96"
+    },
+    "inventory-e436d30279e6": {
+      "path": "ros2_ws/src/cleany_mujoco_sim/cleany_mujoco_sim/placement_verifier.py",
+      "sha256": "106ee6f1174607ea2a02bd9aea0e240daf85ddfdb17521500cc11e39a7449f6a",
+      "href": "/ros/sources/inventory-e436d30279e6.txt",
+      "excerptSha256": "b12f9bdbfbb5b20ab9f956bfa171b9ea9df5e11c47086db5c7a510fe99d25889"
+    },
+    "inventory-0f7c76705019": {
+      "path": "ros2_ws/src/cleany_mujoco_sim/cleany_mujoco_sim/sim_node.py",
+      "sha256": "faa6bf2aa8b832cea94cf0275d4c8129e4e88765fa9985d23501e902dee27fa0",
+      "href": "/ros/sources/inventory-0f7c76705019.txt",
+      "excerptSha256": "39a5039b39017ee8328ad0cd0199ab3b6e93cce1b8cc7906a277324306fe41a3"
+    },
+    "inventory-6203a9fecef1": {
+      "path": "ros2_ws/src/cleany_navigation/cleany_navigation/bt_trace_node.py",
+      "sha256": "ccb7480b5b6ac7f3918ca492affeca7b2743e911d20e05f05cc16972eea01e6c",
+      "href": "/ros/sources/inventory-6203a9fecef1.txt",
+      "excerptSha256": "2f4212578ccc5011ae7821167c2171a900ae4ffd24164e548cb97b27b219a6ea"
+    },
+    "inventory-3898b7816ae7": {
+      "path": "ros2_ws/src/cleany_navigation/cleany_navigation/depth_clearance_node.py",
+      "sha256": "6ed82e8ed0a05829f59d433a44371219c57410eaa1f25fd688a6d84f4203a28a",
+      "href": "/ros/sources/inventory-3898b7816ae7.txt",
+      "excerptSha256": "17e2e42cd57c13a5eacebea3204ad36ddfcd1121ba6e99c8540cf73e2f78c817"
+    },
+    "inventory-048a4ff915f5": {
+      "path": "ros2_ws/src/cleany_navigation/cleany_navigation/depth_coverage_node.py",
+      "sha256": "9c04c1eecf0fcf1d88d9537ca8547152cbb68153341f891de6360e041663e90b",
+      "href": "/ros/sources/inventory-048a4ff915f5.txt",
+      "excerptSha256": "a69b39446db0b24340765de2006255598ec36fa31dea3d6da10131d395e9ef42"
+    },
+    "inventory-f264e8b7992b": {
+      "path": "ros2_ws/src/cleany_navigation/cleany_navigation/obstacle_memory_node.py",
+      "sha256": "11818ebcd45a6cd14409a798a3ca85d72445b78b9e20b3b565b327f072d7f386",
+      "href": "/ros/sources/inventory-f264e8b7992b.txt",
+      "excerptSha256": "0e30712807e486506004a1a77880444687a31da5b3650065215d48a70296736f"
+    },
+    "inventory-3430ecb1fa28": {
+      "path": "ros2_ws/src/cleany_navigation/cleany_navigation/pan_motion_gate_node.py",
+      "sha256": "c4acb9766974197c30c59cf5dac140cc51b069500b5b22470ace82fbc2871ed3",
+      "href": "/ros/sources/inventory-3430ecb1fa28.txt",
+      "excerptSha256": "bc4dfd0add117965d10a2370b9ebb70c8d2d375dc38485a0c3884dc5a7a9fd28"
+    },
+    "inventory-8c68a528e54b": {
+      "path": "ros2_ws/src/cleany_navigation/cleany_navigation/reactive_guard_node.py",
+      "sha256": "7f48373625848c6f78bf5fc7dd3c90a05f8421f321d1cba15d4754511ceadea9",
+      "href": "/ros/sources/inventory-8c68a528e54b.txt",
+      "excerptSha256": "40f4c916d0a3d8fde6b436998b32b3e0006831d45d12a45365442243be30dd93"
+    },
+    "inventory-a2faaec8aedc": {
+      "path": "ros2_ws/src/cleany_navigation/cleany_navigation/voxel_guard_node.py",
+      "sha256": "382f40e5e0feff83f100aac82d193c7793928462cc44d04d091fe1e30dee90c5",
+      "href": "/ros/sources/inventory-a2faaec8aedc.txt",
+      "excerptSha256": "9d0d2cf67e0020d9e2bac857de4a8385bd3da9b2961bd9325716dd0ebf090758"
+    },
+    "inventory-61b8d0a864f4": {
+      "path": "ros2_ws/src/cleany_perception/cleany_perception/depth_scene_node.py",
+      "sha256": "41ac3d13e220976c64f29289e51e280acf45bed4850d5d82ca9af1cb052d1236",
+      "href": "/ros/sources/inventory-61b8d0a864f4.txt",
+      "excerptSha256": "4a9924ed8c1c9df14ee37c1ef0c19485e934f0a8203eae37f2cfbe6614a7726c"
+    },
+    "inventory-587cd6c22fc0": {
+      "path": "ros2_ws/src/cleany_perception/cleany_perception/inspection_node.py",
+      "sha256": "de66f5af1abc495d2e7615d813ac38dcda7284eb620c7c09e31129d8b1c83e85",
+      "href": "/ros/sources/inventory-587cd6c22fc0.txt",
+      "excerptSha256": "c5ef8beb329980b3f86a36a54f7afd4f24fa94a79841cca3ed2b117c5ca81b65"
+    },
+    "inventory-a29a5571e12c": {
+      "path": "ros2_ws/src/cleany_perception/cleany_perception/observation_runtime.py",
+      "sha256": "8884f244bb6ff2dca8e12e9dcae99bfd7986d9a8441ed023960b110519269880",
+      "href": "/ros/sources/inventory-a29a5571e12c.txt",
+      "excerptSha256": "83190f4cbadc0a7712a71bca02460dcaac32e961b5ced532c35fa3381add34d9"
+    },
+    "inventory-1daddf63cd2e": {
+      "path": "ros2_ws/src/cleany_perception/cleany_perception/scene_cloud_receipt_node.py",
+      "sha256": "6bde724077e0d2862cc0642b458103918bd3a21acdbfbc0fcb1099b147661891",
+      "href": "/ros/sources/inventory-1daddf63cd2e.txt",
+      "excerptSha256": "f84d16e01a54313c74baafaaa18e14914b1e04a79863215014e186fcd3b26967"
+    },
+    "inventory-50affd221137": {
+      "path": "ros2_ws/src/cleany_perception/cleany_perception/target_revalidation_service.py",
+      "sha256": "b48d2a2a2c4f8b421acd87b3edf8e28807b95e068dd40ba4933d9d997a5a22bd",
+      "href": "/ros/sources/inventory-50affd221137.txt",
+      "excerptSha256": "f280908b1fb926ade220b1bb977f61febf934bae7600ca68d0fea816df346844"
+    },
+    "inventory-2aee92580059": {
+      "path": "ros2_ws/src/cleany_perception/cleany_perception/vlm_warmup.py",
+      "sha256": "383e3089e17d0677da112863c34fe5887852a155d343beab5cc8cdaba38bbb3d",
+      "href": "/ros/sources/inventory-2aee92580059.txt",
+      "excerptSha256": "f95b2b748d5a16cc82adaacee64c9af1aace4b5497b6deff0d6873ca258a00e0"
+    },
+    "inventory-44e37fb97cad": {
+      "path": "ros2_ws/src/cleany_perception/cleany_perception/wrist_service.py",
+      "sha256": "853e16a461dc0193b0c430148a35986542eebc8a8f523b8d2db52c18a4112764",
+      "href": "/ros/sources/inventory-44e37fb97cad.txt",
+      "excerptSha256": "feeaef1b6f8d0f670ca9e895155e647075025426ba5a46523fe92542a07256eb"
+    },
+    "inventory-3516805c5e27": {
+      "path": "ros2_ws/src/cleany_robot_interface/cleany_robot_interface/control_state_guard.py",
+      "sha256": "abf57a42f0367f8867f70c40814fcb738560a51d9d6c48acf3c7adc84d8a3948",
+      "href": "/ros/sources/inventory-3516805c5e27.txt",
+      "excerptSha256": "f169c0526d174c72c81823f484bf12c849ebbc444cf5cc2d49a1785f6d52c3af"
+    },
+    "inventory-0c99f903ebf5": {
+      "path": "ros2_ws/src/cleany_robot_interface/cleany_robot_interface/motor_telemetry.py",
+      "sha256": "973b23c442a4e64649d620fecc7d187b6641b3f1632350a964ab92373390bd0c",
+      "href": "/ros/sources/inventory-0c99f903ebf5.txt",
+      "excerptSha256": "1e6a58aaf75b2a88d1572c1d646b01fa1cf4eb1ee72a46b0d3c24cb7f32b5e50"
+    },
+    "inventory-46d8a963b5cb": {
+      "path": "ros2_ws/src/cleany_robot_interface/cleany_robot_interface/reader.py",
+      "sha256": "388a312bc5174900971c5f8880667c90b0cfc4fb6606114a04ee290f06cefd45",
+      "href": "/ros/sources/inventory-46d8a963b5cb.txt",
+      "excerptSha256": "09afbbe9e18faf78e3e1cfc608b75da670d84a165ce21a246d6f46a3ab8fc036"
+    },
+    "inventory-7d463095c70f": {
+      "path": "ros2_ws/src/cleany_robot_interface/cleany_robot_interface/robot_state_reader.py",
+      "sha256": "5f725fd3422a26c6a4c9e4bc3c85bfe138b6bb813814fddcfd10467fcc237033",
+      "href": "/ros/sources/inventory-7d463095c70f.txt",
+      "excerptSha256": "d1177260e8d351b3c3d93734ab43554945a9789d98ed3dcb5eeee2fc502a2b3f"
+    },
+    "inventory-ecd8f5d20b91": {
+      "path": "ros2_ws/src/cleany_robot_interface/cleany_robot_interface/wrist_rgb_camera.py",
+      "sha256": "370465887b06826d5dfea0eab3a410b39a07f4d86e5f34040ff9b8a9055dcede",
+      "href": "/ros/sources/inventory-ecd8f5d20b91.txt",
+      "excerptSha256": "21c72f629cf8903bd72bcb90291c1ca3d2c775bc7208af76486d5460ca200458"
+    },
+    "inventory-8e7627b9888c": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/collection_pipeline.py",
+      "sha256": "ae6fb3afcced32b5c3674c06069049064da3ead4c95713ba946b0d16f5d06e6e",
+      "href": "/ros/sources/inventory-8e7627b9888c.txt",
+      "excerptSha256": "b54094217ad016658f25e9842e5412e1bbe1ab69d2ce97d72fae88037ca5589c"
+    },
+    "inventory-eed9c67c25b8": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/collision_geometry_cache.py",
+      "sha256": "e7d689e2bd394d5039b5a42250cfd7f9726b88d517eae90306f3e956644cc8d2",
+      "href": "/ros/sources/inventory-eed9c67c25b8.txt",
+      "excerptSha256": "448d0a3e8e6693833623bebbbed3df9ca36595f0390650740d3bf5f5654f647a"
+    },
+    "inventory-f6e46df2392c": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/curobo_adapter.py",
+      "sha256": "999f2cd5c3a2384928b0792b8f861766b067b2b3bf5d233a0dc2d182e60df99d",
+      "href": "/ros/sources/inventory-f6e46df2392c.txt",
+      "excerptSha256": "45a56dcb7372bf6987f0d748625e286223916719a5df3eeb548133e33510f289"
+    },
+    "inventory-12f8e62b68f2": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/grasp_execution.py",
+      "sha256": "e697e14fe8cdaedf4360d1d1518d033d446d67f85a7de414526ae594552087a3",
+      "href": "/ros/sources/inventory-12f8e62b68f2.txt",
+      "excerptSha256": "0a524de5153d0af243fad22ac66c69440a5b5422617277c0c6fbb86869aad88e"
+    },
+    "inventory-e442596b3ad8": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/grasp_selection_node.py",
+      "sha256": "5678c54a76ff14b5fe174a6625e681d4a669b68e58ffad6ee6876809dc95a58a",
+      "href": "/ros/sources/inventory-e442596b3ad8.txt",
+      "excerptSha256": "15c4f56ce5731c3cdcf940abc8091d5f98ae0c7575bc81aa567f979aed0d8d94"
+    },
+    "inventory-38ca80349469": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/hardware_execution.py",
+      "sha256": "2f87dac6a3f3f522498949c77635d91f9f3f7f2daa65b2b465d60cfd32d97ad1",
+      "href": "/ros/sources/inventory-38ca80349469.txt",
+      "excerptSha256": "6eadde3d5173feea4ec797438bab98b1546e35f2700a6826e04cf9bc204628de"
+    },
+    "inventory-5fb66b9ecd1c": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/manipulation_client.py",
+      "sha256": "c91c8cbacbba00c19485f1aba5c440628e39c93689a3c892a531f426b72a0446",
+      "href": "/ros/sources/inventory-5fb66b9ecd1c.txt",
+      "excerptSha256": "0c7ef5140e25214acd9051e37c2f16fe4f77d8d5c5e0984e8a7cba105365936b"
+    },
+    "inventory-ee89ccdf52ac": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/manipulation_evidence_node.py",
+      "sha256": "abfa0a120cba1d643bb9ee5e75c458534b3f5d4110a1d7b71a2027d9a0f7e6bd",
+      "href": "/ros/sources/inventory-ee89ccdf52ac.txt",
+      "excerptSha256": "68f0bf0cfe2b39ff2133aae6567a07767aee13458c0293462de8b4f63d525026"
+    },
+    "inventory-824c7e899594": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/manipulation_monitor_node.py",
+      "sha256": "be9e9d62e8ab0fbfe9860110dabf2143a4c3020e3e4fb5b6e237ff86bb3599e6",
+      "href": "/ros/sources/inventory-824c7e899594.txt",
+      "excerptSha256": "5a12ae5c553b1afcfd86dd0e0fba6f16780ce9e1993bbbd23eed73e91595f7ad"
+    },
+    "inventory-baff59b200e7": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/manipulation_node.py",
+      "sha256": "72d692170ac0242f948c226444149bef0872f731fb5d3a6808d5af02eeba1aa6",
+      "href": "/ros/sources/inventory-baff59b200e7.txt",
+      "excerptSha256": "e7e33ccb12acc16bd2b38b49c0bd1f48bc4a3b032825e2aff3a08f13d9328b65"
+    },
+    "inventory-05117f85a5a3": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/moveit_adapter.py",
+      "sha256": "685e1b848cc0e3f10c8b9d1890f0f3502e67e978b9b5949094e2659cec9e2b28",
+      "href": "/ros/sources/inventory-05117f85a5a3.txt",
+      "excerptSha256": "b02581deff25b4e17c1a6b61300eff1dae9505f85a40e46427597711f006b776"
+    },
+    "inventory-2daa26ef317b": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/nearest_pregrasp_coordinator.py",
+      "sha256": "c317019f4699c859b4434a0606e0695f30d69dc02622373650cae06da3579d1d",
+      "href": "/ros/sources/inventory-2daa26ef317b.txt",
+      "excerptSha256": "c12256f3e536b457ad791cd57a7b79f621a1768c9d6fb8fc4ba52b5b26a54963"
+    },
+    "inventory-25af95a7927f": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/physical_grasp_selection_node.py",
+      "sha256": "5857e2ffbafcfbc8b4a27f99aefc5da0b6c2e6989f2d71295f6356f26a37954b",
+      "href": "/ros/sources/inventory-25af95a7927f.txt",
+      "excerptSha256": "fd9f89e8e3ccbc0f375d7d51afeaaf4aa02440a07d47ce71f9a7cfd640641236"
+    },
+    "inventory-3e8f6edfe7b1": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/physical_moveit_adapter.py",
+      "sha256": "bd0630aea38ad923243ab26553021df95ab2b2dbbf495d285e4e7bfcc7eea863",
+      "href": "/ros/sources/inventory-3e8f6edfe7b1.txt",
+      "excerptSha256": "b4109c21305402cdfe76ebc792b43815c054010a939fe9042a5fbdd2557a7b83"
+    },
+    "inventory-a47187e7885a": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/planning_scene.py",
+      "sha256": "67a0da6f1513f6a0428ba704123068ab32d7b68197daefbeda0fd196943b4b1e",
+      "href": "/ros/sources/inventory-a47187e7885a.txt",
+      "excerptSha256": "02c7edab1fabbc50d262878d0e35fbbc8fb8e6fdc5867b6210af2952d26f3bbc"
+    },
+    "inventory-daf3ce427e43": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/pregrasp_pipeline.py",
+      "sha256": "b5e0191edd5f0515118d4657c0e5ccb4e77e25f236b961badc3b0621e2c773eb",
+      "href": "/ros/sources/inventory-daf3ce427e43.txt",
+      "excerptSha256": "ae052061065a60af784aaa454f60b0c4e44f340e7d34403e6156efa10e3cfcfe"
+    },
+    "inventory-1b91f30d2ad6": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/pregrasp_sim_ready.py",
+      "sha256": "680e05eb0cb4e5038e3713f5cc8c0907596f878fda7d58dd71e06be2cb3a562e",
+      "href": "/ros/sources/inventory-1b91f30d2ad6.txt",
+      "excerptSha256": "73406efe4235e2fba82b8f5a27e86cbd8e38b152b9f747286749619bfd2321ea"
+    },
+    "inventory-de873ff7af77": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/runtime_readiness.py",
+      "sha256": "1bb7db5537500607aae2cf495a5cec269a42489f52e6fba523469f4ce470a4f1",
+      "href": "/ros/sources/inventory-de873ff7af77.txt",
+      "excerptSha256": "e8f7fcec1582efd02462be6500f4330499aa7ac3149f570c5d5a4f1e8af41bc9"
+    },
+    "inventory-d855a4ad2a51": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/sensor_scene.py",
+      "sha256": "c43b4a5ba61641cc1406c475722fee05bc54d6ac31446068128698e717327072",
+      "href": "/ros/sources/inventory-d855a4ad2a51.txt",
+      "excerptSha256": "0374dc2324b1ff103f9668814ed45fb6bceaf2c3a828fb277a97c675c1dc22c6"
+    },
+    "inventory-67731a219bf9": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/sorting_coordinator.py",
+      "sha256": "1a0b3c0e313a54af9fbc6cf7e9426ed8c91126159f906eb805632c254cb27e8d",
+      "href": "/ros/sources/inventory-67731a219bf9.txt",
+      "excerptSha256": "bf2ab8848eb4dde7fa1881e6eccfd8100cd19e8feafd3cb325f4900c78300beb"
+    },
+    "inventory-3b50fc78c169": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/state_validity_batch.py",
+      "sha256": "cd0a848b7ee3eb9081f8b1a4560050a99020a53e7f74482c5775387f44209fed",
+      "href": "/ros/sources/inventory-3b50fc78c169.txt",
+      "excerptSha256": "0c8d695a3b50d7f0fd89887d008effdb0117c029a24917ff47ecedddc0eb453a"
+    },
+    "inventory-0c3cc044d099": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/validate_pick_node.py",
+      "sha256": "f5dd63d59515d17efc7038450d22f93bf70ea1755d6877f5c58449fef1582c49",
+      "href": "/ros/sources/inventory-0c3cc044d099.txt",
+      "excerptSha256": "89b48c6126d6516362ca37caf2534834689950b9aea0bc0a4f8cabee32d78eed"
+    },
+    "inventory-5d3aa329f316": {
+      "path": "ros2_ws/src/cleany_skill_executor/cleany_skill_executor/wrist_camera_control.py",
+      "sha256": "a103f80c768ecd80749587d514855bf88e9cf14751c5d609350d372cbd13c2a0",
+      "href": "/ros/sources/inventory-5d3aa329f316.txt",
+      "excerptSha256": "eccc2d82b8d90e8aeba9c80e2a0a17b8e875bb35d1b058eef528b07971999603"
+    },
+    "inventory-b70b25cbf060": {
+      "path": "ros2_ws/src/cleany_telemetry/cleany_telemetry/node.py",
+      "sha256": "5e98c429f0fd0885ac374af03eec51e5f845e1cb543a85f2af00a11c55ee0e0c",
+      "href": "/ros/sources/inventory-b70b25cbf060.txt",
+      "excerptSha256": "c32f589268ad6cc48b1f4950863246672732366dc355c2363dce00048a875c28"
+    },
+    "inventory-281d16e91e1a": {
+      "path": "ros2_ws/src/cleany_display/docs/interfaces.md",
+      "sha256": "a0fcd0bbf268c1a05a5be05f94ba6a18782d866a6d078447c231f1236b328d75",
+      "href": "/ros/sources/inventory-281d16e91e1a.txt",
+      "excerptSha256": "9049abef2d31ffcf39982d39419c48d9f6ff02b6a7552df8efee3e5a1ae19b4f"
+    },
+    "inventory-e45758c338f8": {
+      "path": "ros2_ws/src/cleany_moveit_capabilities/src/state_validity_batch.cpp",
+      "sha256": "374b5a4004a9013ac9955b5e3d1fe105d935c0849a3ae4e4e02a5bfbfd61b4b5",
+      "href": "/ros/sources/inventory-e45758c338f8.txt",
+      "excerptSha256": "1f11abc4abafa6652af37f153bd8387dda3cff60eb0a4daff5018349ac451c9f"
+    },
+    "inventory-e1de66d82a63": {
+      "path": "ros2_ws/src/cleany_mujoco_observer/src/scheduled_cameras.cpp",
+      "sha256": "05ce9fc87ea5aa6735ea05e036558b93b5f6ce8f9ffa9b40d96d8f25ba4d83da",
+      "href": "/ros/sources/inventory-e1de66d82a63.txt",
+      "excerptSha256": "cfa85eef9708b311fb0912a6466fcddcbbb8e28999bad87b799a9e8d57595e04"
+    },
+    "inventory-61d49ef0ae5c": {
+      "path": "ros2_ws/src/cleany_mujoco_observer/src/sorting_observer.cpp",
+      "sha256": "6d81bf28a128c456c16f0aaff671754331231c7f4237b3452bf3762cff737252",
+      "href": "/ros/sources/inventory-61d49ef0ae5c.txt",
+      "excerptSha256": "3e4f24c0447339230087e0c88bf01fac3ac53d5c1c3588d3f6e8980193560145"
+    },
+    "inventory-6875e07e1f4f": {
+      "path": "ros2_ws/src/cleany_scene_mapping/src/known_geometry_updater.cpp",
+      "sha256": "3a426b1c5ed7a51bf2dfa7d9c945a6aafe5976f48e25514ea1c15fa7fc872d6b",
+      "href": "/ros/sources/inventory-6875e07e1f4f.txt",
+      "excerptSha256": "865cb1d31dd99f6de3b6694b151d5cafb8320248be2656599f61cb455aff5012"
+    },
+    "inventory-2b3bff49f208": {
+      "path": "ros2_ws/src/cleany_perception/launch/realsense.launch.py",
+      "sha256": "3ae9a40591793e82f20986afa96a0aecb9b7384f65ef48cef343f92c94b7dbcc",
+      "href": "/ros/sources/inventory-2b3bff49f208.txt",
+      "excerptSha256": "3733680ebc2548e0455243b2113bdc38779eb675f06a39768b9108c6608eb21f"
+    },
+    "inventory-35f35d8a6a12": {
+      "path": "ros2_ws/src/cleany_skill_executor/launch/manipulation_mock.launch.py",
+      "sha256": "c0b18ace1710841133183319c8448812d5cd27c9d507ad331a804fbc0b70d597",
+      "href": "/ros/sources/inventory-35f35d8a6a12.txt",
+      "excerptSha256": "a55ff0cd78ee3b2dd93eb1fb322b1f6a2bd1dc914d89114addf98f30556abcb9"
+    },
+    "inventory-6d93e32e836e": {
+      "path": "ros2_ws/src/cleany_dev_monitor/config/manipulation_io_probe.json",
+      "sha256": "9cbd705c0692c2a5853ee149fbb8afdff9a582e0bf0e7dafb72c81dbb544c772",
+      "href": "/ros/sources/inventory-6d93e32e836e.txt",
+      "excerptSha256": "9a887c7d83cfaa6c8045129096ca28936b5de145eec257f2210dd8431dde8761"
+    },
+    "inventory-1864ba3832cf": {
+      "path": "tools/collection-runtime",
+      "sha256": "10775bfa1b9482f0073e0103301e2bfce5f7a72f07355fbee8d7ab78a49ef48a",
+      "href": "/ros/sources/inventory-1864ba3832cf.txt",
+      "excerptSha256": "f4ee23a8a4520b5e989d50f6858d9d80e3c20c513d0acc6ba933d3988ead312b"
+    },
+    "inventory-389b44c4ba76": {
+      "path": "ros2_ws/src/cleany_perception/launch/learned_rgbd.launch.py",
+      "sha256": "659cf255924c71c8beb103e0e3c233844d673b39e383484e2931bada7916ea51",
+      "href": "/ros/sources/inventory-389b44c4ba76.txt",
+      "excerptSha256": "ed3b6ea94d3948419fd8e565f913b2b4d2726f0db963e646e2d14fc8110622ce"
+    },
+    "inventory-124bbae48232": {
+      "path": "ros2_ws/src/cleany_robot_interface/launch/real_control.launch.py",
+      "sha256": "2afb44725b1cc86ff0924fdcbc4d0e3b635aa116b94ca4a871e966164644e40f",
+      "href": "/ros/sources/inventory-124bbae48232.txt",
+      "excerptSha256": "12cd0dd4adfd7512b80a6f107e83708b0262a46f726e204e074f88257b23883b"
+    }
+  }
+}

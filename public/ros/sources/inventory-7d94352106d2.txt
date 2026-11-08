@@ -1,0 +1,31 @@
+ros2_ws/src/cleany_control_bridge/cleany_control_bridge/node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 0de78916609bc21fdfccac767436550238cd66b960f896ec186af54ff847ab73
+
+29:         uncertain and triggers reconnection rather than fabricating rejection.
+30:     """
+31:     def __init__(self) -> None:
+32:         super().__init__("control_bridge")
+33:         self.declare_parameter("url", "ws://127.0.0.1:8080/api/robots/cleany-01/gateway/ws")
+34:         self.declare_parameter("journal_path", "~/.local/state/cleany/control-bridge.db")
+35:         self.declare_parameter("rpc_timeout", 3.0)
+36:         self.declare_parameter("heartbeat_interval", 1.0)
+37:         self.declare_parameter("reconnect_initial", 1.0)
+38:         self.declare_parameter("reconnect_max", 30.0)
+39:         self.url = self.get_parameter("url").value
+40:         self.rpc_timeout = float(self.get_parameter("rpc_timeout").value)
+41:         self.interval = float(self.get_parameter("heartbeat_interval").value)
+42:         self.reconnect_initial = float(self.get_parameter("reconnect_initial").value)
+43:         self.reconnect_max = float(self.get_parameter("reconnect_max").value)
+46:         )) or self.reconnect_max < self.reconnect_initial:
+47:             raise ValueError("bridge timing parameters must be positive")
+48:         self.session = BridgeSession(self.get_parameter("journal_path").value)
+49:         self.offer_client = self.create_client(OfferMission, "mission/offer")
+50:         self.cancel_client = self.create_client(CancelMission, "mission/cancel")
+51:         self.snapshot_client = self.create_client(GetRuntimeSnapshot, "mission/snapshot")
+52:         self.stop_event = threading.Event()
+53:         self.socket = None
+54:         self.synced = False
+55:         self.snapshot_event_id = ""
+56:         self.snapshot_sent_at = 0.0

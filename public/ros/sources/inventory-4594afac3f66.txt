@@ -1,0 +1,173 @@
+ros2_ws/src/cleany_base_odometry/cleany_base_odometry/wheel_odom_node.py
+Review: 2026-11-02
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: ee4ed8a21ce13f7376e1b0aa16950eb6949186929511016d0eef5446d04a869f
+
+1: from __future__ import annotations
+2: 
+3: from math import cos, sin
+4: 
+5: import rclpy
+6: from nav_msgs.msg import Odometry
+7: from rclpy.executors import ExternalShutdownException
+8: from rclpy.node import Node
+9: from rclpy.qos import qos_profile_sensor_data
+10: from sensor_msgs.msg import JointState
+11: 
+12: from cleany_base_odometry.mecanum_odometry import (
+13:     MecanumGeometry,
+14:     MecanumOdometry,
+15:     WheelPositions,
+16: )
+17: 
+18: 
+19: class WheelOdometryNode(Node):
+20:     """Estimate planar odometry from cumulative wheel angles.
+21: 
+22:     Subscriptions:
+23:         joint_states (sensor_msgs/msg/JointState): All four wheel positions in
+24:             radians; configurable with input_topic.
+25: 
+26:     Publishers:
+27:         wheel/odom (nav_msgs/msg/Odometry): Pose in odom and velocity in
+28:             base_link; topic and frame names are parameter defaults.
+29: 
+30:     TF:
+31:         Does not broadcast; the odometry relay owns odom -> base_link.
+32: 
+33:     QoS:
+34:         Input uses sensor_data; output is reliable with depth 10.
+35: 
+36:     Notes:
+37:         The first sample, non-increasing time and velocity-window warm-up
+38:         produce no message. Invalid wheel values raise a validation error.
+39:     """
+40: 
+41:     def __init__(self) -> None:
+42:         super().__init__('wheel_odometry')
+43:         self.declare_parameter('input_topic', 'joint_states')
+44:         self.declare_parameter('output_topic', 'wheel/odom')
+45:         self.declare_parameter('odom_frame_id', 'odom')
+46:         self.declare_parameter('base_frame_id', 'base_link')
+47:         self.declare_parameter('velocity_window_s', 0.0)
+48:         self.declare_parameter('yaw_scale', 1.0)
+49:         self.declare_parameter('wheel_radius_m', 0.0635)
+50:         self.declare_parameter('wheelbase_m', 0.30)
+51:         self.declare_parameter('wheel_separation_m', 0.51)
+52:         self.declare_parameter(
+53:             'front_left_joint', 'front_left_wheel_joint'
+54:         )
+55:         self.declare_parameter(
+56:             'front_right_joint', 'front_right_wheel_joint'
+57:         )
+58:         self.declare_parameter('rear_left_joint', 'rear_left_wheel_joint')
+59:         self.declare_parameter('rear_right_joint', 'rear_right_wheel_joint')
+60: 
+61:         geometry = MecanumGeometry(
+62:             wheel_radius_m=float(self.get_parameter('wheel_radius_m').value),
+63:             wheelbase_m=float(self.get_parameter('wheelbase_m').value),
+64:             wheel_separation_m=float(
+65:                 self.get_parameter('wheel_separation_m').value
+66:             ),
+67:         )
+68:         self._odometry = MecanumOdometry(
+69:             geometry,
+70:             velocity_window_s=float(self.get_parameter('velocity_window_s').value),
+71:             yaw_scale=float(self.get_parameter('yaw_scale').value),
+72:         )
+73:         self._odom_frame_id = str(self.get_parameter('odom_frame_id').value)
+74:         self._base_frame_id = str(self.get_parameter('base_frame_id').value)
+75:         self._joint_names = {
+76:             'front_left': str(self.get_parameter('front_left_joint').value),
+77:             'front_right': str(
+78:                 self.get_parameter('front_right_joint').value
+79:             ),
+80:             'rear_left': str(self.get_parameter('rear_left_joint').value),
+81:             'rear_right': str(self.get_parameter('rear_right_joint').value),
+82:         }
+83:         input_topic = str(self.get_parameter('input_topic').value)
+84:         output_topic = str(self.get_parameter('output_topic').value)
+85:         self._publisher = self.create_publisher(Odometry, output_topic, 10)
+86:         self.create_subscription(
+87:             JointState,
+88:             input_topic,
+89:             self._on_joint_state,
+90:             qos_profile_sensor_data,
+91:         )
+92: 
+93:     def _on_joint_state(self, message: JointState) -> None:
+94:         """Integrate complete wheel samples, using node time for a zero stamp.
+95: 
+96:         Missing positions or wheel names are ignored. Non-finite wheel values
+97:         raise during validation; they are not converted into zero motion.
+98:         """
+99:         if len(message.position) < len(message.name):
+100:             self.get_logger().warning(
+101:                 'Ignoring JointState with fewer positions than names',
+102:                 throttle_duration_sec=5.0,
+103:             )
+104:             return
+105: 
+106:         position_by_name = dict(zip(message.name, message.position))
+107:         missing = [
+108:             joint_name
+109:             for joint_name in self._joint_names.values()
+110:             if joint_name not in position_by_name
+111:         ]
+112:         if missing:
+113:             self.get_logger().warning(
+114:                 f'Ignoring JointState missing wheel joints: {missing}',
+115:                 throttle_duration_sec=5.0,
+116:             )
+117:             return
+118: 
+119:         positions = WheelPositions(
+120:             front_left=float(
+121:                 position_by_name[self._joint_names['front_left']]
+122:             ),
+123:             front_right=float(
+124:                 position_by_name[self._joint_names['front_right']]
+125:             ),
+126:             rear_left=float(
+127:                 position_by_name[self._joint_names['rear_left']]
+128:             ),
+129:             rear_right=float(
+130:                 position_by_name[self._joint_names['rear_right']]
+131:             ),
+132:         )
+133:         stamp = message.header.stamp
+134:         if stamp.sec == 0 and stamp.nanosec == 0:
+135:             stamp = self.get_clock().now().to_msg()
+136:         stamp_s = float(stamp.sec) + float(stamp.nanosec) * 1e-9
+137:         estimate = self._odometry.update(positions, stamp_s)
+138:         if estimate is None:
+139:             return
+140: 
+141:         output = Odometry()
+142:         output.header.stamp = stamp
+143:         output.header.frame_id = self._odom_frame_id
+144:         output.child_frame_id = self._base_frame_id
+145:         output.pose.pose.position.x = estimate.x_m
+146:         output.pose.pose.position.y = estimate.y_m
+147:         output.pose.pose.orientation.z = sin(estimate.yaw_rad / 2.0)
+148:         output.pose.pose.orientation.w = cos(estimate.yaw_rad / 2.0)
+149:         output.twist.twist.linear.x = estimate.linear_x_mps
+150:         output.twist.twist.linear.y = estimate.linear_y_mps
+151:         output.twist.twist.angular.z = estimate.angular_z_rps
+152:         self._publisher.publish(output)
+153: 
+154: 
+155: def main(args: list[str] | None = None) -> None:
+156:     rclpy.init(args=args)
+157:     node = WheelOdometryNode()
+158:     try:
+159:         rclpy.spin(node)
+160:     except (KeyboardInterrupt, ExternalShutdownException):
+161:         pass
+162:     finally:
+163:         try:
+164:             node.destroy_node()
+165:             if rclpy.ok():
+166:                 rclpy.shutdown()
+167:         except KeyboardInterrupt:
+168:             pass

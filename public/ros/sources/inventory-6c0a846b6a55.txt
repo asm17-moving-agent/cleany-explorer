@@ -1,0 +1,17 @@
+ros2_ws/src/cleany_base_driver/cleany_base_driver/odom_relay.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 5f010db23c86acd95f81b28b44e7f48a7fd2a7b5d6e82d87bba997628158a9e1
+
+24:         already represent odom -> base_link. Do not run a second TF owner.
+25:     """
+26:     def __init__(self):
+27:         super().__init__('base_odom_relay')
+28:         self.pub = self.create_publisher(Odometry, 'odom', 10)
+29:         self.tf = TransformBroadcaster(self)
+30:         self.create_subscription(Odometry, 'wheel/odom', self.on_odom, 10)
+31: 
+32:     def on_odom(self, m):
+33:         m.header.frame_id, m.child_frame_id = 'odom', 'base_link'
+34:         self.pub.publish(m)
+35:         t = TransformStamped()

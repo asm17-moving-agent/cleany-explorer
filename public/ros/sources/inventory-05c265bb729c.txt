@@ -1,0 +1,14 @@
+ros2_ws/src/cleany_manipulation_bt/cleany_manipulation_bt/recovery_client.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 7015134d4a5f7629d154dbe260d4f935d9859fc8e30de07fe101afa1900c9464
+
+30:     try:
+31:         rclpy.init(args=ros_args)
+32:         node = rclpy.create_node('manipulation_recovery_client')
+33:         client = node.create_client(ConfirmManipulationRecovery, '/manipulation/confirm_recovery')
+34:         if not client.wait_for_service(timeout_sec=5.):
+35:             raise RuntimeError('복구 서비스가 없습니다. 새 실행기를 make manipulation-start로 시작하세요.')
+36:         status = call(ConfirmManipulationRecovery.Request())
+37:         blocked = dict(zip(status.blocked_execution_ids, status.blocked_revisions, strict=True))
+38:         print(f'inhibited={status.inhibited}', flush=True)

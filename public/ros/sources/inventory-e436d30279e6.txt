@@ -1,0 +1,48 @@
+ros2_ws/src/cleany_mujoco_sim/cleany_mujoco_sim/placement_verifier.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 106ee6f1174607ea2a02bd9aea0e240daf85ddfdb17521500cc11e39a7449f6a
+
+42:         Insufficient evidence returns an unsuccessful response.
+43:     """
+44:     def __init__(self):
+45:         super().__init__('simulation_placement_verifier')
+46:         default = (Path(get_package_share_directory('cleany_mujoco_sim'))
+47:                    / 'config' / 'robot_top_bins.yaml')
+48:         self.declare_parameter('bins_config', str(default))
+49:         self.declare_parameter('minimum_samples', 5)
+50:         self.declare_parameter('maximum_age_sec', 1.0)
+51:         self.declare_parameter('maximum_drift_m', 0.003)
+52:         self.declare_parameter('settled_duration_sec', 0.4)
+53:         self.declare_parameter('labels', list(DEFAULT_LABEL_BODIES))
+54:         self.declare_parameter('bodies', list(DEFAULT_LABEL_BODIES.values()))
+55:         labels = self.get_parameter('labels').value
+56:         bodies = self.get_parameter('bodies').value
+57:         if len(labels) != len(bodies) or len(set(zip(labels, bodies))) != len(labels):
+58:             raise ValueError('Verifier requires distinct label/body pairs')
+59:         self._body_candidates = defaultdict(set)
+62:         # Label-only compatibility is allowed only for a single configured body.
+63:         self._bodies = {label: next(iter(values)) for label, values in self._body_candidates.items()
+64:                         if len(values) == 1}
+65:         self.declare_parameter('registration_maximum_distance_m', 0.05)
+66:         self.declare_parameter('registration_ambiguity_margin_m', 0.01)
+67:         self.declare_parameter('registration_maximum_size_error_m', 0.08)
+68:         self.declare_parameter('registration_observation_maximum_age_sec', 120.0)
+69:         self.declare_parameter('registration_ttl_sec', 600.0)
+70:         self.declare_parameter('registration_maximum_entries', 128)
+71:         self._registrations = {}
+72:         self._execution_registrations = {}
+73:         self._bins = {b.name: b for b in load_bins(
+74:             self.get_parameter('bins_config').value)}
+75:         self._samples = defaultdict(lambda: deque(maxlen=30))
+76:         self.create_subscription(MarkerArray,
+77:                                  '/simulation/sorting_ground_truth',
+78:                                  self._observe, 10)
+79:         self.create_service(RegisterPlacementTarget, '/sorting/register_placement_target',
+80:                             self._register)
+81:         self.create_service(VerifyPlacement, '/sorting/verify_placement',
+82:                             self._verify)
+83: 
+84:     def _observe(self, message):
+85:         for marker in message.markers:
+86:             if marker.header.frame_id != 'base_link':

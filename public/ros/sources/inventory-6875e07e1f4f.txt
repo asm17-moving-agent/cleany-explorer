@@ -1,0 +1,19 @@
+ros2_ws/src/cleany_scene_mapping/src/known_geometry_updater.cpp
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 3a426b1c5ed7a51bf2dfa7d9c945a6aafe5976f48e25514ea1c15fa7fc872d6b
+
+86:     return;
+87:   last_update_ns_ = 0;
+88:   if (!filtered_topic_.empty())
+89:     publisher_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
+90:         filtered_topic_, rclcpp::SensorDataQoS().keep_last(1));
+91:   callback_group_ = node_->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+92:   rclcpp::SubscriptionOptions options;
+93:   options.callback_group = callback_group_;
+94:   subscription_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+95:       cloud_topic_, rclcpp::SensorDataQoS().keep_last(1),
+96:       [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud) {
+97:         if (active_)
+98:           processCloud(*cloud);
+99:       }, options);

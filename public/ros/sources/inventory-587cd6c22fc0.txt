@@ -1,0 +1,1290 @@
+ros2_ws/src/cleany_perception/cleany_perception/inspection_node.py
+Review: 2026-11-01
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: de66f5af1abc495d2e7615d813ac38dcda7284eb620c7c09e31129d8b1c83e85
+
+1: from __future__ import annotations
+2: 
+3: import threading
+4: import math
+5: import os
+6: import json
+7: import time
+8: from pathlib import Path
+9: from collections.abc import Sequence
+10: 
+11: import numpy as np
+12: 
+13: import rclpy
+14: from cleany_interfaces.action import InspectScene
+15: from cleany_interfaces.msg import (
+16:     DetectedObject2D,
+17:     DetectedObject2DArray,
+18:     DetectedObject3D,
+19:     DetectedObject3DArray,
+20: )
+21: from rclpy.action import (
+22:     ActionServer,
+23:     CancelResponse,
+24:     GoalResponse,
+25: )
+26: from rclpy.callback_groups import (
+27:     MutuallyExclusiveCallbackGroup,
+28:     ReentrantCallbackGroup,
+29: )
+30: from rclpy.executors import MultiThreadedExecutor
+31: from rclpy.node import Node
+32: from rclpy.parameter import Parameter
+33: from rclpy.qos import (
+34:     DurabilityPolicy,
+35:     HistoryPolicy,
+36:     QoSProfile,
+37:     ReliabilityPolicy,
+38:     qos_profile_sensor_data,
+39: )
+40: from rclpy.time import Time
+41: from sensor_msgs.msg import CameraInfo, Image
+42: from std_srvs.srv import Trigger
+43: 
+44: from cleany_perception.adapters.gemini_detector import GeminiClassifier, GeminiDetector
+45: from cleany_perception.object_labels import DEFAULT_OBJECT_LABEL_ALIASES
+46: from cleany_perception.adapters.simulation_color import (
+47:     SimulationColorDetector,
+48:     SimulationColorSegmenter,
+49: )
+50: from cleany_perception.adapters.tf2_transform import Tf2TransformAdapter
+51: from cleany_perception.adapters.yoloe_detector import YoloeDetector, YoloeMaskSegmenter, YoloeModelPool
+52: from cleany_perception.adapters.yoloe_gemini import YoloeGeminiDetector
+53: from cleany_perception.model_runtime import (
+54:     resolve_device, resolve_model_assets,
+55: )
+56: from cleany_perception.core.geometry import quaternion_xyzw_from_rotation
+57: from cleany_perception.core.point_cloud import (
+58:     colored_cloud_from_selection,
+59:     transform_colored_cloud,
+60: )
+61: from cleany_perception.core.models import (
+62:     Detection2D,
+63:     FailureKind,
+64:     InspectionFailure,
+65:     InspectionOutput,
+66:     InspectionStage,
+67:     PipelineConfig,
+68:     RgbdSnapshot,
+69:     RigidTransform,
+70: )
+71: from cleany_perception.core.object_ranking import (
+72:     ObjectRankingConfig,
+73:     rank_detections_by_distance,
+74: )
+75: from cleany_perception.core.pipeline import InspectionPipeline
+76: from cleany_perception.core.reconstruction_cache import ReconstructionCache
+77: from cleany_perception.vlm_warmup import VlmWarmupClient
+78: from cleany_perception.core.ports import (
+79:     DetectorPort,
+80:     SegmenterPort,
+81:     TransformPort,
+82: )
+83: from cleany_perception.debug_image import (
+84:     debug_image_message,
+85:     render_debug_image,
+86: )
+87: from cleany_perception.rgbd_snapshot import (
+88:     RgbdSnapshotBuffer,
+89:     snapshot_from_messages,
+90: )
+91: from cleany_perception.point_cloud_message import colored_point_cloud_message
+92: from cleany_perception.core.tracking import ObjectTracker, TrackingConfig, TrackingOutput
+93: from cleany_interfaces.msg import TrackedObjectReference
+94: 
+95: from cleany_perception.snapshot_cache import (
+96:     CachedDetectionSnapshot,
+97:     DetectionSnapshotCache,
+98: )
+99: from cleany_interfaces.srv import GetSceneSnapshot
+100: from cleany_perception.target_revalidation_service import TargetRevalidationService
+101: 
+102: 
+103: _FAILURE_CODES = {
+104:     FailureKind.RGBD_TIMEOUT: InspectScene.Result.ERROR_RGBD_TIMEOUT,
+105:     FailureKind.DETECTOR_API: InspectScene.Result.ERROR_DETECTOR_API,
+106:     FailureKind.DETECTOR_RESPONSE: InspectScene.Result.ERROR_DETECTOR_RESPONSE,
+107:     FailureKind.MASK: InspectScene.Result.ERROR_MASK,
+108:     FailureKind.DEPTH: InspectScene.Result.ERROR_DEPTH,
+109:     FailureKind.PLANE: InspectScene.Result.ERROR_PLANE,
+110:     FailureKind.TF: InspectScene.Result.ERROR_TF,
+111:     FailureKind.CANCELLED: InspectScene.Result.ERROR_CANCELLED,
+112:     FailureKind.INTERNAL: InspectScene.Result.ERROR_INTERNAL,
+113: }
+114: 
+115: 
+116: _STAGE_CODES = {
+117:     InspectionStage.WAITING_FOR_RGBD: (
+118:         InspectScene.Feedback.STAGE_WAITING_FOR_RGBD
+119:     ),
+120:     InspectionStage.DETECTING: InspectScene.Feedback.STAGE_DETECTING,
+121:     InspectionStage.SEGMENTING: InspectScene.Feedback.STAGE_SEGMENTING,
+122:     InspectionStage.RECONSTRUCTING: InspectScene.Feedback.STAGE_RECONSTRUCTING,
+123:     InspectionStage.TRANSFORMING: InspectScene.Feedback.STAGE_TRANSFORMING,
+124: }
+125: 
+126: 
+127: _LATCHED_DEBUG_IMAGE_QOS = QoSProfile(
+128:     history=HistoryPolicy.KEEP_LAST,
+129:     depth=1,
+130:     reliability=ReliabilityPolicy.RELIABLE,
+131:     durability=DurabilityPolicy.TRANSIENT_LOCAL,
+132: )
+133: 
+134: 
+135: from cleany_perception.observation_runtime import (ObservationRuntime, SerializedInference, declare_observation_parameters)
+136: 
+137: 
+138: class InspectionNode(Node):
+139:     """Inspect a synchronized RGB-D snapshot and retain selectable observations.
+140: 
+141:     Subscriptions:
+142:         camera/color/image_raw and camera/depth/image_raw (sensor_msgs/msg/Image):
+143:             Color and depth; configurable defaults.
+144:         camera/color/camera_info and camera/depth/camera_info
+145:             (sensor_msgs/msg/CameraInfo): Corresponding intrinsics; configurable.
+146:         /{left,right}_wrist_camera/{image_raw,camera_info}
+147:             (sensor_msgs/msg/Image, sensor_msgs/msg/CameraInfo): Optional wrist RGB pairs.
+148: 
+149:     Publishers:
+150:         perception/objects (cleany_interfaces/msg/DetectedObject3DArray): Located objects.
+151:         perception/detections_2d (cleany_interfaces/msg/DetectedObject2DArray): Image detections.
+152:         perception/debug_image and perception/debug_image_latched (sensor_msgs/msg/Image):
+153:             Detection overlays. All publisher names are configurable defaults.
+154: 
+155:     Services:
+156:         /perception/revalidate_target (cleany_interfaces/srv/RevalidateTarget):
+157:             Fresh local target observation with the cached approval semantics.
+158:         /perception/observe_wrist_target (cleany_interfaces/srv/ObserveWristTarget):
+159:             Optional WristService endpoint when enable_wrist_observation is true.
+160: 
+161:     Actions:
+162:         perception/inspect_scene (cleany_interfaces/action/InspectScene): Server
+163:             for inspection and selection from cached snapshots; configurable default.
+164: 
+165:     TF:
+166:         Resolves capture-time camera geometry into target_frame, default base_link.
+167: 
+168:     QoS:
+169:         Camera inputs and live debug output use sensor_data; latched debug uses
+170:         reliable, transient-local QoS.
+171: 
+172:     Notes:
+173:         Sensor callbacks and action work use separate callback groups. Missing
+174:         synchronized input, invalid geometry or expired snapshots fail the request.
+175:         Wrist RGB supplies image evidence, not measured depth.
+176:     """
+177:     def __init__(
+178:         self,
+179:         detector: DetectorPort | None = None,
+180:         segmenter: SegmenterPort | None = None,
+181:         transformer: TransformPort | None = None,
+182:         **kwargs,
+183:     ) -> None:
+184:         super().__init__('perception_inspector', **kwargs)
+185:         self._declare_parameters()
+186:         self._default_query = str(self.get_parameter('default_query').value)
+187:         self._snapshot_timeout_seconds = float(
+188:             self.get_parameter('snapshot_timeout_seconds').value
+189:         )
+190:         self._depth_16u_scale_m = float(
+191:             self.get_parameter('depth_16u_scale_m').value
+192:         )
+193:         self._debug_republish_count = int(
+194:             self.get_parameter('debug_republish_count').value
+195:         )
+196:         self._debug_republish_period_seconds = float(
+197:             self.get_parameter('debug_republish_period_seconds').value
+198:         )
+199:         if self._debug_republish_count < 0:
+200:             raise ValueError('Debug republish count must be nonnegative')
+201:         if self._debug_republish_period_seconds <= 0.0:
+202:             raise ValueError('Debug republish period must be positive')
+203:         target_frame = str(self.get_parameter('target_frame').value)
+204:         self._target_frame = target_frame
+205: 
+206:         detector_type = str(self.get_parameter('detector_type').value)
+207:         segmenter_type = str(self.get_parameter('segmenter_type').value)
+208:         if detector_type == 'yoloe_gemini' and segmenter_type != 'yoloe_seg':
+209:             raise ValueError('YOLOE+Gemini classification requires YOLOE segmentation')
+210:         for kind, supplied in ((detector_type, detector),
+211:                                (segmenter_type, segmenter)):
+212:             if supplied is None and kind in ('yoloe', 'yoloe_gemini'):
+213:                 self._resolve_local_model('yoloe' if kind == 'yoloe_gemini' else kind)
+214:         wrist_yoloe = None
+215:         wrist_check_yoloe = None
+216:         wrist_mouse_check_yoloe = None
+217:         wrist_right_yoloe = None
+218:         wrist_right_check_yoloe = None
+219:         if detector is None:
+220:             if detector_type == 'gemini':
+221:                 detector = GeminiDetector(
+222:                     model=str(self.get_parameter('gemini_model').value),
+223:                     jpeg_quality=self.get_parameter('gemini_jpeg_quality').value,
+224:                     api_key_environment=str(
+225:                         self.get_parameter('gemini_api_key_environment').value
+226:                     ),
+227:                     timeout_seconds=float(
+228:                         self.get_parameter('detector_timeout_seconds').value
+229:                     ),
+230:                 )
+231:             elif detector_type == 'simulation_color':
+232:                 detector = SimulationColorDetector(
+233:                     minimum_pixels=int(
+234:                         self.get_parameter(
+235:                             'simulation_color_minimum_pixels'
+236:                         ).value
+237:                     ),
+238:                     profile=str(
+239:                         self.get_parameter(
+240:                             'simulation_color_profile'
+241:                         ).value
+242:                     ),
+243:                 )
+244:             elif detector_type in ('yoloe', 'yoloe_gemini'):
+245:                 model_pool = YoloeModelPool()
+246:                 def make_yoloe(
+247:                     model_path: str, *, class_thresholds: tuple[float, ...] | None = None,
+248:                 ) -> YoloeDetector:
+249:                     return YoloeDetector(
+250:                         model_pool=model_pool,
+251:                         model_path=model_path,
+252:                         classes=tuple(self.get_parameter('yoloe_classes').value),
+253:                         device=str(self.get_parameter('yoloe_device').value),
+254:                         engine_execution=str(self.get_parameter('yoloe_engine_execution').value),
+255:                         image_size=int(self.get_parameter('yoloe_image_size').value),
+256:                         confidence_threshold=float(self.get_parameter(
+257:                             'minimum_detection_confidence').value),
+258:                         iou_threshold=float(self.get_parameter('yoloe_iou_threshold').value),
+259:                         maximum_detections=int(self.get_parameter('maximum_detections').value),
+260:                         text_encoder_directory=str(self.get_parameter(
+261:                             'yoloe_text_encoder_directory').value),
+262:                         require_masks=segmenter_type == 'yoloe_seg',
+263:                         class_confidence_thresholds=(
+264:                             class_thresholds if class_thresholds is not None else
+265:                             tuple(self.get_parameter_or(
+266:                                 'yoloe_class_confidence_thresholds').value or ())),
+267:                     )
+268: 
+269:                 yoloe = make_yoloe(str(self.get_parameter('yoloe_model_path').value))
+270:                 wrist_yoloe = yoloe
+271:                 if (segmenter_type == 'yoloe_seg'
+272:                         and bool(self.get_parameter('enable_wrist_observation').value)):
+273:                     def resolved_model_path(parameter_name: str) -> Path | None:
+274:                         raw = str(self.get_parameter(parameter_name).value).strip()
+275:                         if not raw:
+276:                             return None
+277:                         path = Path(raw).expanduser()
+278:                         if not path.is_absolute():
+279:                             path = Path(str(self.get_parameter(
+280:                                 'model_directory').value)).expanduser() / path
+281:                         return path.resolve()
+282: 
+283:                     head_path = Path(str(self.get_parameter('yoloe_model_path').value)).resolve()
+284:                     wrist_path = resolved_model_path('wrist_yoloe_model_path')
+285:                     if wrist_path is not None and wrist_path != head_path:
+286:                         wrist_yoloe = make_yoloe(str(wrist_path))
+287:                     wrist_right_yoloe = wrist_yoloe
+288:                     right_path = resolved_model_path('wrist_right_yoloe_model_path')
+289:                     if right_path == head_path:
+290:                         wrist_right_yoloe = yoloe
+291:                     elif right_path == wrist_path:
+292:                         wrist_right_yoloe = wrist_yoloe
+293:                     elif right_path is not None:
+294:                         wrist_right_yoloe = make_yoloe(str(right_path))
+295:                     wrist_check_yoloe = wrist_yoloe
+296:                     check_path = resolved_model_path('wrist_check_yoloe_model_path')
+297:                     if check_path == head_path:
+298:                         wrist_check_yoloe = yoloe
+299:                     elif check_path == wrist_path:
+300:                         wrist_check_yoloe = wrist_yoloe
+301:                     elif check_path == right_path:
+302:                         wrist_check_yoloe = wrist_right_yoloe
+303:                     elif check_path is not None:
+304:                         wrist_check_yoloe = make_yoloe(str(check_path))
+305:                     wrist_mouse_check_yoloe = wrist_check_yoloe
+306:                     mouse_check_path = resolved_model_path(
+307:                         'wrist_mouse_check_yoloe_model_path')
+308:                     if mouse_check_path is not None:
+309:                         for path, adapter in (
+310:                             (head_path, yoloe), (wrist_path, wrist_yoloe),
+311:                             (right_path, wrist_right_yoloe),
+312:                             (check_path, wrist_check_yoloe),
+313:                         ):
+314:                             if mouse_check_path == path:
+315:                                 wrist_mouse_check_yoloe = adapter
+316:                                 break
+317:                         else:
+318:                             wrist_mouse_check_yoloe = make_yoloe(
+319:                                 str(mouse_check_path))
+320:                     wrist_right_check_yoloe = wrist_check_yoloe
+321:                     right_check_path = resolved_model_path(
+322:                         'wrist_right_check_yoloe_model_path')
+323:                     right_check_thresholds = tuple(self.get_parameter_or(
+324:                         'wrist_right_check_yoloe_class_confidence_thresholds'
+325:                     ).value or ())
+326:                     if right_check_path is not None and right_check_thresholds:
+327:                         wrist_right_check_yoloe = make_yoloe(
+328:                             str(right_check_path),
+329:                             class_thresholds=right_check_thresholds)
+330:                     else:
+331:                         for path, adapter in (
+332:                             (head_path, yoloe), (wrist_path, wrist_yoloe),
+333:                             (right_path, wrist_right_yoloe),
+334:                             (check_path, wrist_check_yoloe),
+335:                         ):
+336:                             if right_check_path is not None and right_check_path == path:
+337:                                 wrist_right_check_yoloe = adapter
+338:                                 break
+339:                         else:
+340:                             if right_check_path is not None:
+341:                                 wrist_right_check_yoloe = make_yoloe(
+342:                                     str(right_check_path))
+343:                 if detector_type == 'yoloe_gemini':
+344:                     detector = YoloeGeminiDetector(yoloe, GeminiClassifier(
+345:                         model=str(self.get_parameter('gemini_model').value),
+346:                         label_aliases=self.get_parameter('semantic_label_aliases').value,
+347:                         jpeg_quality=self.get_parameter('gemini_jpeg_quality').value,
+348:                         api_key_environment=str(self.get_parameter(
+349:                             'gemini_api_key_environment').value),
+350:                         timeout_seconds=float(self.get_parameter(
+351:                             'detector_timeout_seconds').value),
+352:                     ), vlm_active=self._vlm_active, timing=self._log_inspection_timing)
+353:                 else:
+354:                     detector = yoloe
+355:             else:
+356:                 raise ValueError(f'Unsupported detector_type: {detector_type}')
+357:         if segmenter is None:
+358:             if segmenter_type == 'simulation_color':
+359:                 segmenter = SimulationColorSegmenter(
+360:                     profile=str(
+361:                         self.get_parameter(
+362:                             'simulation_color_profile'
+363:                         ).value
+364:                     )
+365:                 )
+366:             elif segmenter_type == 'yoloe_seg':
+367:                 if detector_type not in ('yoloe', 'yoloe_gemini'):
+368:                     raise ValueError('YOLOE masks require a YOLOE detector')
+369:                 segmenter = YoloeMaskSegmenter()
+370:             else:
+371:                 raise ValueError(
+372:                     f'Unsupported segmenter_type: {segmenter_type}'
+373:                 )
+374:         engine_selected = any(
+375:             Path(str(self.get_parameter(name).value)).suffix == '.engine'
+376:             for name in ('yoloe_model_path', 'wrist_yoloe_model_path',
+377:                          'wrist_right_yoloe_model_path', 'wrist_check_yoloe_model_path',
+378:                          'wrist_mouse_check_yoloe_model_path', 'wrist_right_check_yoloe_model_path'))
+379:         if bool(self.get_parameter('preload_models').value) or engine_selected:
+380:             self.get_logger().info('Loading perception models')
+381:             adapters = (('detector', detector), ('segmenter', segmenter))
+382:             if wrist_yoloe is not None and wrist_yoloe is not yoloe:
+383:                 adapters += (('wrist detector', wrist_yoloe),)
+384:             if (wrist_right_yoloe is not None
+385:                     and wrist_right_yoloe is not wrist_yoloe
+386:                     and wrist_right_yoloe is not yoloe):
+387:                 adapters += (('right wrist detector', wrist_right_yoloe),)
+388:             if (wrist_check_yoloe is not None
+389:                     and wrist_check_yoloe is not wrist_yoloe
+390:                     and wrist_check_yoloe is not wrist_right_yoloe
+391:                     and wrist_check_yoloe is not yoloe):
+392:                 adapters += (('wrist check detector', wrist_check_yoloe),)
+393:             if (wrist_right_check_yoloe is not None
+394:                     and wrist_right_check_yoloe not in (
+395:                         yoloe, wrist_yoloe, wrist_right_yoloe, wrist_check_yoloe)):
+396:                 adapters += (('right wrist check detector', wrist_right_check_yoloe),)
+397:             if (wrist_mouse_check_yoloe is not None
+398:                     and wrist_mouse_check_yoloe not in (
+399:                         yoloe, wrist_yoloe, wrist_right_yoloe,
+400:                         wrist_check_yoloe, wrist_right_check_yoloe)):
+401:                 adapters += (('mouse wrist check detector', wrist_mouse_check_yoloe),)
+402:             for name, adapter in adapters:
+403:                 prepare = getattr(adapter, 'prepare', None)
+404:                 if not callable(prepare):
+405:                     raise ValueError(f'{name} cannot preload models')
+406:                 self.get_logger().debug(f'Loading {name} before action ready')
+407:                 prepare()
+408:             detector_device = (
+409:                 f"remote API: {self.get_parameter('gemini_model').value}; access not yet verified"
+410:                 if detector_type == 'gemini' else self.get_parameter('yoloe_device').value)
+411:             segmenter_device = ('YOLOE instance masks' if segmenter_type == 'yoloe_seg'
+412:                                 else 'simulation color')
+413:             self.get_logger().info(
+414:                 'PERCEPTION MODELS READY: '
+415:                 f'{detector_type} ({detector_device}) + '
+416:                 f'{segmenter_type} ({segmenter_device}); '
+417:                 'no simulation fallback'
+418:             )
+419:         if transformer is None:
+420:             transformer = Tf2TransformAdapter(
+421:                 self,
+422:                 timeout_seconds=float(
+423:                     self.get_parameter('tf_timeout_seconds').value
+424:                 ),
+425:                 cache_seconds=float(
+426:                     self.get_parameter('tf_cache_seconds').value
+427:                 ),
+428:             )
+429:         self._transformer = transformer
+430:         self._inference_lock = threading.RLock()
+431:         reference_detector = SerializedInference(getattr(detector, '_yoloe', detector), self._inference_lock)
+432:         detector = SerializedInference(detector, self._inference_lock)
+433:         segmenter = SerializedInference(segmenter, self._inference_lock)
+434:         self._pipeline = InspectionPipeline(
+435:             detector=detector,
+436:             segmenter=segmenter,
+437:             transformer=transformer,
+438:             target_frame=target_frame,
+439:             config=self._pipeline_config(),
+440:         )
+441:         self._object_ranking_config = ObjectRankingConfig(
+442:             central_bbox_fraction=float(
+443:                 self.get_parameter(
+444:                     'nearest_object_central_bbox_fraction'
+445:                 ).value
+446:             ),
+447:             minimum_valid_depth_pixels=int(
+448:                 self.get_parameter('nearest_object_minimum_depth_pixels').value
+449:             ),
+450:             minimum_depth_m=float(
+451:                 self.get_parameter('minimum_depth_m').value
+452:             ),
+453:             maximum_depth_m=float(
+454:                 self.get_parameter('maximum_depth_m').value
+455:             ),
+456:         )
+457:         self._tracker = ObjectTracker(TrackingConfig(
+458:             maximum_distance_m=float(self.get_parameter('tracking_maximum_distance_m').value),
+459:             ambiguity_margin_m=float(self.get_parameter('tracking_ambiguity_margin_m').value),
+460:             session_ttl_seconds=float(self.get_parameter('tracking_session_ttl_seconds').value),
+461:             maximum_sessions=int(self.get_parameter('tracking_maximum_sessions').value),
+462:             label_aliases=tuple(tuple(item.split('=', 1)) for item in
+463:                                 self.get_parameter('tracking_label_aliases').value),
+464:         ))
+465:         self._snapshot_cache = DetectionSnapshotCache(
+466:             maximum_entries=int(
+467:                 self.get_parameter('snapshot_cache_max_entries').value
+468:             ),
+469:             ttl_seconds=float(
+470:                 self.get_parameter('snapshot_cache_ttl_seconds').value
+471:             ),
+472:         )
+473: 
+474:         self._snapshot_buffer = RgbdSnapshotBuffer()
+475:         self._action_callback_group = ReentrantCallbackGroup()
+476:         self._vlm_warmup = (VlmWarmupClient(self,
+477:             str(self.get_parameter('vlm_ik_warmup_service').value), self._action_callback_group,
+478:             prepare_service=str(self.get_parameter('vlm_anygrasp_prepare_service').value))
+479:             if self.get_parameter('vlm_ik_warmup_enabled').value else None)
+480:         self.get_logger().info('VLM IK warmup notifications: ' +
+481:             ('enabled' if self._vlm_warmup is not None else 'disabled'))
+482:         self._create_sensor_subscriptions()
+483:         self._objects_publisher = self.create_publisher(
+484:             DetectedObject3DArray,
+485:             str(self.get_parameter('objects_topic').value),
+486:             10,
+487:         )
+488:         self._detections_publisher = self.create_publisher(
+489:             DetectedObject2DArray,
+490:             str(self.get_parameter('detections_topic').value),
+491:             10,
+492:         )
+493:         self._debug_publisher = self.create_publisher(
+494:             Image,
+495:             str(self.get_parameter('debug_image_topic').value),
+496:             qos_profile_sensor_data,
+497:         )
+498:         self._latched_debug_publisher = self.create_publisher(
+499:             Image,
+500:             str(self.get_parameter('latched_debug_image_topic').value),
+501:             _LATCHED_DEBUG_IMAGE_QOS,
+502:         )
+503:         self._debug_lock = threading.Lock()
+504:         self._debug_message = None
+505:         self._debug_republishes_remaining = 0
+506:         self._debug_timer = (
+507:             self.create_timer(
+508:                 self._debug_republish_period_seconds,
+509:                 self._republish_debug_image,
+510:             )
+511:             if self._debug_republish_count > 1 else None
+512:         )
+513:         self._busy_lock = threading.Lock()
+514:         self._busy = False
+515:         self._wrist_service = None
+516:         if bool(self.get_parameter('enable_wrist_observation').value):
+517:             if detector_type != 'yoloe_gemini' or segmenter_type != 'yoloe_seg' or wrist_yoloe is None:
+518:                 raise ValueError('Wrist observation requires the local YOLOE-seg detector')
+519:             from cleany_perception.wrist_service import WristService
+520:             from dataclasses import asdict
+521:             from cleany_perception.core.wrist_observation import WristObservationConfig
+522:             wrist_config = WristObservationConfig(**{
+523:                 name: self.declare_parameter(f'wrist_{name}', default).value
+524:                 for name, default in asdict(WristObservationConfig()).items()
+525:             })
+526:             self._wrist_service = WristService(
+527:                 self, SerializedInference(wrist_yoloe, self._inference_lock),
+528:                 check_detector=SerializedInference(wrist_check_yoloe, self._inference_lock) if wrist_check_yoloe is not None else None,
+529:                 mouse_check_detector=SerializedInference(wrist_mouse_check_yoloe, self._inference_lock) if wrist_mouse_check_yoloe is not None else None,
+530:                 right_detector=SerializedInference(wrist_right_yoloe, self._inference_lock) if wrist_right_yoloe is not None else None,
+531:                 right_check_detector=SerializedInference(wrist_right_check_yoloe, self._inference_lock) if wrist_right_check_yoloe is not None else None,
+532:                 failure_image_directory=str(self.get_parameter(
+533:                     'wrist_failure_image_directory').value),
+534:                 config=wrist_config)
+535:         self._observations = ObservationRuntime(self, reference_detector)
+536:         self._target_revalidation = TargetRevalidationService(self, reference_detector)
+537:         cleanup_period = float(self.get_parameter('snapshot_cleanup_period_seconds').value)
+538:         if not math.isfinite(cleanup_period) or cleanup_period < 0:
+539:             raise ValueError('Snapshot cleanup period must be finite and nonnegative')
+540:         self._snapshot_cleanup_timer = (
+541:             self.create_timer(cleanup_period, self._cleanup_expired_snapshots,
+542:                               callback_group=self._action_callback_group)
+543:             if cleanup_period > 0 else None)
+544:         self._snapshot_service = self.create_service(
+545:             GetSceneSnapshot, 'perception/get_scene_snapshot', self._get_scene_snapshot,
+546:             callback_group=self._action_callback_group)
+547:         self._rgbd_check_service = self.create_service(
+548:             Trigger, 'perception/check_rgbd', self._check_rgbd,
+549:             callback_group=self._action_callback_group)
+550:         self._action_server = ActionServer(
+551:             self,
+552:             InspectScene,
+553:             str(self.get_parameter('action_name').value),
+554:             execute_callback=self._execute,
+555:             callback_group=self._action_callback_group,
+556:             goal_callback=self._goal_callback,
+557:             cancel_callback=self._cancel_callback,
+558:         )
+559: 
+560:     def _cleanup_expired_snapshots(self) -> None:
+561:         self._snapshot_cache.expire()
+562:         self._observations.expire_reference()
+563: 
+564:     def _get_scene_snapshot(self, request, response):
+565:         cached = self._snapshot_cache.get(request.snapshot_id)
+566:         response.found = cached is not None
+567:         response.message = 'Snapshot missing or expired'
+568:         if cached is not None:
+569:             response.detections = self._detections_message(
+570:                 cached.detections, cached.snapshot.stamp_ns, cached.color_frame,
+571:                 request.snapshot_id, cached.detection_distances_m,
+572:                 cached.tracking, cached.representative_frame)
+573:             response.message = 'Cached snapshot; capture time and TTL unchanged'
+574:         return response
+575: 
+576:     def _check_rgbd(self, _request: Trigger.Request,
+577:                     response: Trigger.Response) -> Trigger.Response:
+578:         """Check this server's fresh input without inference or a cached detection."""
+579:         try:
+580:             messages = self._snapshot_buffer.wait_for_new(
+581:                 self._snapshot_buffer.sequence, self._snapshot_timeout_seconds)
+582:             snapshot = snapshot_from_messages(
+583:                 messages, depth_16u_scale_m=self._depth_16u_scale_m)
+584:             age_seconds = (self.get_clock().now().nanoseconds - snapshot.stamp_ns) / 1e9
+585:             if not 0 <= age_seconds <= self._snapshot_timeout_seconds:
+586:                 raise ValueError(f'RGB-D capture is stale or future-dated: age={age_seconds:.3f}s')
+587:             response.success = True
+588:             response.message = (
+589:                 f'Fresh exact-timestamp RGB-D input: stamp_ns={snapshot.stamp_ns}, '
+590:                 f'frame={snapshot.source_frame}, age={age_seconds:.3f}s')
+591:         except (InspectionFailure, ValueError) as error:
+592:             response.success = False
+593:             response.message = str(error)
+594:         return response
+595: 
+596:     def destroy_node(self) -> None:
+597:         self._vlm_active(False)
+598:         if self._snapshot_cleanup_timer is not None:
+599:             self.destroy_timer(self._snapshot_cleanup_timer)
+600:         if self._wrist_service is not None:
+601:             self._wrist_service.close(wait=True)
+602:         self._observations.close()
+603:         self._action_server.destroy()
+604:         super().destroy_node()
+605: 
+606:     def _vlm_active(self, active: bool) -> None:
+607:         client = getattr(self, '_vlm_warmup', None)
+608:         if client is not None:
+609:             client.set_active(active)
+610: 
+611:     def _log_inspection_timing(self, stage: str, seconds: float) -> None:
+612:         self.get_logger().info(json.dumps({'event': 'inspection_phase_timing',
+613:             'stage': stage, 'wall_sec': seconds}))
+614: 
+615:     def _declare_parameters(self) -> None:
+616:         declare_observation_parameters(self)
+617:         self.declare_parameter('enable_wrist_observation', False)
+618:         self.declare_parameter('preload_models', False)
+619:         self.declare_parameter('vlm_ik_warmup_enabled', False)
+620:         self.declare_parameter('vlm_ik_warmup_service', '/grasp/vlm_warmup')
+621:         self.declare_parameter('vlm_anygrasp_prepare_service', '/grasp/prepare_window')
+622:         self.declare_parameter(
+623:             'model_directory',
+624:             os.environ.get('CLEANY_MODEL_DIR', str(Path.home() / 'models')),
+625:         )
+626:         self.declare_parameter('action_name', 'perception/inspect_scene')
+627:         self.declare_parameter('objects_topic', 'perception/objects')
+628:         self.declare_parameter('detections_topic', 'perception/detections_2d')
+629:         self.declare_parameter('debug_image_topic', 'perception/debug_image')
+630:         self.declare_parameter(
+631:             'latched_debug_image_topic',
+632:             'perception/debug_image_latched',
+633:         )
+634:         self.declare_parameter('debug_republish_count', 5)
+635:         self.declare_parameter('debug_republish_period_seconds', 0.25)
+636:         self.declare_parameter('color_image_topic', 'camera/color/image_raw')
+637:         self.declare_parameter('color_info_topic', 'camera/color/camera_info')
+638:         self.declare_parameter('depth_image_topic', 'camera/depth/image_raw')
+639:         self.declare_parameter('depth_info_topic', 'camera/depth/camera_info')
+640:         self.declare_parameter('rgbd_qos_reliability', 'best_effort')
+641:         self.declare_parameter('target_frame', 'base_link')
+642:         self.declare_parameter(
+643:             'default_query',
+644:             'Detect the box and can on the table.',
+645:         )
+646:         self.declare_parameter('detector_type', 'yoloe_gemini')
+647:         self.declare_parameter('segmenter_type', 'yoloe_seg')
+648:         self.declare_parameter('simulation_color_minimum_pixels', 100)
+649:         self.declare_parameter('simulation_color_profile', 'legacy')
+650:         self.declare_parameter('yoloe_model_path', '')
+651:         self.declare_parameter('wrist_yoloe_model_path', '')
+652:         self.declare_parameter('wrist_right_yoloe_model_path', '')
+653:         self.declare_parameter('wrist_check_yoloe_model_path', '')
+654:         self.declare_parameter('wrist_mouse_check_yoloe_model_path', '')
+655:         self.declare_parameter('wrist_right_check_yoloe_model_path', '')
+656:         self.declare_parameter('wrist_failure_image_directory', '')
+657:         self.declare_parameter(
+658:             'wrist_right_check_yoloe_class_confidence_thresholds',
+659:             Parameter.Type.DOUBLE_ARRAY)
+660:         self.declare_parameter(
+661:             'yoloe_classes',
+662:             ['cup', 'wallet', 'crumpled tissue', 'lego brick'],
+663:         )
+664:         self.declare_parameter('yoloe_device', 'cuda')
+665:         self.declare_parameter('yoloe_engine_execution', 'async')
+666:         self.declare_parameter('yoloe_image_size', 640)
+667:         self.declare_parameter('yoloe_iou_threshold', 0.5)
+668:         self.declare_parameter(
+669:             'yoloe_class_confidence_thresholds', Parameter.Type.DOUBLE_ARRAY
+670:         )
+671:         self.declare_parameter('yoloe_text_encoder_directory', '')
+672:         self.declare_parameter('snapshot_timeout_seconds', 2.0)
+673:         self.declare_parameter('depth_16u_scale_m', 0.001)
+674:         self.declare_parameter('tracking_maximum_distance_m', 0.03)
+675:         self.declare_parameter('tracking_ambiguity_margin_m', 0.01)
+676:         self.declare_parameter('tracking_session_ttl_seconds', 600.0)
+677:         self.declare_parameter('tracking_maximum_sessions', 32)
+678:         self.declare_parameter('tracking_label_aliases',
+679:                                [f'{alias}={label}' for alias, label in TrackingConfig().label_aliases])
+680:         self.declare_parameter('snapshot_cache_max_entries', 2)
+681:         self.declare_parameter('snapshot_cache_ttl_seconds', 120.0)
+682:         self.declare_parameter('snapshot_cleanup_period_seconds', 5.0)
+683:         self.declare_parameter(
+684:             'gemini_model',
+685:             'gemini-robotics-er-2-preview',
+686:         )
+687:         self.declare_parameter('gemini_api_key_environment', 'GEMINI_API_KEY')
+688:         self.declare_parameter('gemini_jpeg_quality', 95)
+689:         self.declare_parameter('semantic_label_aliases', list(DEFAULT_OBJECT_LABEL_ALIASES))
+690:         self.declare_parameter('detector_timeout_seconds', 30.0)
+691:         self.declare_parameter('tf_timeout_seconds', 0.5)
+692:         self.declare_parameter('tf_cache_seconds', 60.0)
+693:         self.declare_parameter('minimum_detection_confidence', 0.25)
+694:         self.declare_parameter('maximum_detections', 10)
+695:         self.declare_parameter('minimum_depth_m', 0.1)
+696:         self.declare_parameter('maximum_depth_m', 3.0)
+697:         self.declare_parameter('nearest_object_central_bbox_fraction', 0.5)
+698:         self.declare_parameter('nearest_object_minimum_depth_pixels', 20)
+699:         self.declare_parameter('support_margin_pixels', 40)
+700:         self.declare_parameter('support_sample_stride', 4)
+701:         self.declare_parameter('plane_ransac_iterations', 200)
+702:         self.declare_parameter('plane_distance_threshold_m', 0.006)
+703:         self.declare_parameter('plane_minimum_inliers', 100)
+704:         self.declare_parameter('plane_minimum_inlier_ratio', 0.35)
+705:         self.declare_parameter('maximum_plane_tilt_degrees', 20.0)
+706:         self.declare_parameter('minimum_object_points', 30)
+707:         self.declare_parameter('minimum_object_height_m', 0.005)
+708:         self.declare_parameter('minimum_obb_extent_m', 0.005)
+709:         self.declare_parameter('grasp_context_margin_pixels', 80)
+710:         self.declare_parameter('grasp_cloud_voxel_size_m', 0.005)
+711:         self.declare_parameter('grasp_target_maximum_points', 12000)
+712:         self.declare_parameter('grasp_context_maximum_points', 30000)
+713: 
+714:     def _resolve_local_model(self, kind: str) -> None:
+715:         keys = (
+716:             'yoloe_model_path', 'yoloe_text_encoder_directory'
+717:         )
+718:         resolved = resolve_model_assets(
+719:             {key: str(self.get_parameter(key).value) for key in keys},
+720:             str(self.get_parameter('model_directory').value), kind,
+721:         )
+722:         import torch
+723: 
+724:         device_key = kind + '_device'
+725:         requested = str(self.get_parameter(device_key).value)
+726:         resolved[device_key] = resolve_device(
+727:             requested, torch.cuda.is_available()
+728:         )
+729:         for key, value in resolved.items():
+730:             self.set_parameters([Parameter(key, value=value)])
+731:             self.get_logger().debug(f'Perception runtime: {key}={value}')
+732: 
+733:     def _pipeline_config(self) -> PipelineConfig:
+734:         return PipelineConfig(
+735:             minimum_detection_confidence=float(
+736:                 self.get_parameter('minimum_detection_confidence').value
+737:             ),
+738:             maximum_detections=int(
+739:                 self.get_parameter('maximum_detections').value
+740:             ),
+741:             minimum_depth_m=float(self.get_parameter('minimum_depth_m').value),
+742:             maximum_depth_m=float(self.get_parameter('maximum_depth_m').value),
+743:             support_margin_pixels=int(
+744:                 self.get_parameter('support_margin_pixels').value
+745:             ),
+746:             support_sample_stride=int(
+747:                 self.get_parameter('support_sample_stride').value
+748:             ),
+749:             plane_ransac_iterations=int(
+750:                 self.get_parameter('plane_ransac_iterations').value
+751:             ),
+752:             plane_distance_threshold_m=float(
+753:                 self.get_parameter('plane_distance_threshold_m').value
+754:             ),
+755:             plane_minimum_inliers=int(
+756:                 self.get_parameter('plane_minimum_inliers').value
+757:             ),
+758:             plane_minimum_inlier_ratio=float(
+759:                 self.get_parameter('plane_minimum_inlier_ratio').value
+760:             ),
+761:             maximum_plane_tilt_degrees=float(
+762:                 self.get_parameter('maximum_plane_tilt_degrees').value
+763:             ),
+764:             minimum_object_points=int(
+765:                 self.get_parameter('minimum_object_points').value
+766:             ),
+767:             minimum_object_height_m=float(
+768:                 self.get_parameter('minimum_object_height_m').value
+769:             ),
+770:             minimum_obb_extent_m=float(
+771:                 self.get_parameter('minimum_obb_extent_m').value
+772:             ),
+773:         )
+774: 
+775:     def _create_sensor_subscriptions(self) -> None:
+776:         reliability = str(self.get_parameter('rgbd_qos_reliability').value)
+777:         if reliability not in ('best_effort', 'reliable'):
+778:             raise ValueError('rgbd_qos_reliability must be best_effort or reliable')
+779:         qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=5,
+780:             reliability=(ReliabilityPolicy.RELIABLE if reliability == 'reliable'
+781:                          else ReliabilityPolicy.BEST_EFFORT))
+782:         # A slow, continuously ready Image callback must not starve CameraInfo
+783:         # or the other camera stream. Buffer updates have their own lock.
+784:         for message_type, topic_parameter, callback in (
+785:             (Image, 'color_image_topic', self._snapshot_buffer.add_color),
+786:             (CameraInfo, 'color_info_topic', self._snapshot_buffer.add_color_info),
+787:             (Image, 'depth_image_topic', self._snapshot_buffer.add_depth),
+788:             (CameraInfo, 'depth_info_topic', self._snapshot_buffer.add_depth_info),
+789:         ):
+790:             self.create_subscription(
+791:                 message_type, str(self.get_parameter(topic_parameter).value),
+792:                 callback, qos,
+793:                 callback_group=MutuallyExclusiveCallbackGroup())
+794: 
+795:     def _goal_callback(self, _goal_request) -> GoalResponse:
+796:         with self._busy_lock:
+797:             if self._busy:
+798:                 return GoalResponse.REJECT
+799:             self._busy = True
+800:         return GoalResponse.ACCEPT
+801: 
+802:     @staticmethod
+803:     def _cancel_callback(_goal_handle) -> CancelResponse:
+804:         return CancelResponse.ACCEPT
+805: 
+806:     def _execute(self, goal_handle) -> InspectScene.Result:
+807:         result = InspectScene.Result()
+808:         result.detections = self._empty_detections()
+809:         result.objects = self._empty_objects()
+810:         try:
+811:             has_snapshot = bool(goal_handle.request.snapshot_id)
+812:             has_selection = goal_handle.request.selected_object_id != 0
+813:             if has_snapshot != has_selection:
+814:                 result.success = False
+815:                 result.error_code = InspectScene.Result.ERROR_INVALID_SELECTION
+816:                 result.message = (
+817:                     'snapshot_id and selected_object_id must be supplied '
+818:                     'together'
+819:                 )
+820:                 goal_handle.abort()
+821:                 return result
+822:             if has_snapshot:
+823:                 return self._execute_selection(goal_handle, result)
+824:             self._feedback(
+825:                 goal_handle,
+826:                 InspectionStage.WAITING_FOR_RGBD,
+827:                 0,
+828:                 0,
+829:                 'Waiting for a new synchronized RGB-D snapshot',
+830:             )
+831:             baseline = self._snapshot_buffer.sequence
+832:             messages = self._snapshot_buffer.wait_for_new(
+833:                 baseline,
+834:                 self._snapshot_timeout_seconds,
+835:                 cancelled=lambda: goal_handle.is_cancel_requested,
+836:             )
+837:             snapshot = snapshot_from_messages(
+838:                 messages,
+839:                 depth_16u_scale_m=self._depth_16u_scale_m,
+840:             )
+841:             capture_transform = self._lookup_capture_transform(snapshot)
+842:             query = goal_handle.request.query.strip() or self._default_query
+843:             geometry_cache = ReconstructionCache()
+844:             inspection_began = time.monotonic()
+845:             detections = self._pipeline.detect(
+846:                 snapshot,
+847:                 query,
+848:                 progress=lambda stage, detections, objects, message: (
+849:                     self._feedback(
+850:                         goal_handle,
+851:                         stage,
+852:                         detections,
+853:                         objects,
+854:                         message,
+855:                     )
+856:                 ),
+857:                 cancelled=lambda: goal_handle.is_cancel_requested,
+858:                 capture_transform=capture_transform,
+859:                 geometry_cache=geometry_cache,
+860:             )
+861:             footprint_began = time.monotonic()
+862:             detections = self._pipeline.estimate_detection_footprints(
+863:                 snapshot, detections, capture_transform,
+864:                 cancelled=lambda: goal_handle.is_cancel_requested,
+865:                 geometry_cache=geometry_cache,
+866:             )
+867:             self._log_inspection_timing('footprints_after_classification', time.monotonic() - footprint_began)
+868:             self._log_inspection_timing('detection_and_geometry', time.monotonic() - inspection_began)
+869:             ranked_detections = rank_detections_by_distance(
+870:                 snapshot,
+871:                 detections,
+872:                 capture_transform,
+873:                 self._object_ranking_config,
+874:             )
+875:             detections = tuple(item.detection for item in ranked_detections)
+876:             detection_distances_m = tuple(
+877:                 item.distance_m for item in ranked_detections
+878:             )
+879:             self._feedback(
+880:                 goal_handle,
+881:                 InspectionStage.DETECTING,
+882:                 len(detections),
+883:                 0,
+884:                 f'Detected {len(detections)} objects',
+885:             )
+886:             snapshot_id = self._snapshot_id(
+887:                 snapshot.stamp_ns,
+888:                 messages.sequence,
+889:             )
+890:             session_id = goal_handle.request.tracking_session_id
+891:             if session_id and self._target_frame != 'base_link':
+892:                 raise InspectionFailure(FailureKind.TF, 'Tracking requires base_link and a fixed base')
+893:             if goal_handle.is_cancel_requested:
+894:                 raise InspectionFailure(FailureKind.CANCELLED, 'Observation canceled before tracking update')
+895:             tracking = self._tracker.update(
+896:                 session_id, snapshot_id, [d.label for d in detections],
+897:                 [item.position for item in ranked_detections],
+898:                 detector_labels=[d.detector_label for d in detections],
+899:             )
+900:             self._snapshot_cache.put(
+901:                 snapshot_id,
+902:                 CachedDetectionSnapshot(
+903:                     snapshot=snapshot,
+904:                     detections=detections,
+905:                     detection_distances_m=detection_distances_m,
+906:                     capture_transform=capture_transform,
+907:                     color_frame=messages.color.header.frame_id,
+908:                     tracking=tracking,
+909:                     representative_frame=self._target_frame,
+910:                     geometry_cache=geometry_cache,
+911:                 ),
+912:             )
+913:             detections_message = self._detections_message(
+914:                 detections,
+915:                 snapshot.stamp_ns,
+916:                 messages.color.header.frame_id,
+917:                 snapshot_id,
+918:                 detection_distances_m,
+919:                 tracking, self._target_frame,
+920:             )
+921:             result.success = True
+922:             result.error_code = InspectScene.Result.ERROR_NONE
+923:             result.message = (
+924:                 f'Detected {len(detections)} objects ordered by nearest '
+925:                 'target-frame distance; select a distance-valid object_id '
+926:                 'for selected-object inspection'
+927:             )
+928:             result.detections = detections_message
+929:             self._detections_publisher.publish(detections_message)
+930:             if self._debug_republish_count:
+931:                 debug_rgb = render_debug_image(snapshot.rgb, detections, ())
+932:                 self._publish_debug_image(debug_image_message(
+933:                     debug_rgb, snapshot.stamp_ns,
+934:                     messages.color.header.frame_id,
+935:                 ))
+936:             goal_handle.succeed()
+937:             return result
+938:         except InspectionFailure as error:
+939:             result.success = False
+940:             result.error_code = _FAILURE_CODES[error.kind]
+941:             result.message = str(error)
+942:             if error.kind == FailureKind.CANCELLED:
+943:                 goal_handle.canceled()
+944:             else:
+945:                 goal_handle.abort()
+946:             return result
+947:         except Exception as error:
+948:             result.success = False
+949:             result.error_code = InspectScene.Result.ERROR_INTERNAL
+950:             result.message = f'Unexpected inspection error: {error}'
+951:             goal_handle.abort()
+952:             return result
+953:         finally:
+954:             with self._busy_lock:
+955:                 self._busy = False
+956: 
+957: 
+958:     def _execute_selection(
+959:         self,
+960:         goal_handle,
+961:         result: InspectScene.Result,
+962:     ) -> InspectScene.Result:
+963:         snapshot_id = goal_handle.request.snapshot_id
+964:         cached = self._snapshot_cache.get(snapshot_id)
+965:         if cached is None:
+966:             result.success = False
+967:             result.error_code = InspectScene.Result.ERROR_SNAPSHOT_NOT_FOUND
+968:             result.message = f'Snapshot not found or expired: {snapshot_id}'
+969:             goal_handle.abort()
+970:             return result
+971:         requested_session = goal_handle.request.tracking_session_id
+972:         if requested_session and (cached.tracking is None or cached.tracking.session_id != requested_session):
+973:             result.error_code = InspectScene.Result.ERROR_INVALID_SELECTION
+974:             result.message = 'Tracking session does not match the cached observation'
+975:             goal_handle.abort()
+976:             return result
+977:         selected_id = int(goal_handle.request.selected_object_id)
+978:         if selected_id < 1 or selected_id > len(cached.detections):
+979:             result.success = False
+980:             result.error_code = InspectScene.Result.ERROR_INVALID_SELECTION
+981:             result.message = (
+982:                 f'Object ID {selected_id} is outside the snapshot range '
+983:                 f'1..{len(cached.detections)}'
+984:             )
+985:             goal_handle.abort()
+986:             return result
+987:         selected = cached.detections[selected_id - 1]
+988:         output = self._pipeline.inspect_selected(
+989:             cached.snapshot,
+990:             cached.detections,
+991:             selected,
+992:             cached.capture_transform,
+993:             progress=lambda stage, detections, objects, message: (
+994:                 self._feedback(
+995:                     goal_handle,
+996:                     stage,
+997:                     detections,
+998:                     objects,
+999:                     message,
+1000:                 )
+1001:             ),
+1002:             cancelled=lambda: goal_handle.is_cancel_requested,
+1003:             geometry_cache=cached.geometry_cache,
+1004:         )
+1005:         if cached.geometry_cache is not None:
+1006:             self.get_logger().info(json.dumps({'event': 'inspection_geometry_cache',
+1007:                 'snapshot_id': snapshot_id, 'object_id': selected_id,
+1008:                 'hits': cached.geometry_cache.hits, 'misses': cached.geometry_cache.misses}))
+1009:         detections_message = self._detections_message(
+1010:             cached.detections,
+1011:             cached.snapshot.stamp_ns,
+1012:             cached.color_frame,
+1013:             snapshot_id,
+1014:             cached.detection_distances_m,
+1015:             cached.tracking, cached.representative_frame,
+1016:         )
+1017:         objects_message = self._objects_message(
+1018:             output,
+1019:             cached.snapshot.stamp_ns,
+1020:             snapshot_id,
+1021:             (selected_id,),
+1022:         )
+1023:         if cached.tracking is not None:
+1024:             objects_message.tracking_session_id = cached.tracking.session_id
+1025:             objects_message.tracking_epoch = cached.tracking.epoch
+1026:             for obj in objects_message.objects:
+1027:                 tracked = cached.tracking.detections[obj.object_id - 1]
+1028:                 obj.track_id, obj.tracking_state = tracked.track_id, tracked.state.value
+1029:         target_cloud, context_cloud = self._selected_cloud_messages(
+1030:             cached.snapshot,
+1031:             output.masks[0].mask,
+1032:             selected,
+1033:             cached.capture_transform,
+1034:             output.target_frame,
+1035:             support_plane=output.plane,
+1036:         )
+1037:         result.success = True
+1038:         result.error_code = InspectScene.Result.ERROR_NONE
+1039:         result.message = (
+1040:             f'Inspected selected object {selected_id}: {selected.label}'
+1041:         )
+1042:         result.detections = detections_message
+1043:         result.objects = objects_message
+1044:         result.target_cloud = target_cloud
+1045:         result.context_cloud = context_cloud
+1046:         self._objects_publisher.publish(objects_message)
+1047:         if self._debug_republish_count:
+1048:             debug_rgb = render_debug_image(
+1049:                 cached.snapshot.rgb, output.detections, output.masks,
+1050:                 object_ids=(selected_id,),
+1051:             )
+1052:             self._publish_debug_image(debug_image_message(
+1053:                 debug_rgb, cached.snapshot.stamp_ns, cached.color_frame,
+1054:             ))
+1055:         goal_handle.succeed()
+1056:         return result
+1057: 
+1058:     def _selected_cloud_messages(
+1059:         self,
+1060:         snapshot,
+1061:         target_mask,
+1062:         detection,
+1063:         capture_transform,
+1064:         target_frame,
+1065:         support_plane=None,
+1066:     ):
+1067:         height, width = snapshot.depth_m.shape
+1068:         margin = int(self.get_parameter('grasp_context_margin_pixels').value)
+1069:         x_min = max(0, int(detection.bbox.x_min) - margin)
+1070:         y_min = max(0, int(detection.bbox.y_min) - margin)
+1071:         x_max = min(width, int(detection.bbox.x_max + 0.999) + margin)
+1072:         y_max = min(height, int(detection.bbox.y_max + 0.999) + margin)
+1073:         context_mask = np.zeros((height, width), dtype=bool)
+1074:         context_mask[y_min:y_max, x_min:x_max] = True
+1075:         common = {
+1076:             'depth_m': snapshot.depth_m,
+1077:             'rgb': snapshot.rgb,
+1078:             'intrinsics': snapshot.intrinsics,
+1079:             'minimum_depth_m': float(
+1080:                 self.get_parameter('minimum_depth_m').value
+1081:             ),
+1082:             'maximum_depth_m': float(
+1083:                 self.get_parameter('maximum_depth_m').value
+1084:             ),
+1085:             'voxel_size_m': float(
+1086:                 self.get_parameter('grasp_cloud_voxel_size_m').value
+1087:             ),
+1088:         }
+1089:         target = transform_colored_cloud(
+1090:             colored_cloud_from_selection(
+1091:                 selection=target_mask,
+1092:                 support_plane=support_plane,
+1093:                 minimum_height_m=float(
+1094:                     self.get_parameter('minimum_object_height_m').value),
+1095:                 maximum_points=int(
+1096:                     self.get_parameter('grasp_target_maximum_points').value
+1097:                 ),
+1098:                 **common,
+1099:             ),
+1100:             capture_transform,
+1101:         )
+1102:         context = transform_colored_cloud(
+1103:             colored_cloud_from_selection(
+1104:                 selection=context_mask,
+1105:                 maximum_points=int(
+1106:                     self.get_parameter('grasp_context_maximum_points').value
+1107:                 ),
+1108:                 **common,
+1109:             ),
+1110:             capture_transform,
+1111:         )
+1112:         stamp = Time(nanoseconds=snapshot.stamp_ns).to_msg()
+1113:         return (
+1114:             colored_point_cloud_message(target, stamp, target_frame),
+1115:             colored_point_cloud_message(context, stamp, target_frame),
+1116:         )
+1117: 
+1118:     def _publish_debug_image(self, message: Image) -> None:
+1119:         if self._debug_republish_count == 0:
+1120:             return
+1121:         self._debug_publisher.publish(message)
+1122:         self._latched_debug_publisher.publish(message)
+1123:         with self._debug_lock:
+1124:             self._debug_message = message
+1125:             self._debug_republishes_remaining = (
+1126:                 self._debug_republish_count - 1
+1127:             )
+1128: 
+1129:     def _republish_debug_image(self) -> None:
+1130:         with self._debug_lock:
+1131:             if (
+1132:                 self._debug_message is None
+1133:                 or self._debug_republishes_remaining <= 0
+1134:             ):
+1135:                 return
+1136:             message = self._debug_message
+1137:             self._debug_republishes_remaining -= 1
+1138:         self._debug_publisher.publish(message)
+1139: 
+1140:     def _lookup_capture_transform(
+1141:         self,
+1142:         snapshot: RgbdSnapshot,
+1143:     ) -> RigidTransform:
+1144:         try:
+1145:             return self._transformer.lookup(
+1146:                 self._target_frame,
+1147:                 snapshot.source_frame,
+1148:                 snapshot.stamp_ns,
+1149:             )
+1150:         except InspectionFailure:
+1151:             raise
+1152:         except Exception as error:
+1153:             raise InspectionFailure(
+1154:                 FailureKind.TF,
+1155:                 f'Failed to look up capture transform: {error}',
+1156:             ) from error
+1157: 
+1158:     @staticmethod
+1159:     def _feedback(
+1160:         goal_handle,
+1161:         stage: InspectionStage,
+1162:         detections: int,
+1163:         objects: int,
+1164:         message: str,
+1165:     ) -> None:
+1166:         feedback = InspectScene.Feedback()
+1167:         feedback.stage = _STAGE_CODES[stage]
+1168:         feedback.detections_2d = detections
+1169:         feedback.objects_3d = objects
+1170:         feedback.message = message
+1171:         goal_handle.publish_feedback(feedback)
+1172: 
+1173:     @staticmethod
+1174:     def _empty_detections() -> DetectedObject2DArray:
+1175:         return DetectedObject2DArray()
+1176: 
+1177:     @staticmethod
+1178:     def _empty_objects() -> DetectedObject3DArray:
+1179:         return DetectedObject3DArray()
+1180: 
+1181:     @staticmethod
+1182:     def _snapshot_id(stamp_ns: int, sequence: int) -> str:
+1183:         return f'rgbd-{stamp_ns:019d}-{sequence:06d}'
+1184: 
+1185:     @staticmethod
+1186:     def _detections_message(
+1187:         detections: Sequence[Detection2D],
+1188:         stamp_ns: int,
+1189:         frame_id: str,
+1190:         snapshot_id: str,
+1191:         detection_distances_m: Sequence[float | None],
+1192:         tracking: TrackingOutput | None = None,
+1193:         representative_frame: str = 'base_link',
+1194:     ) -> DetectedObject2DArray:
+1195:         if len(detections) != len(detection_distances_m):
+1196:             raise ValueError('Detection distances must match detections')
+1197:         message = DetectedObject2DArray()
+1198:         message.header.stamp = Time(nanoseconds=stamp_ns).to_msg()
+1199:         message.header.frame_id = frame_id
+1200:         message.snapshot_id = snapshot_id
+1201:         message.representative_frame = representative_frame
+1202:         if tracking is not None:
+1203:             message.tracking_session_id, message.tracking_epoch = tracking.session_id, tracking.epoch
+1204:             message.missing_objects = [TrackedObjectReference(**vars(ref)) for ref in tracking.missing]
+1205:         for object_id, (detection, distance_m) in enumerate(
+1206:             zip(detections, detection_distances_m, strict=True),
+1207:             start=1,
+1208:         ):
+1209:             detected = DetectedObject2D()
+1210:             detected.object_id = object_id
+1211:             detected.label = detection.label
+1212:             detected.detector_label = detection.detector_label
+1213:             detected.confidence = detection.confidence
+1214:             detected.sorting_category = detection.sorting_category
+1215:             detected.distance_valid = distance_m is not None
+1216:             detected.distance_m = 0.0 if distance_m is None else distance_m
+1217:             if tracking is not None:
+1218:                 tracked = tracking.detections[object_id - 1]
+1219:                 detected.track_id, detected.tracking_state = tracked.track_id, tracked.state.value
+1220:                 detected.position_valid = tracked.position is not None
+1221:                 if tracked.position is not None:
+1222:                     (detected.representative_position.x, detected.representative_position.y,
+1223:                      detected.representative_position.z) = tracked.position
+1224:             detected.median_depth_m = detection.median_depth_m
+1225:             detected.estimated_width_m = detection.estimated_width_m
+1226:             detected.estimated_height_m = detection.estimated_height_m
+1227:             detected.x_min = detection.bbox.x_min
+1228:             detected.y_min = detection.bbox.y_min
+1229:             detected.x_max = detection.bbox.x_max
+1230:             detected.y_max = detection.bbox.y_max
+1231:             message.detections.append(detected)
+1232:         return message
+1233: 
+1234:     @staticmethod
+1235:     def _objects_message(
+1236:         output: InspectionOutput,
+1237:         stamp_ns: int,
+1238:         snapshot_id: str,
+1239:         object_ids: Sequence[int],
+1240:     ) -> DetectedObject3DArray:
+1241:         if len(object_ids) != len(output.objects):
+1242:             raise ValueError('Object IDs must match inspected objects')
+1243:         message = DetectedObject3DArray()
+1244:         message.header.stamp = Time(nanoseconds=stamp_ns).to_msg()
+1245:         message.header.frame_id = output.target_frame
+1246:         message.snapshot_id = snapshot_id
+1247:         for object_id, inspected in zip(object_ids, output.objects):
+1248:             detected = DetectedObject3D()
+1249:             detected.object_id = object_id
+1250:             detected.label = inspected.label
+1251:             detected.detector_label = inspected.detector_label
+1252:             detected.confidence = inspected.confidence
+1253:             detected.obb_pose.position.x = float(inspected.box.center[0])
+1254:             detected.obb_pose.position.y = float(inspected.box.center[1])
+1255:             detected.obb_pose.position.z = float(inspected.box.center[2])
+1256:             quaternion = quaternion_xyzw_from_rotation(inspected.box.rotation)
+1257:             detected.obb_pose.orientation.x = quaternion[0]
+1258:             detected.obb_pose.orientation.y = quaternion[1]
+1259:             detected.obb_pose.orientation.z = quaternion[2]
+1260:             detected.obb_pose.orientation.w = quaternion[3]
+1261:             detected.obb_size.x = float(inspected.box.size[0])
+1262:             detected.obb_size.y = float(inspected.box.size[1])
+1263:             detected.obb_size.z = float(inspected.box.size[2])
+1264:             message.objects.append(detected)
+1265:         return message
+1266: 
+1267: 
+1268: def main(args: list[str] | None = None) -> None:
+1269:     rclpy.init(args=args)
+1270:     node = InspectionNode()
+1271:     executor = MultiThreadedExecutor(num_threads=3)
+1272:     executor.add_node(node)
+1273:     try:
+1274:         executor.spin()
+1275:     except KeyboardInterrupt:
+1276:         pass
+1277:     finally:
+1278:         executor.shutdown()
+1279:         node.destroy_node()
+1280:         if rclpy.ok():
+1281:             rclpy.shutdown()
+1282: 
+1283: 
+1284: if __name__ == '__main__':
+1285:     main()

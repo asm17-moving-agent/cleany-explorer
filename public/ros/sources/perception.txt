@@ -1,0 +1,68 @@
+ros2_ws/src/cleany_perception/cleany_perception/inspection_node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: de66f5af1abc495d2e7615d813ac38dcda7284eb620c7c09e31129d8b1c83e85
+
+138: class InspectionNode(Node):
+139:     """Inspect a synchronized RGB-D snapshot and retain selectable observations.
+140: 
+141:     Subscriptions:
+142:         camera/color/image_raw and camera/depth/image_raw (sensor_msgs/msg/Image):
+143:             Color and depth; configurable defaults.
+144:         camera/color/camera_info and camera/depth/camera_info
+145:             (sensor_msgs/msg/CameraInfo): Corresponding intrinsics; configurable.
+146:         /{left,right}_wrist_camera/{image_raw,camera_info}
+147:             (sensor_msgs/msg/Image, sensor_msgs/msg/CameraInfo): Optional wrist RGB pairs.
+148: 
+149:     Publishers:
+150:         perception/objects (cleany_interfaces/msg/DetectedObject3DArray): Located objects.
+151:         perception/detections_2d (cleany_interfaces/msg/DetectedObject2DArray): Image detections.
+152:         perception/debug_image and perception/debug_image_latched (sensor_msgs/msg/Image):
+153:             Detection overlays. All publisher names are configurable defaults.
+154: 
+155:     Services:
+156:         /perception/revalidate_target (cleany_interfaces/srv/RevalidateTarget):
+157:             Fresh local target observation with the cached approval semantics.
+158:         /perception/observe_wrist_target (cleany_interfaces/srv/ObserveWristTarget):
+159:             Optional WristService endpoint when enable_wrist_observation is true.
+160: 
+161:     Actions:
+162:         perception/inspect_scene (cleany_interfaces/action/InspectScene): Server
+163:             for inspection and selection from cached snapshots; configurable default.
+164: 
+165:     TF:
+166:         Resolves capture-time camera geometry into target_frame, default base_link.
+167: 
+168:     QoS:
+169:         Camera inputs and live debug output use sensor_data; latched debug uses
+170:         reliable, transient-local QoS.
+171: 
+172:     Notes:
+
+636:         self.declare_parameter('color_image_topic', 'camera/color/image_raw')
+637:         self.declare_parameter('color_info_topic', 'camera/color/camera_info')
+638:         self.declare_parameter('depth_image_topic', 'camera/depth/image_raw')
+639:         self.declare_parameter('depth_info_topic', 'camera/depth/camera_info')
+640:         self.declare_parameter('rgbd_qos_reliability', 'best_effort')
+
+775:     def _create_sensor_subscriptions(self) -> None:
+776:         reliability = str(self.get_parameter('rgbd_qos_reliability').value)
+777:         if reliability not in ('best_effort', 'reliable'):
+778:             raise ValueError('rgbd_qos_reliability must be best_effort or reliable')
+779:         qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=5,
+780:             reliability=(ReliabilityPolicy.RELIABLE if reliability == 'reliable'
+781:                          else ReliabilityPolicy.BEST_EFFORT))
+782:         # A slow, continuously ready Image callback must not starve CameraInfo
+783:         # or the other camera stream. Buffer updates have their own lock.
+784:         for message_type, topic_parameter, callback in (
+785:             (Image, 'color_image_topic', self._snapshot_buffer.add_color),
+786:             (CameraInfo, 'color_info_topic', self._snapshot_buffer.add_color_info),
+787:             (Image, 'depth_image_topic', self._snapshot_buffer.add_depth),
+788:             (CameraInfo, 'depth_info_topic', self._snapshot_buffer.add_depth_info),
+789:         ):
+790:             self.create_subscription(
+791:                 message_type, str(self.get_parameter(topic_parameter).value),
+792:                 callback, qos,
+793:                 callback_group=MutuallyExclusiveCallbackGroup())
+794: 
+795:     def _goal_callback(self, _goal_request) -> GoalResponse:

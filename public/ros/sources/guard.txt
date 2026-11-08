@@ -1,0 +1,60 @@
+ros2_ws/src/cleany_robot_interface/cleany_robot_interface/control_state_guard.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: abf57a42f0367f8867f70c40814fcb738560a51d9d6c48acf3c7adc84d8a3948
+
+31:     def __init__(self):
+32:         super().__init__('real_control_state_guard')
+33:         self.declare_parameter('max_state_age_s', .25)
+34:         self.declare_parameter('startup_timeout_s', 30.0)
+35:         self.declare_parameter('controller_names', CONTROLLERS)
+36:         self.controllers = list(self.get_parameter('controller_names').value)
+37:         if not self.controllers or not set(self.controllers) <= set(CONTROLLERS):
+38:             raise ValueError('Invalid controller_names')
+39:         self.max_age = float(self.get_parameter('max_state_age_s').value)
+40:         self.startup = float(self.get_parameter('startup_timeout_s').value)
+41:         if not 0 < self.max_age <= 1 or not 1 <= self.startup <= 60:
+42:             raise ValueError('Invalid state timeout')
+43:         self.created = time.monotonic()
+44:         self.last_received = None
+45:         self.last_stamp = -1
+46:         self.fault = ''
+47:         self.stop_confirmed = False
+48:         self.request = None
+49:         self.cancel_requests = {}
+50:         self.actions_cancelled = False
+51:         self.publisher = self.create_publisher(JointState, 'joint_states', 10)
+52:         self.status = self.create_publisher(String, 'real_control/status',
+53:             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+54:         self.subscription = self.create_subscription(JointState,
+55:             'joint_state_broadcaster/joint_states', self.receive, 10)
+56:         self.switch = self.create_client(SwitchController, 'controller_manager/switch_controller')
+57:         self.cancel = {name: self.create_client(
+58:             CancelGoal, f'/{name}/follow_joint_trajectory/_action/cancel_goal')
+59:             for name in self.controllers}
+60:         self.stop_service = self.create_service(Trigger, 'real_control/stop', self.stop)
+61:         self.timer = self.create_timer(.05, self.tick)
+62: 
+63:     def receive(self, message):
+64:         stamp = message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
+65:         if self.fault:
+66:             return
+67:         if not valid_positions(message, self.get_clock().now().nanoseconds, self.max_age):
+68:             self.latch('Invalid/incomplete/stale hardware position feedback')
+69:             return
+70:         if stamp <= self.last_stamp:
+71:             return  # A repeated stamp does not refresh the watchdog.
+72:         self.last_stamp = stamp
+73:         self.last_received = time.monotonic()
+74:         result = JointState()
+75:         result.header = message.header
+76:         result.name, result.position = message.name, message.position
+77:         # Humble broadcaster fills unsupported velocity/effort with NaN; omit them.
+78:         self.publisher.publish(result)
+79: 
+80:     def latch(self, reason):
+81:         if not self.fault:
+82:             self.fault = reason
+83:             self.get_logger().error(reason + '; controller stop requested; restart required')
+84: 
+85:     def stop(self, _request, response):

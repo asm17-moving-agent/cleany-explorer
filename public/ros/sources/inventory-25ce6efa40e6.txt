@@ -1,0 +1,34 @@
+ros2_ws/src/cleany_mission_manager/cleany_mission_manager/adapters/nav2.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 18d128c91fda3a8ae1cd84ed5317d0b7637be3033a3ad5c7ad06c0e8a940c6b9
+
+45:     """
+46:     def __init__(self, node, targets: TargetMap, journal: MissionJournal) -> None:
+47:         self.node, self.targets, self.journal = node, targets, journal
+48:         self.client = ActionClient(node, NavigateToPose, "navigate_to_pose")
+49:         self.cancel_client = node.create_client(CancelGoal, "navigate_to_pose/_action/cancel_goal")
+50:         self.buffer = Buffer()
+51:         self.listener = TransformListener(self.buffer, node)
+52:         self.operation: NavigationOperation | None = None
+53:         self.latest_odom = None
+54:         self.odom_received = 0.0
+61:                 or len(set(required_nodes)) != len(required_nodes)):
+62:             raise ValueError("required_navigation_lifecycle_nodes must be non-empty unique node names")
+63:         self.state_clients = {
+64:             name: node.create_client(GetState, name + "/get_state") for name in
+65:             required_nodes
+66:         }
+67:         self.last_query = 0.0
+68:         self.recovery_future = None
+69:         self.recovery_started = 0.0
+82:                 self.arrival_position_tolerance, self.arrival_yaw_tolerance, self.arrival_pose_timeout,
+83:         )) or any(not math.isfinite(v) or v < 0 for v in (self.stop_linear, self.stop_angular))):
+84:             raise ValueError("navigation freshness/stopped parameters must be finite and bounded")
+85:         node.create_subscription(Odometry, self.odom_topic, self._odom, qos_profile_sensor_data)
+86:         node.create_subscription(GoalStatusArray, "navigate_to_pose/_action/status",
+87:                                  self._status, qos_profile_action_status_default)
+88: 
+89:     def _status(self, message) -> None:
+90:         if self.operation is None:
+91:             return

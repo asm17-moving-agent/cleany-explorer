@@ -1,0 +1,35 @@
+ros2_ws/src/cleany_dev_monitor/cleany_dev_monitor/io_probe_node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: c434bba10f13b477ea7cc57dc4dc7aaebd7f1e3ab6f76b26e2babae007352624
+
+44: 
+45: class IOProbe(Node):
+46:     def __init__(self, config: dict, output: Path, *, request_file: str = '', **kwargs):
+47:         super().__init__('manipulation_io_probe', enable_rosout=False,
+48:                          start_parameter_services=False, **kwargs)
+49:         self.config, self.output = config, output
+50:         self.started, self.wall_ns = time.monotonic(), time.time_ns()
+51:         self.state = ProbeState(config)
+52:         self.writer = EvidenceWriter(output / 'events.jsonl', config['writer_queue_size'],
+63:         self.last_execution_key = None
+64:         for spec in config['streams']:
+65:             message_type = get_message(spec['type'])
+66:             self.subscriptions_owned.append(self.create_subscription(
+67:                 message_type, spec['topic'],
+68:                 lambda raw, s=spec, cls=message_type: self.receive(s, cls, raw),
+69:                 qos_profile_sensor_data, raw=True))
+70:         latched = QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE,
+71:                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
+72:         self.subscriptions_owned.append(self.create_subscription(
+73:             ManipulationExecutionRecord, config['execution_topic'], self.execution, latched))
+74:         self.subscriptions_owned.append(self.create_subscription(
+75:             String, config['bt_topic'], lambda msg: self.writer.put(
+76:                 dict(kind='bt', t=self.elapsed(), data=msg.data)), latched))
+77:         for arm in ('left', 'right'):
+78:             self.subscriptions_owned.append(self.create_subscription(
+79:                 Bool, f'/{arm}_wrist_camera/enabled',
+80:                 lambda msg, a=arm: self.wrist(a, msg.data), latched))
+81:         self.window_timer = self.create_timer(config['sample_interval_s'], self.tick)
+82:         self.graph_timer = self.create_timer(5., self.graph)
+83:         self.graph()

@@ -1,0 +1,95 @@
+ros2_ws/src/cleany_gazebo_sim/cleany_gazebo_sim/feedback_sampler.py
+Review: 2026-11-02
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: afe08c39c14e627db893758cee336e67912fee2099c940a896a5293f4562a794
+
+1: """Gazebo adapter: publish coherent clock/joint snapshots at bounded frequency."""
+2: from __future__ import annotations
+3: import rclpy
+4: from rclpy.clock import Clock as RosClock, ClockType
+5: from rclpy.node import Node
+6: from rclpy.qos import qos_profile_sensor_data
+7: from rosgraph_msgs.msg import Clock
+8: from sensor_msgs.msg import JointState
+9: 
+10: 
+11: class FeedbackSampler(Node):
+12:     """Throttle Gazebo feedback without inventing fresh samples.
+13: 
+14:     Subscriptions:
+15:         /gazebo/raw_clock (rosgraph_msgs/msg/Clock): Simulator time.
+16:         /gazebo/raw_joint_states (sensor_msgs/msg/JointState): Simulator joints.
+17: 
+18:     Publishers:
+19:         /clock (rosgraph_msgs/msg/Clock): Latest changed simulator time.
+20:         /joint_states (sensor_msgs/msg/JointState): Latest joint sample no newer
+21:             than the published clock.
+22: 
+23:     QoS:
+24:         Raw inputs and joint output use sensor_data; clock output is reliable.
+25: 
+26:     Notes:
+27:         A steady timer bounds publication rate. Original stamps are preserved;
+28:         unchanged simulation data is not republished as fresh feedback.
+29:     """
+30:     def __init__(self) -> None:
+31:         super().__init__('gazebo_feedback_sampler')
+32:         self.declare_parameter('publish_period_s', .02)
+33:         period = self.get_parameter('publish_period_s').value
+34:         if not 0. <= period <= 1. or period == 0:
+35:             raise ValueError('publish_period_s must be in (0, 1]')
+36:         self.clock_msg = self.joints = self.coherent_joints = None
+37:         self.last_clock = self.last_joint = None
+38:         self.clock_pub = self.create_publisher(Clock, '/clock', 10)
+39:         self.joint_pub = self.create_publisher(JointState, '/joint_states', qos_profile_sensor_data)
+40:         self.create_subscription(Clock, '/gazebo/raw_clock', self.on_clock, qos_profile_sensor_data)
+41:         self.create_subscription(JointState, '/gazebo/raw_joint_states', self.on_joint, qos_profile_sensor_data)
+42:         self.create_timer(period, self.publish_latest, clock=RosClock(clock_type=ClockType.STEADY_TIME))
+43: 
+44:     def on_clock(self, msg: Clock) -> None:
+45:         if self.clock_msg is not None and self.stamp(msg.clock) < self.stamp(self.clock_msg.clock):
+46:             self.coherent_joints = None
+47:         self.clock_msg = msg
+48:         self.capture_joint()
+49: 
+50:     def on_joint(self, msg: JointState) -> None:
+51:         self.joints = msg
+52:         self.capture_joint()
+53: 
+54:     @staticmethod
+55:     def stamp(t):
+56:         return t.sec, t.nanosec
+57: 
+58:     def capture_joint(self) -> None:
+59:         if self.clock_msg is not None and self.joints is not None and self.stamp(self.joints.header.stamp) <= self.stamp(self.clock_msg.clock):
+60:             self.coherent_joints = self.joints
+61: 
+62:     def publish_latest(self) -> None:
+63:         if self.clock_msg is None:
+64:             return
+65:         t = self.clock_msg.clock
+66:         stamp = (t.sec, t.nanosec)
+67:         if self.last_clock is not None and stamp < self.last_clock:
+68:             self.last_joint = None
+69:         if stamp != self.last_clock:
+70:             self.clock_pub.publish(self.clock_msg)
+71:             self.last_clock = stamp
+72:         if self.coherent_joints is not None:
+73:             t = self.coherent_joints.header.stamp
+74:             joint = (t.sec, t.nanosec)
+75:             if joint <= stamp and joint != self.last_joint:
+76:                 self.joint_pub.publish(self.coherent_joints)
+77:                 self.last_joint = joint
+78:         # Never restamp or repeat a stopped simulator's data as fresh feedback.
+79: 
+80: 
+81: def main(args=None) -> None:
+82:     rclpy.init(args=args);node = FeedbackSampler()
+83:     try:
+84:         rclpy.spin(node)
+85:     except KeyboardInterrupt:
+86:         pass
+87:     finally:
+88:         node.destroy_node()
+89:         if rclpy.ok():
+90:             rclpy.shutdown()

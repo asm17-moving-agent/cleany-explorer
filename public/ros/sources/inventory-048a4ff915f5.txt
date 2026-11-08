@@ -1,0 +1,27 @@
+ros2_ws/src/cleany_navigation/cleany_navigation/depth_coverage_node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 9c04c1eecf0fcf1d88d9537ca8547152cbb68153341f891de6360e041663e90b
+
+46:         publish a gated velocity command.
+47:     """
+48:     def __init__(self):
+49:         super().__init__('depth_coverage')
+50:         defaults = dict(profile='', allow_simulation_limits=False, fixed_frame='odom', base_frame='base_link',
+51:                         optical_frame='head_camera_depth_optical_frame', input_topic='camera/head/depth/image_raw',
+52:                         camera_info_topic='camera/head/depth/camera_info', source_timeout_s=.5,
+53:                         update_period_s=.2, processing_budget_s=.15, cell_size=.1, max_cells=20000, pose_jump_m=.25, pose_jump_rad=.3,
+54:                         **vars(GuardConfig()))
+67:         self.command_wall = self.depth_wall = self.odom_wall = -np.inf
+68:         self.clock_stamp = None
+69:         self.clock_wall = time.monotonic()
+70:         self.state = self.create_publisher(String, 'head_pan/coverage', 10)
+71:         self.create_subscription(CameraInfo, self.p['camera_info_topic'], self.on_info, qos_profile_sensor_data)
+72:         self.create_subscription(Image, self.p['input_topic'], self.on_depth, qos_profile_sensor_data)
+73:         self.create_subscription(Twist, 'nav2/cmd_vel', self.on_command, 10)
+74:         self.create_subscription(Odometry, 'odom', self.on_odom, qos_profile_sensor_data)
+75:         self.create_timer(self.p['update_period_s'], self.update, clock=Clock(clock_type=ClockType.STEADY_TIME))
+76: 
+77:     def on_info(self, msg):
+78:         self.camera = msg
+79: 

@@ -1,0 +1,245 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/grasp_execution.py
+Review: 2026-11-02
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: e697e14fe8cdaedf4360d1d1518d033d446d67f85a7de414526ae594552087a3
+
+1: """Shared MoveIt execution and joint-feedback helpers for study-cafe skills."""
+2: 
+3: from __future__ import annotations
+4: 
+5: import math
+6: import time
+7: from typing import Any, Callable
+8: 
+9: from action_msgs.msg import GoalStatus
+10: from cleany_interfaces.action import SelectReachableGrasp
+11: from moveit_msgs.action import MoveGroup
+12: from moveit_msgs.msg import Constraints, JointConstraint, MoveItErrorCodes
+13: import rclpy
+14: from rclpy.action import ActionClient
+15: from rclpy.node import Node
+16: from sensor_msgs.msg import JointState
+17: 
+18: from cleany_skill_executor.core.grasp_selection import REQUIRED_JOINT_NAMES
+19: 
+20: 
+21: class GraspExecutionNode(Node):
+22:     """Provide guarded MoveIt execution to manipulation coordinators.
+23: 
+24:     Subscriptions:
+25:         /joint_states (sensor_msgs/msg/JointState): Motion feedback, depth 20.
+26: 
+27:     Actions:
+28:         /grasp/select_reachable (cleany_interfaces/action/SelectReachableGrasp):
+29:             Selection client; selection_action default.
+30:         /move_action (moveit_msgs/action/MoveGroup): Motion client;
+31:             move_group_action default.
+32: 
+33:     Notes:
+34:         Execution waits for joint feedback and checks the final tracking error.
+35:         This base class provides clients and helpers; subclasses own the sequence.
+36:     """
+37: 
+38:     def __init__(self, node_name: str = 'grasp_execution') -> None:
+39:         super().__init__(node_name)
+40:         self.declare_parameter('selection_action', '/grasp/select_reachable')
+41:         self.declare_parameter('move_group_action', '/move_action')
+42:         self.declare_parameter('startup_timeout_sec', 60.0)
+43:         self.declare_parameter('demo_start_delay_sec', 5.0)
+44:         self.declare_parameter('planning_timeout_sec', 5.0)
+45:         self.declare_parameter('planning_attempts', 3)
+46:         self.declare_parameter('replan_attempts', 2)
+47:         self.declare_parameter('replan_delay_sec', 0.25)
+48:         self.declare_parameter('velocity_scaling', 0.08)
+49:         self.declare_parameter('acceleration_scaling', 0.08)
+50:         self._selection = ActionClient(
+51:             self,
+52:             SelectReachableGrasp,
+53:             str(self.get_parameter('selection_action').value),
+54:         )
+55:         self._move_group = ActionClient(
+56:             self,
+57:             MoveGroup,
+58:             str(self.get_parameter('move_group_action').value),
+59:         )
+60:         self._joint_positions: dict[str, float] = {}
+61:         self.create_subscription(JointState, '/joint_states', self._on_joints, 20)
+62: 
+63:     def _spin_once(self, timeout_sec: float) -> None:
+64:         rclpy.spin_once(self, timeout_sec=timeout_sec)
+65: 
+66:     def _on_joints(self, message: JointState) -> None:
+67:         self._joint_positions.update(
+68:             zip(message.name, message.position, strict=True)
+69:         )
+70: 
+71: 
+72:     def _wait_for_joint_state(self, timeout: float) -> None:
+73:         deadline = time.monotonic() + timeout
+74:         while (
+75:             not set(REQUIRED_JOINT_NAMES) <= self._joint_positions.keys()
+76:             and time.monotonic() < deadline
+77:         ):
+78:             self._spin_once(timeout_sec=0.05)
+79:         missing = set(REQUIRED_JOINT_NAMES) - self._joint_positions.keys()
+80:         if missing:
+81:             self.get_logger().error(
+82:                 f'Missing required joint feedback: {sorted(missing)}'
+83:             )
+84:             raise RuntimeError('complete 12-joint feedback is unavailable')
+85: 
+86: 
+87:     def _selection_feedback(self, message: Any) -> None:
+88:         feedback = message.feedback
+89:         self.get_logger().info(
+90:             f'candidate={feedback.candidate_index} arm={feedback.arm} '
+91:             f'stage={feedback.stage}: {feedback.message}'
+92:         )
+93: 
+94:     def _move_to(
+95:         self,
+96:         arm: str,
+97:         joint_state: JointState,
+98:         label: str,
+99:         *,
+100:         accept_control_failure: Callable[[], bool] | None = None,
+101:     ) -> bool:
+102:         attempts = (1, 2) if getattr(self, '_controller_retry_enabled', True) else (1,)
+103:         for execution_attempt in attempts:
+104:             goal = self._execution_goal(arm, joint_state, label)
+105:             self.get_logger().info(
+106:                 f'MoveIt plan-and-execute: {label} attempt={execution_attempt}/{len(attempts)}'
+107:             )
+108:             handle = self._future(
+109:                 self._move_group.send_goal_async(goal),
+110:                 10.0,
+111:                 f'{label} goal response',
+112:             )
+113:             if not handle.accepted:
+114:                 raise RuntimeError(f'{label} MoveGroup goal was rejected')
+115:             wrapped = self._future(handle.get_result_async(), 60.0, f'{label} execution result')
+116:             code = wrapped.result.error_code.val
+117:             if (
+118:                 wrapped.status == GoalStatus.STATUS_SUCCEEDED
+119:                 and code == MoveItErrorCodes.SUCCESS
+120:             ):
+121:                 self.get_logger().info(f'MoveIt execution succeeded: {label}')
+122:                 return True
+123:             self._log_joint_tracking_error(joint_state, label, code)
+124:             if (
+125:                 code == MoveItErrorCodes.CONTROL_FAILED
+126:                 and accept_control_failure is not None
+127:                 and accept_control_failure()
+128:             ):
+129:                 self.get_logger().info(
+130:                     f'{label} stopped on verified target contact; '
+131:                     'skipping endpoint retry'
+132:                 )
+133:                 return False
+134:             if execution_attempt < len(attempts) and code == MoveItErrorCodes.CONTROL_FAILED:
+135:                 self.get_logger().warning(
+136:                     f'{label} controller failed; replanning once from current state'
+137:                 )
+138:                 continue
+139:             raise RuntimeError(
+140:                 f'{label} execution failed: status={wrapped.status} code={code}'
+141:             )
+142:         raise RuntimeError(f'{label} controller recovery was exhausted')
+143: 
+144:     def _execution_goal(
+145:         self, arm: str, joint_state: JointState, label: str
+146:     ) -> MoveGroup.Goal:
+147:         goal = MoveGroup.Goal()
+148:         request = goal.request
+149:         request.group_name = f'{arm}_grasp_arm'
+150:         request.num_planning_attempts = int(
+151:             self.get_parameter('planning_attempts').value
+152:         )
+153:         request.allowed_planning_time = float(
+154:             self.get_parameter('planning_timeout_sec').value
+155:         )
+156:         request.max_velocity_scaling_factor = float(
+157:             self.get_parameter('velocity_scaling').value
+158:         )
+159:         request.max_acceleration_scaling_factor = float(
+160:             self.get_parameter('acceleration_scaling').value
+161:         )
+162:         request.start_state.is_diff = True
+163:         constraints = Constraints()
+164:         constraints.name = f'grasp_{label}'
+165:         for name, position in zip(
+166:             joint_state.name, joint_state.position, strict=True
+167:         ):
+168:             constraint = JointConstraint()
+169:             constraint.joint_name = name
+170:             constraint.position = position
+171:             constraint.tolerance_above = 1e-4
+172:             constraint.tolerance_below = 1e-4
+173:             constraint.weight = 1.0
+174:             constraints.joint_constraints.append(constraint)
+175:         request.goal_constraints = [constraints]
+176:         goal.planning_options.plan_only = False
+177:         goal.planning_options.look_around = False
+178:         goal.planning_options.replan = True
+179:         goal.planning_options.replan_attempts = int(
+180:             self.get_parameter('replan_attempts').value
+181:         )
+182:         goal.planning_options.replan_delay = float(
+183:             self.get_parameter('replan_delay_sec').value
+184:         )
+185:         goal.planning_options.planning_scene_diff.is_diff = True
+186:         goal.planning_options.planning_scene_diff.robot_state.is_diff = True
+187:         return goal
+188: 
+189:     def _log_joint_tracking_error(
+190:         self, joint_state: JointState, label: str, error_code: int
+191:     ) -> None:
+192:         errors = {
+193:             name: abs(float(target) - self._joint_positions[name])
+194:             for name, target in zip(
+195:                 joint_state.name, joint_state.position, strict=True
+196:             )
+197:             if name in self._joint_positions
+198:         }
+199:         if not errors:
+200:             self.get_logger().error(
+201:                 f'{label} failed code={error_code}; joint feedback unavailable'
+202:             )
+203:             return
+204:         details = ', '.join(
+205:             f'{name}={error:.4f}rad'
+206:             for name, error in sorted(errors.items())
+207:         )
+208:         self.get_logger().error(
+209:             f'{label} failed code={error_code}; joint tracking error: {details}'
+210:         )
+211: 
+212:     def _verify_feedback(self, goal: JointState) -> None:
+213:         deadline = time.monotonic() + 5.0
+214:         while time.monotonic() < deadline:
+215:             self._spin_once(timeout_sec=0.05)
+216:             if all(
+217:                 abs(self._joint_positions.get(name, math.inf) - position) < 0.03
+218:                 for name, position in zip(goal.name, goal.position, strict=True)
+219:             ):
+220:                 return
+221:         raise RuntimeError('MuJoCo joint feedback did not converge to grasp')
+222: 
+223:     def _future(self, future: Any, timeout: float, label: str) -> Any:
+224:         deadline = time.monotonic() + timeout
+225:         while not future.done() and time.monotonic() < deadline:
+226:             self._spin_once(timeout_sec=0.05)
+227:         if not future.done():
+228:             future.cancel()
+229:             raise RuntimeError(f'timed out waiting for {label}')
+230:         result = future.result()
+231:         if result is None:
+232:             raise RuntimeError(f'{label} returned no result')
+233:         return result
+234: 
+235:     def _hold(self, parameter_name: str) -> None:
+236:         deadline = time.monotonic() + float(
+237:             self.get_parameter(parameter_name).value
+238:         )
+239:         while time.monotonic() < deadline:
+240:             self._spin_once(timeout_sec=0.05)

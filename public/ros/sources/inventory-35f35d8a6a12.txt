@@ -1,0 +1,36 @@
+ros2_ws/src/cleany_skill_executor/launch/manipulation_mock.launch.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: c0b18ace1710841133183319c8448812d5cd27c9d507ad331a804fbc0b70d597
+
+1: """Launch the manipulation Action in a mock namespace with a persistent journal."""
+2: 
+3: from launch import LaunchDescription
+4: from launch.actions import DeclareLaunchArgument
+5: from launch.conditions import IfCondition
+6: from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+7: from launch_ros.actions import Node
+8: from launch_ros.substitutions import FindPackageShare
+9: 
+10: from cleany_skill_executor.manipulation.store import default_database_path
+11: 
+12: 
+13: def generate_launch_description():
+14:     return LaunchDescription([
+15:         DeclareLaunchArgument('namespace', default_value='mock'),
+16:         DeclareLaunchArgument('database_path', default_value=default_database_path()),
+17:         DeclareLaunchArgument('scenario', default_value='success'),
+18:         DeclareLaunchArgument('monitor', default_value='false'),
+19:         DeclareLaunchArgument('monitor_port', default_value='1666'),
+20:         DeclareLaunchArgument('mock_config', default_value=PathJoinSubstitution([
+21:             FindPackageShare('cleany_skill_executor'), 'config', 'manipulation_mock.yaml'])),
+22:         Node(package='cleany_skill_executor', executable='manipulation_server',
+23:              namespace=LaunchConfiguration('namespace'), output='screen',
+24:              parameters=[{'backend': 'mock', 'database_path': LaunchConfiguration('database_path'),
+25:                           'scenario': LaunchConfiguration('scenario'),
+26:                           'mock_config': LaunchConfiguration('mock_config')}]),
+27:         Node(package='cleany_skill_executor', executable='manipulation_monitor',
+28:              namespace=LaunchConfiguration('namespace'), output='screen',
+29:              condition=IfCondition(LaunchConfiguration('monitor')),
+30:              parameters=[{'monitor_port': LaunchConfiguration('monitor_port')}]),
+31:     ])

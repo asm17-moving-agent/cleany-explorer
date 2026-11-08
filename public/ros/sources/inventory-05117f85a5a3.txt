@@ -1,0 +1,19 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/moveit_adapter.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 685e1b848cc0e3f10c8b9d1890f0f3502e67e978b9b5949094e2659cec9e2b28
+
+161:         self._node = node
+162:         self._local_fk = {}
+163:         self._config = config
+164:         self._ik_client = ik_client or node.create_client(GetPositionIK, '/compute_ik')
+165:         self._fk_client = fk_client or node.create_client(GetPositionFK, '/compute_fk')
+166:         self._validity_client = validity_client or node.create_client(
+167:             GetStateValidity, '/check_state_validity'
+168:         )
+169:         self._plan_client = plan_client or ActionClient(node, MoveGroup, '/move_action')
+170:         self._monotonic = monotonic
+171:         self._spin_once = spin_once or self._default_spin
+172:         self._service_trace = service_trace
+173:         self._current_state: JointState | None = None
+174:         self._active_goal_handle: Any | None = None

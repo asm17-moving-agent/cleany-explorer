@@ -1,0 +1,86 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/hardware_execution.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 2f87dac6a3f3f522498949c77635d91f9f3f7f2daa65b2b465d60cfd32d97ad1
+
+129:         self.communication_recovery_count = 0
+130:         self.complete_feedback_stamp_ns: int | None = None
+131:         self._active_recovery_generation: int | None = None
+132:         node.declare_parameter('hardware_reuse_settle_history', True)
+133:         node.declare_parameter('hardware_reuse_scene_barrier', False)
+134:         for name in ('parallel_model_queries', 'sparse_cubic_commands', 'share_return_preparation'):
+135:             parameter = 'hardware_'+name
+136:             node.declare_parameter(parameter, False)
+137:             enabled = node.get_parameter(parameter).value
+138:             if type(enabled) is not bool:
+139:                 raise ValueError(parameter+' must be boolean')
+140:             setattr(self, name, enabled)
+141:         node.declare_parameter('hardware_state_preparation_monitor_period_sec', .01)
+142:         self._state_preparation_monitor_period_sec = self.value(
+143:             'hardware_state_preparation_monitor_period_sec')
+144:         if self._state_preparation_monitor_period_sec > .01:
+145:             raise ValueError('State preparation monitoring period must be at most 0.01 seconds')
+146:         self.reuse_scene_barrier = node.get_parameter('hardware_reuse_scene_barrier').value
+150:         if type(reuse_history) is not bool:
+151:             raise ValueError('hardware_reuse_settle_history must be boolean')
+152:         self._stability_history = JointStabilityHistory() if reuse_history else None
+153:         node.declare_parameter('gripper_contact_rule_file', str(
+154:             Path(get_package_share_directory('cleany_skill_executor')) /
+155:             'config/gripper_contact_decision.yaml'))
+156:         self.contact_criteria = load_contact_criteria(
+157:             node.get_parameter('gripper_contact_rule_file').value)
+158:         self.contact_histories = {
+159:             arm: LiveContactHistory(criteria) for arm, criteria in self.contact_criteria.items()
+160:         }
+161:         self.contact_lock = threading.Lock()
+162:         self.contact_subscription = node.create_subscription(
+163:             DynamicJointState, '/joint_state_broadcaster/dynamic_joint_states',
+164:             self.on_contact_feedback, 10)
+165:         self._motion_monitors: set[MotionMonitor] = set()
+166:         self._sensor_scene_freeze_depth = 0
+167:         node.declare_parameter('continuous_sensor_scene_updates', True)
+168:         node.declare_parameter(
+169:             'sensor_scene_update_service',
+170:             '/perception/scene_cloud_updates_enabled',
+171:         )
+172:         self.subscription = node.create_subscription(String, '/real_control/status', self.on_guard, 10)
+173:         self.hardware = node.create_client(ListHardwareComponents, '/controller_manager/list_hardware_components')
+174:         self.controllers = node.create_client(ListControllers, '/controller_manager/list_controllers')
+175:         self.parameters = node.create_client(GetParameters, '/controller_manager/get_parameters')
+176:         self.moveit_parameters = node.create_client(GetParameters, '/move_group/get_parameters')
+177:         self.validity = node.create_client(GetStateValidity, '/check_state_validity')
+178:         node.declare_parameter('hardware_state_validity_batch_size', 32)
+179:         self._batch_validity = StateValidityBatch(node,
+180:             batch_size=node.get_parameter('hardware_state_validity_batch_size').value)
+181:         self.stop = node.create_client(Trigger, '/real_control/stop')
+182:         self.scene_updates = node.create_client(
+183:             SetBool,
+184:             str(node.get_parameter('sensor_scene_update_service').value),
+185:         )
+186:         for name, value in {'hardware_velocity_rad_s': .8, 'hardware_acceleration_rad_s2': 1.2,
+187:                             'hardware_path_step_rad': .01,
+214:                             'hardware_motion_minimum_motion_rad': .005,
+215:                             'hardware_motion_feedback_timeout_sec': 1.}.items():
+216:             node.declare_parameter(name, value)
+217:         node.declare_parameter('hardware_motion_monitor_enabled', True)
+218:         node.declare_parameter('hardware_motion_abort_on_deviation', True)
+219:         node.declare_parameter('hardware_uncommanded_motion_check_enabled', True)
+220:         self.uncommanded_motion_check_enabled = node.get_parameter(
+221:             'hardware_uncommanded_motion_check_enabled').value
+222:         if type(self.uncommanded_motion_check_enabled) is not bool:
+223:             raise ValueError('hardware_uncommanded_motion_check_enabled must be boolean')
+224:         node.declare_parameter('hardware_gripper_opening_position_range_check_enabled', True)
+225:         self.gripper_opening_position_range_check_enabled = node.get_parameter(
+226:             'hardware_gripper_opening_position_range_check_enabled').value
+227:         if type(self.gripper_opening_position_range_check_enabled) is not bool:
+228:             raise ValueError('hardware_gripper_opening_position_range_check_enabled must be boolean')
+229:         abort_on_deviation = node.get_parameter('hardware_motion_abort_on_deviation').value
+244:         name = f'/{arm}_{controller}_controller/follow_joint_trajectory'
+245:         factory = getattr(self.node, 'create_motion_client', None)
+246:         return (factory(FollowJointTrajectory, name) if factory is not None
+247:                 else ActionClient(self.node, FollowJointTrajectory, name))
+248: 
+249:     def motion_clients(self, arm, controllers):
+250:         """Release earlier leases if acquiring a later controller fails."""
+251:         clients = {}
+252:         try:

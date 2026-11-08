@@ -1,0 +1,36 @@
+ros2_ws/src/cleany_gazebo_sim/cleany_gazebo_sim/ground_truth_route_follower.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 6e11a397a6647d83803975c2a26d4a4e9e90588efc65ce1aab50d514fb626157
+
+32:         stale odometry or route completion produces a stop command.
+33:     """
+34:     def __init__(self) -> None:
+35:         super().__init__('ground_truth_route_follower')
+36:         self.declare_parameter('waypoints_xy', Parameter.Type.DOUBLE_ARRAY)
+37:         self.declare_parameter('max_linear_speed', 0.15)
+38:         self.declare_parameter('max_angular_speed', 0.25)
+39:         self.declare_parameter('max_linear_acceleration', 0.2)
+40:         self.declare_parameter('heading_gain', 1.2)
+41:         self.declare_parameter('position_tolerance', 0.09)
+42:         self.declare_parameter('position_gain', 1.0)
+43:         self.declare_parameter('heading_tolerance', 0.08)
+44:         self.declare_parameter('position_gain', 1.0)
+45:         self.declare_parameter('turn_in_place_threshold', 0.15)
+46:         self.declare_parameter('control_rate_hz', 20.0)
+47:         self.declare_parameter('odom_timeout_sec', 0.5)
+48: 
+49:         waypoints = waypoints_from_flat(
+50:             self.get_parameter('waypoints_xy').value
+51:         )
+52:         self._tracker = RouteTracker(
+90:         self._latest_odom_ns: int | None = None
+91:         self._completed = False
+92:         self._last_reported_index = -1
+93:         self._publisher = self.create_publisher(Twist, 'cmd_vel', 10)
+94:         self.create_subscription(
+95:             Odometry, 'ground_truth/odom', self._on_odometry, 10
+96:         )
+97:         self.create_timer(self._control_period_sec, self._on_control)
+98:         self.get_logger().info(
+99:             f'Loaded route with {self._tracker.waypoint_count} waypoints'

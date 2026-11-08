@@ -1,0 +1,29 @@
+ros2_ws/src/cleany_telemetry/cleany_telemetry/node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 5e98c429f0fd0885ac374af03eec51e5f845e1cb543a85f2af00a11c55ee0e0c
+
+27:         rate limiting and stale-input handling. Coordinates retain the input frame.
+28:     """
+29:     def __init__(self) -> None:
+30:         super().__init__("cleany_telemetry")
+31:         self.declare_parameter("odom_topic", "/odom")
+32:         self.declare_parameter("url", "ws://127.0.0.1:8080/api/robots/cleany-01/pose/ws")
+33:         self.declare_parameter("rate", 5.0)
+34:         self.declare_parameter("input_timeout", 1.5)
+35:         self.declare_parameter("reconnect_initial", 1.0)
+36:         self.declare_parameter("reconnect_max", 30.0)
+37:         self._relay = PoseRelay(
+38:             self.get_parameter("url").value,
+39:             float(self.get_parameter("rate").value),
+40:             float(self.get_parameter("input_timeout").value),
+41:             float(self.get_parameter("reconnect_initial").value),
+46:             depth=1,
+47:             reliability=QoSReliabilityPolicy.BEST_EFFORT,
+48:         )
+49:         self.create_subscription(
+50:             Odometry, self.get_parameter("odom_topic").value, self._odom, odom_qos
+51:         )
+52:         self._relay.start()
+53: 
+54:     def _odom(self, message: Odometry) -> None:

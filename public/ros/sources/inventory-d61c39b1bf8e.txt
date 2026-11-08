@@ -1,0 +1,23 @@
+ros2_ws/src/cleany_dev_monitor/cleany_dev_monitor/node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 264640e3c6a119de60d36237af7110d29e0df81db1accdd674a414ed580519d3
+
+80:         and camera, topic and recording limits bound retained data.
+81:     """
+82:     def __init__(self, **kwargs):
+83:         super().__init__("cleany_dev_monitor", **kwargs)
+84:         defaults = {
+85:             **PROPOSAL_DEFAULTS,
+86:             "resource_interval_s": 1.0,
+87:             "resource_process_limit": 20,
+88:             "resource_history_limit": 300,
+373:                             if compatibility == QoSCompatibility.ERROR:
+374:                                 raise ValueError("QoS mismatch: " + reason)
+375:                         cls = get_message(types[0])
+376:                         sub = self.create_subscription(
+377:                             cls,
+378:                             name,
+379:                             lambda msg, topic=name: self.receive(topic, msg),
+380:                             qos,
+381:                         )

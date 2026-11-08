@@ -1,0 +1,38 @@
+ros2_ws/src/cleany_mujoco_sim/cleany_mujoco_sim/camera_contract_adapter.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: cb445d9c4e7becfbe03fea8930274897601587d0eedcefe8d06f45a488a52fa9
+
+51:     _MAX_PENDING_SAMPLES = 12
+52: 
+53:     def __init__(self) -> None:
+54:         super().__init__('left_wrist_camera_contract_adapter')
+55:         self.declare_parameter('camera_config', str(default_camera_contract_path()))
+56:         camera_config = Path(self.get_parameter('camera_config').value)
+57:         self._contract = load_camera_contract(camera_config)
+58: 
+59:         self._image_publisher = self.create_publisher(
+60:             Image,
+61:             self._contract.public_image_topic,
+62:             qos_profile_sensor_data,
+63:         )
+64:         self._info_publisher = self.create_publisher(
+65:             CameraInfo,
+66:             self._contract.public_info_topic,
+67:             qos_profile_sensor_data,
+68:         )
+69:         self._images: OrderedDict[StampKey, Image] = OrderedDict()
+70:         self._infos: OrderedDict[StampKey, CameraInfo] = OrderedDict()
+71:         self._blocked_reason: str | None = None
+72:         self.create_subscription(
+73:             Image,
+74:             self._contract.internal_image_topic,
+75:             self._on_image,
+76:             qos_profile_sensor_data,
+77:         )
+78:         self.create_subscription(
+79:             CameraInfo,
+80:             self._contract.internal_info_topic,
+81:             self._on_info,
+82:             qos_profile_sensor_data,
+83:         )

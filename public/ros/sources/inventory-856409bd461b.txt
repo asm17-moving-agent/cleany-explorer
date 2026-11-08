@@ -1,0 +1,14 @@
+ros2_ws/src/cleany_manipulation_bt/cleany_manipulation_bt/arm_return_recovery.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: b4847787bd65c858d449d4dcc10ba73d09d6d20abaa486857bbb23dd128637bd
+
+60:             status = {}
+61: 
+62:     topic = namespace.rstrip('/') + '/real_control/status'
+63:     subscription = node.create_subscription(String, topic, receive, 1)
+64:     executor = SingleThreadedExecutor(context=node.context)
+65:     executor.add_node(node)
+66:     deadline = time.monotonic() + timeout
+67:     try:
+68:         while node.context.ok() and time.monotonic() < deadline:

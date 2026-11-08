@@ -1,0 +1,146 @@
+ros2_ws/src/cleany_robot_interface/cleany_robot_interface/control_state_guard.py
+Review: 2026-11-02
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: abf57a42f0367f8867f70c40814fcb738560a51d9d6c48acf3c7adc84d8a3948
+
+1: """Publish complete position feedback and deactivate controllers on stale/invalid state."""
+2: import json
+3: import math
+4: import time
+5: 
+6: import rclpy
+7: from rclpy.node import Node
+8: from rclpy.qos import DurabilityPolicy, QoSProfile
+9: from action_msgs.srv import CancelGoal
+10: from controller_manager_msgs.srv import SwitchController
+11: from sensor_msgs.msg import JointState
+12: from std_msgs.msg import String
+13: from std_srvs.srv import Trigger
+14: 
+15: 
+16: EXPECTED_JOINTS = {f'{side}_{suffix}_joint' for side in ('left', 'right') for suffix in
+17:                    ('shoulder_yaw', 'shoulder_pitch', 'elbow_pitch', 'wrist_pitch', 'wrist_roll', 'gripper')}
+18: EXPECTED_JOINTS.update(('head_pan_joint', 'head_tilt_joint'))
+19: CONTROLLERS = [f'{side}_{part}_controller' for side in ('left', 'right') for part in ('arm', 'gripper')]
+20: 
+21: 
+22: def valid_positions(message: JointState, now_ns: int, maximum_age: float) -> bool:
+23:     stamp = message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
+24:     return (len(message.name) == len(message.position) == 14
+25:             and set(message.name) == EXPECTED_JOINTS
+26:             and all(math.isfinite(value) for value in message.position)
+27:             and 0 <= now_ns - stamp <= maximum_age * 1e9)
+28: 
+29: 
+30: class ControlStateGuard(Node):
+31:     def __init__(self):
+32:         super().__init__('real_control_state_guard')
+33:         self.declare_parameter('max_state_age_s', .25)
+34:         self.declare_parameter('startup_timeout_s', 30.0)
+35:         self.declare_parameter('controller_names', CONTROLLERS)
+36:         self.controllers = list(self.get_parameter('controller_names').value)
+37:         if not self.controllers or not set(self.controllers) <= set(CONTROLLERS):
+38:             raise ValueError('Invalid controller_names')
+39:         self.max_age = float(self.get_parameter('max_state_age_s').value)
+40:         self.startup = float(self.get_parameter('startup_timeout_s').value)
+41:         if not 0 < self.max_age <= 1 or not 1 <= self.startup <= 60:
+42:             raise ValueError('Invalid state timeout')
+43:         self.created = time.monotonic()
+44:         self.last_received = None
+45:         self.last_stamp = -1
+46:         self.fault = ''
+47:         self.stop_confirmed = False
+48:         self.request = None
+49:         self.cancel_requests = {}
+50:         self.actions_cancelled = False
+51:         self.publisher = self.create_publisher(JointState, 'joint_states', 10)
+52:         self.status = self.create_publisher(String, 'real_control/status',
+53:             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+54:         self.subscription = self.create_subscription(JointState,
+55:             'joint_state_broadcaster/joint_states', self.receive, 10)
+56:         self.switch = self.create_client(SwitchController, 'controller_manager/switch_controller')
+57:         self.cancel = {name: self.create_client(
+58:             CancelGoal, f'/{name}/follow_joint_trajectory/_action/cancel_goal')
+59:             for name in self.controllers}
+60:         self.stop_service = self.create_service(Trigger, 'real_control/stop', self.stop)
+61:         self.timer = self.create_timer(.05, self.tick)
+62: 
+63:     def receive(self, message):
+64:         stamp = message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
+65:         if self.fault:
+66:             return
+67:         if not valid_positions(message, self.get_clock().now().nanoseconds, self.max_age):
+68:             self.latch('Invalid/incomplete/stale hardware position feedback')
+69:             return
+70:         if stamp <= self.last_stamp:
+71:             return  # A repeated stamp does not refresh the watchdog.
+72:         self.last_stamp = stamp
+73:         self.last_received = time.monotonic()
+74:         result = JointState()
+75:         result.header = message.header
+76:         result.name, result.position = message.name, message.position
+77:         # Humble broadcaster fills unsupported velocity/effort with NaN; omit them.
+78:         self.publisher.publish(result)
+79: 
+80:     def latch(self, reason):
+81:         if not self.fault:
+82:             self.fault = reason
+83:             self.get_logger().error(reason + '; controller stop requested; restart required')
+84: 
+85:     def stop(self, _request, response):
+86:         self.latch('Operator software stop')
+87:         response.success = True
+88:         response.message = 'Stop latched; awaiting controller deactivation. See real_control/status.'
+89:         return response
+90: 
+91:     def tick(self):
+92:         now = time.monotonic()
+93:         if self.last_received is None:
+94:             if now - self.created > self.startup:
+95:                 self.latch('Hardware feedback startup timeout')
+96:         elif now - self.last_received > self.max_age:
+97:             self.latch('Hardware feedback timeout')
+98:         if self.fault:
+99:             for name, client in self.cancel.items():
+100:                 future = self.cancel_requests.get(name)
+101:                 if future is None and client.service_is_ready():
+102:                     # A zero GoalInfo is the ROS action protocol request to
+103:                     # cancel every active goal on this action server.
+104:                     self.cancel_requests[name] = client.call_async(CancelGoal.Request())
+105:             if self.cancel_requests and all(future.done() for future in self.cancel_requests.values()):
+106:                 self.actions_cancelled = all(
+107:                     future.exception() is None and
+108:                     future.result().return_code != CancelGoal.Response.ERROR_REJECTED
+109:                     for future in self.cancel_requests.values())
+110:         if self.fault and not self.stop_confirmed:
+111:             if self.request is not None and self.request.done():
+112:                 try:
+113:                     self.stop_confirmed = bool(self.request.result().ok)
+114:                 except Exception as error:
+115:                     self.get_logger().error(str(error))
+116:                 self.request = None
+117:             if not self.stop_confirmed and self.request is None and self.switch.service_is_ready():
+118:                 request = SwitchController.Request()
+119:                 request.deactivate_controllers = self.controllers
+120:                 request.strictness = SwitchController.Request.BEST_EFFORT
+121:                 request.timeout.sec = 1
+122:                 self.request = self.switch.call_async(request)
+123:         message = String()
+124:         message.data = json.dumps({'state': 'fault' if self.fault else
+125:                                   ('ready' if self.last_received is not None else 'waiting'),
+126:                                   'reason': self.fault, 'controllers_stopped': self.stop_confirmed,
+127:                                   'actions_cancelled': self.actions_cancelled,
+128:                                   'physical_stop_verified': False})
+129:         self.status.publish(message)
+130: 
+131: 
+132: def main(args=None):
+133:     rclpy.init(args=args)
+134:     node = ControlStateGuard()
+135:     try:
+136:         rclpy.spin(node)
+137:     except KeyboardInterrupt:
+138:         pass
+139:     finally:
+140:         node.destroy_node()
+141:         rclpy.try_shutdown()

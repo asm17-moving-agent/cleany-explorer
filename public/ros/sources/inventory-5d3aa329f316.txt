@@ -1,0 +1,93 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/wrist_camera_control.py
+Review: 2026-11-01
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: a103f80c768ecd80749587d514855bf88e9cf14751c5d609350d372cbd13c2a0
+
+1: """Keep USB capture open only for the selected arm's observation window."""
+2: from __future__ import annotations
+3: 
+4: import math
+5: import time
+6: from collections.abc import Callable
+7: from typing import Any
+8: 
+9: from rclpy.node import Node
+10: from std_srvs.srv import SetBool
+11: 
+12: 
+13: class WristCameraSession:
+14:     def __init__(self, node: Node, timeout_seconds: float, wait: Callable[..., Any]) -> None:
+15:         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+16:             raise ValueError('Wrist camera control timeout must be finite and positive')
+17:         self.timeout_seconds = timeout_seconds
+18:         self.wait = wait
+19:         self.clients = {arm: node.create_client(SetBool, f'/{arm}_wrist_camera/set_enabled')
+20:                         for arm in ('left', 'right')}
+21:         self.active_arm: str | None = None
+22:         # Record before sending enable: an aborted/timed-out reply can still open USB.
+23:         self._requested_arms: set[str] = set()
+24:         self._disable_pending: dict[str, Any] = {}
+25: 
+26:     def _set(self, arm: str, enabled: bool, *, cleanup: bool = False) -> None:
+27:         client = self.clients[arm]
+28:         if not client.wait_for_service(timeout_sec=self.timeout_seconds):
+29:             raise RuntimeError(f'{arm} wrist camera control service unavailable')
+30:         future = client.call_async(SetBool.Request(data=enabled))
+31:         self._acknowledge(arm, future, cleanup=cleanup)
+32: 
+33:     def _acknowledge(self, arm: str, future: Any, *, cleanup: bool) -> None:
+34:         if cleanup:
+35:             # Closing capture must remain possible after the motion guard has aborted.
+36:             deadline = time.monotonic() + self.timeout_seconds
+37:             while not future.done() and time.monotonic() < deadline:
+38:                 time.sleep(.01)
+39:             if not future.done():
+40:                 raise RuntimeError(f'Timed out disabling {arm} wrist camera')
+41:             response = future.result()
+42:         else:
+43:             response = self.wait(future, self.timeout_seconds)
+44:         if response is None or not response.success:
+45:             message = response.message if response is not None else 'No response'
+46:             raise RuntimeError(f'{arm} wrist camera control failed: {message}')
+47: 
+48:     def activate(self, arm: str) -> None:
+49:         if arm not in self.clients:
+50:             raise ValueError('Unknown wrist camera arm')
+51:         if self.active_arm == arm and arm not in self._disable_pending:
+52:             return
+53:         other = 'right' if arm == 'left' else 'left'
+54:         # Require the opposite capture to be closed before opening the selected one.
+55:         self._requested_arms.add(other)
+56:         self._set(other, False)
+57:         self._requested_arms.discard(other)
+58:         self._disable_pending.pop(other, None)
+59:         if self.active_arm == other:
+60:             self.active_arm = None
+61:         self._requested_arms.add(arm)
+62:         self._disable_pending.pop(arm, None)
+63:         self._set(arm, True)
+64:         self.active_arm = arm
+65: 
+66:     def close(self) -> None:
+67:         errors = []
+68:         for arm in sorted(self._requested_arms):
+69:             try:
+70:                 pending = self._disable_pending.pop(arm, None)
+71:                 if pending is None:
+72:                     self._set(arm, False, cleanup=True)
+73:                 else:
+74:                     self._acknowledge(arm, pending, cleanup=True)
+75:             except Exception as error:
+76:                 errors.append(str(error))
+77:             else:
+78:                 self._requested_arms.discard(arm)
+79:                 if self.active_arm == arm:
+80:                     self.active_arm = None
+81:         if errors:
+82:             raise RuntimeError('; '.join(errors))
+83: 
+84:     def request_close(self) -> None:
+85:         """Submit capture shutdown without delaying trajectory cancellation."""
+86:         for arm in sorted(self._requested_arms):
+87:             if arm not in self._disable_pending:
+88:                 self._disable_pending[arm] = self.clients[arm].call_async(SetBool.Request(data=False))

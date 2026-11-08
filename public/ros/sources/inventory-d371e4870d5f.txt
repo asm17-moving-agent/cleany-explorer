@@ -1,0 +1,29 @@
+ros2_ws/src/cleany_gazebo_sim/cleany_gazebo_sim/command_guard.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 5ee40e67b04d6e92d8f942e5b36957d6f0d6d61af59eaba2af3c4cbfc6b3f4a2
+
+33:         timeout callbacks run on the node timer and depend on its clock advancing.
+34:     """
+35:     def __init__(self) -> None:
+36:         super().__init__('gazebo_command_guard')
+37:         self.declare_parameter('max_linear_x', 0.3)
+38:         self.declare_parameter('max_linear_y', 0.3)
+39:         self.declare_parameter('max_angular_z', 0.8)
+40:         self.declare_parameter('cmd_vel_timeout_sec', 0.5)
+41:         self.declare_parameter('timeout_check_rate_hz', 20.0)
+42: 
+43:         self._limits = CommandLimits(
+44:             max_linear_x=self.get_parameter('max_linear_x').value,
+45:             max_linear_y=self.get_parameter('max_linear_y').value,
+46:             max_angular_z=self.get_parameter('max_angular_z').value,
+53:             raise ValueError('timeout values must be positive')
+54: 
+55:         self._last_command_time: float | None = None
+56:         self._publisher = self.create_publisher(Twist, 'gazebo_cmd_vel', 10)
+57:         self.create_subscription(Twist, 'cmd_vel', self._on_command, 10)
+58:         self.create_timer(1.0 / timeout_check_rate_hz, self._on_timeout)
+59: 
+60:     def _on_command(self, message: Twist) -> None:
+61:         all_axes = (
+62:             message.linear.x,

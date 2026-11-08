@@ -1,0 +1,29 @@
+ros2_ws/src/cleany_dev_monitor/config/manipulation_io_probe.json
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 9cbd705c0692c2a5853ee149fbb8afdff9a582e0bf0e7dafb72c81dbb544c772
+
+1: {
+2:   "window_s": 1.0,
+3:   "sample_interval_s": 0.1,
+4:   "state_timeout_s": 3.0,
+5:   "startup_grace_s": 2.0,
+6:   "resource_interval_s": 1.0,
+7:   "motor_detail_interval_s": 0.2,
+8:   "writer_queue_size": 8192,
+9:   "max_recording_mib": 512,
+10:   "execution_topic": "/manipulation/execution_events",
+11:   "bt_topic": "/manipulation/bt_transitions",
+12:   "streams": [
+13:     {"topic": "/joint_states", "type": "sensor_msgs/msg/JointState", "label": "모터 1–14 위치", "hz": 50, "mode": "always", "kind": "joint"},
+14:     {"topic": "/joint_state_broadcaster/dynamic_joint_states", "type": "control_msgs/msg/DynamicJointState", "label": "모터 원시 피드백", "hz": 50, "mode": "always", "kind": "motor"},
+15:     {"topic": "/camera/color/image_raw", "type": "sensor_msgs/msg/Image", "label": "헤드 컬러", "hz": 15, "mode": "always", "kind": "image"},
+16:     {"topic": "/camera/depth/image_raw", "type": "sensor_msgs/msg/Image", "label": "헤드 정렬 깊이", "hz": 15, "mode": "always", "kind": "image"},
+17:     {"topic": "/left_wrist_camera/image_raw", "type": "sensor_msgs/msg/Image", "label": "왼손목 컬러", "hz": 15, "mode": "left", "kind": "image"},
+18:     {"topic": "/right_wrist_camera/image_raw", "type": "sensor_msgs/msg/Image", "label": "오른손목 컬러", "hz": 15, "mode": "right", "kind": "image"},
+19:     {"topic": "/camera/color/camera_info", "type": "sensor_msgs/msg/CameraInfo", "label": "헤드 컬러 정보", "hz": 15, "mode": "always", "kind": "info"},
+20:     {"topic": "/camera/depth/camera_info", "type": "sensor_msgs/msg/CameraInfo", "label": "헤드 깊이 정보", "hz": 15, "mode": "always", "kind": "info"},
+21:     {"topic": "/left_wrist_camera/camera_info", "type": "sensor_msgs/msg/CameraInfo", "label": "왼손목 정보", "hz": 15, "mode": "left", "kind": "info"},
+22:     {"topic": "/right_wrist_camera/camera_info", "type": "sensor_msgs/msg/CameraInfo", "label": "오른손목 정보", "hz": 15, "mode": "right", "kind": "info"}
+23:   ]
+24: }

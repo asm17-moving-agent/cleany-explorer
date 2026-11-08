@@ -1,0 +1,35 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/manipulation_evidence_node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: abfa0a120cba1d643bb9ee5e75c458534b3f5d4110a1d7b71a2027d9a0f7e6bd
+
+22: 
+23: class ManipulationEvidenceNode(Node):
+24:     def __init__(self, **kwargs):
+25:         super().__init__('manipulation_evidence', **kwargs)
+26:         self.declare_parameter('request_timeout_sec', .8)
+27:         self.timeout = float(self.get_parameter('request_timeout_sec').value)
+28:         if not math.isfinite(self.timeout) or not 0 < self.timeout <= 2:
+29:             raise ValueError('Invalid request timeout')
+30:         self.declare_parameter('contact_rule_file', str(Path(get_package_share_directory(
+31:             'cleany_skill_executor'))/'config/gripper_contact_decision.yaml'))
+32:         self.declare_parameter('tracking_maximum_age_sec', .5)
+33:         self.declare_parameter('tracking_maximum_skew_sec', .2)
+34:         criteria = load_contact_criteria(self.get_parameter('contact_rule_file').value)
+35:         self.histories = {arm: RawContactHistory(c, ContactConfig(
+36:             window_sec=c.window_sec,
+37:             maximum_age_sec=float(self.get_parameter('tracking_maximum_age_sec').value),
+38:             maximum_skew_sec=float(self.get_parameter('tracking_maximum_skew_sec').value)))
+46:         self.lock = threading.Lock()
+47:         self.group = ReentrantCallbackGroup()
+48:         self.subscriptions_ = [
+49:             self.create_subscription(DynamicJointState,'/joint_state_broadcaster/dynamic_joint_states',self.on_motor,20,callback_group=self.group),
+50:             self.create_subscription(WristTrackingStatus,'/perception/wrist_tracking_status',self.on_tracking,10,callback_group=self.group),
+51:             self.create_subscription(String,'/real_control/status',self.on_guard,10,callback_group=self.group),
+52:             self.create_subscription(ManipulationOutcome,'/perception/manipulation_outcome',self.on_outcome,10,callback_group=self.group)]
+53:         self.service = self.create_service(CheckManipulation,'/manipulation/check_evidence',self.check,callback_group=self.group)
+54: 
+55:     def on_guard(self, message):
+56:         with self.lock:
+57:             try:
+58:                 data=json.loads(message.data)

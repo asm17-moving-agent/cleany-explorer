@@ -1,0 +1,206 @@
+docs/ROS_INTERFACES.md
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: d219dcf3d1db5501dcc485616299bd16584ebf9cf9c75ab35abb9afcc2c08a8c
+
+1: # ROS 인터페이스 색인
+2: 
+3: 각 노드의 발행, 구독, 서비스 제공/호출, 액션 제공/호출을 찾는 색인이다. 상세 표는 코드 옆 `docs/interfaces.md`가 관리하고, 동작과 안전 규칙은 [INTEGRATION](INTEGRATION.md)의 계약 reference를 따른다.
+4: 
+5: 표는 현재 소스와 launch의 기본 이름을 기록한다. 실행별 namespace, node name, parameter와 remap에 따라 실제 graph는 달라진다. 조건부 endpoint, 외부 server, 미구현 타입을 구분하며 모든 노드가 동시에 실행되는 것으로 해석하지 않는다.
+6: 
+7: ## 표 읽기
+8: 
+9: | 표기 | 뜻 |
+10: |---|---|
+11: | 토픽 발행 / 구독 | 해당 노드에서 나가는 데이터 / 들어오는 데이터 |
+12: | 서비스 제공 / 호출 | Server / client |
+13: | 액션 제공 / 호출 | Action server / client |
+14: | R10, R20, R1 | Reliable, volatile, keep-last depth 10 / 20 / 1 |
+15: | B1 | Best-effort, volatile, keep-last depth 1 |
+16: | Sensor | Humble `qos_profile_sensor_data`: best-effort, volatile, keep-last depth 5 |
+17: | R/T1, R/T2048 | Reliable, transient-local, keep-last depth 1 / 2048 |
+18: | Service 기본값 | Humble service QoS: reliable, volatile, keep-last depth 10 |
+19: | Action 기본값 | rclpy 기본 request/result/cancel service와 feedback/status QoS. Status는 reliable, transient-local, depth 1 |
+20: | TF 기본 QoS | tf2_ros broadcaster/listener 기본값. 응용 코드가 별도 QoS를 지정하지 않음 |
+21: | 상대 이름 / `/절대 이름` / `~/private` | Node namespace 적용 / root 이름 / node namespace와 node name 적용 |
+22: | 주기 | 소스의 기본 timer 또는 callback 조건. 실제 수신 빈도와 동일하지 않을 수 있음 |
+23: 
+24: ## 종류별 통합 목록
+25: 
+26: [Topic](#topic-목록), [Action](#action-목록), [Service](#service-목록)에서 이름으로 찾는다. 노드 링크는 패키지의 상세 표로 연결하며, 아직 표에 없는 runtime endpoint는 구현 소스로 연결한다. QoS와 호출 조건은 연결된 문서와 소스를 따른다.
+27: 
+28: 아래 이름은 **root namespace에서 기본 이름을 해석한 값**이다. 상대 이름을 절대 이름으로 고정하는 설정이 아니며, namespace, remap과 parameter override가 있으면 달라진다. `cleany_dev_monitor`의 `runtime_namespace`는 기본 빈 값으로 표시했다. `<...>`는 실행 시 결정되는 이름 패턴이다.
+29: 
+30: 발행/제공 목록의 여러 노드는 실행 구성에 따른 대안이거나 서로 다른 데이터를 같은 토픽으로 보내는 노드다. 동시에 실행한다는 뜻은 아니다. `mock_*`, Gazebo, MuJoCo와 `sorting_cameras`는 mock 또는 시뮬레이션 경로이며, 외부 Nav2, MoveIt과 controller는 별도 실행이 필요하다. `—`는 이 색인에서 상대 노드를 지정하지 않은 항목이며, endpoint의 부재나 미구현을 뜻하지 않는다. `SortingObserver`는 MuJoCo host 노드에 붙는 plugin이며 독립 노드 이름이 아니다. Monitor의 동적 구독은 discovery와 사용자 선택에 따라 생성된다.
+31: 
+32: ROS 자동 인터페이스는 [별도 표](#ros가-자동-생성하는-인터페이스)에 둔다. 응용 코드가 직접 호출하거나 관찰하는 action cancel/status와 카메라 parameter 서비스는 통합 목록에도 표시한다. 외부 패키지 전체 API와 실행 중 동적으로 발견되는 모든 이름을 열거하지는 않는다.
+33: 
+34: ### Topic 목록
+35: 
+36: | 기본 이름 (root namespace) | ROS 타입 | 발행 노드 | 구독 노드 | 조건 / 연결 |
+37: |---|---|---|---|---|
+38: | `/amcl_pose` | `geometry_msgs/msg/PoseWithCovarianceStamped` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+39: | `/base/imu_state` | `cleany_base_interfaces/msg/ImuState` | [`cleany_motor_controller`][ros-cleany-motor-controller] | [`cleany_imu`][ros-cleany-imu] | — |
+40: | `/base/wheel_command` | `cleany_base_interfaces/msg/WheelCommand` | [`cleany_base_driver`][ros-cleany-base-driver] | [`mock_base_mcu`][ros-mock-base-mcu], [`cleany_motor_controller`][ros-cleany-motor-controller] | — |
+41: | `/base/wheel_state` | `cleany_base_interfaces/msg/WheelState` | [`mock_base_mcu`][ros-mock-base-mcu], [`cleany_motor_controller`][ros-cleany-motor-controller] | [`cleany_base_driver`][ros-cleany-base-driver] | — |
+42: | `/behavior_tree_log` | `nav2_msgs/msg/BehaviorTreeLog` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor], [`nav2_bt_trace`][ros-nav2-bt-trace] | — |
+43: | `/body_guard_3d/risk_voxels` | `sensor_msgs/msg/PointCloud2` | [`voxel_guard`][ros-voxel-guard] | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+44: | `/body_guard_3d/state` | `std_msgs/msg/String` | [`voxel_guard`][ros-voxel-guard] | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+45: | `/bt_navigator/transition_event` | `lifecycle_msgs/msg/TransitionEvent` | — | [`nav2_bt_trace`][ros-nav2-bt-trace] | — |
+46: | `/camera/aligned_depth_to_color/image_raw` | `sensor_msgs/msg/Image` | [`sorting_cameras`][ros-sorting-cameras] | — | 발행자는 MuJoCo 전용; 실물 camera 제공자는 별도 |
+47: | `/camera/color/camera_info` | `sensor_msgs/msg/CameraInfo` | [`sorting_cameras`][ros-sorting-cameras] | [`perception_inspector`][ros-perception-inspector] | 발행자는 MuJoCo 전용; 실물 camera 제공자는 별도 |
+48: | `/camera/color/image_raw` | `sensor_msgs/msg/Image` | [`sorting_cameras`][ros-sorting-cameras] | [`perception_inspector`][ros-perception-inspector] | 발행자는 MuJoCo 전용; 실물 camera 제공자는 별도 |
+49: | `/camera/depth/camera_info` | `sensor_msgs/msg/CameraInfo` | — | [`perception_inspector`][ros-perception-inspector], [`depth_scene_node`][ros-depth-scene-node] | — |
+50: | `/camera/depth/image_raw` | `sensor_msgs/msg/Image` | — | [`perception_inspector`][ros-perception-inspector] | — |
+51: | `/camera/depth/image_rect_raw` | `sensor_msgs/msg/Image` | — | [`depth_scene_node`][ros-depth-scene-node] | — |
+52: | `/camera/head/color/image_raw` | `sensor_msgs/msg/Image` | [`ros_gz_bridge`][ros-ros-gz-bridge] | — | — |
+53: | `/camera/head/depth/camera_info` | `sensor_msgs/msg/CameraInfo` | [`ros_gz_bridge`][ros-ros-gz-bridge] | [`depth_clearance`][ros-depth-clearance], [`depth_coverage`][ros-depth-coverage] | — |
+54: | `/camera/head/depth/image_raw` | `sensor_msgs/msg/Image` | [`ros_gz_bridge`][ros-ros-gz-bridge] | [`depth_clearance`][ros-depth-clearance], [`depth_coverage`][ros-depth-coverage] | — |
+55: | `/camera/head/depth/obstacle_points` | `sensor_msgs/msg/PointCloud2` | [`depth_clearance`][ros-depth-clearance] | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+56: | `/camera/head/depth/points` | `sensor_msgs/msg/PointCloud2` | [`depth_clearance`][ros-depth-clearance] | [`pan_motion_gate`][ros-pan-motion-gate], [`reactive_guard`][ros-reactive-guard], [`obstacle_memory`][ros-obstacle-memory] | — |
+57: | `/camera/left_wrist/color/image_raw` | `sensor_msgs/msg/Image` | [`ros_gz_bridge`][ros-ros-gz-bridge] | — | — |
+58: | `/camera/right_wrist/color/image_raw` | `sensor_msgs/msg/Image` | [`ros_gz_bridge`][ros-ros-gz-bridge] | — | — |
+59: | `/cleany/internal/mujoco/left_wrist_camera/camera_info` | `sensor_msgs/msg/CameraInfo` | — | [`left_wrist_camera_contract_adapter`][ros-left-wrist-camera-contract-adapter], [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | — |
+60: | `/cleany/internal/mujoco/left_wrist_camera/image_raw` | `sensor_msgs/msg/Image` | — | [`left_wrist_camera_contract_adapter`][ros-left-wrist-camera-contract-adapter] | — |
+61: | `/clock` | `rosgraph_msgs/msg/Clock` | [`gazebo_feedback_sampler`][ros-gazebo-feedback-sampler], [`ros_gz_bridge`][ros-ros-gz-bridge] | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | Bridge 직접 발행은 override 구성; profile은 sampler 경유 |
+62: | `/cmd_vel` | `geometry_msgs/msg/Twist` | [`ground_truth_route_follower`][ros-ground-truth-route-follower], [`reactive_guard`][ros-reactive-guard], [`voxel_guard`][ros-voxel-guard] | [`cleany_base_driver`][ros-cleany-base-driver], [`cleany_dev_monitor`][ros-cleany-dev-monitor], [`gazebo_command_guard`][ros-gazebo-command-guard], [`mujoco_sim`][ros-mujoco-sim] | — |
+63: | `/collision_monitor_state` | `discovery 타입` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | 실행 graph에서 타입 확인 |
+64: | `/constraint_list` | `visualization_msgs/msg/MarkerArray` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+65: | `/diagnostics` | `diagnostic_msgs/msg/DiagnosticArray` | [`cleany_base_driver`][ros-cleany-base-driver], [`cleany_imu`][ros-cleany-imu] | — | — |
+66: | `/evaluation` | `discovery 타입` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | 실행 graph에서 타입 확인; 발행자 존재는 실행 구성에서 확인 |
+67: | `/gazebo/raw_clock` | `rosgraph_msgs/msg/Clock` | [`ros_gz_bridge`][ros-ros-gz-bridge] | [`gazebo_feedback_sampler`][ros-gazebo-feedback-sampler] | Gazebo profile에서 raw 이름으로 remap |
+68: | `/gazebo/raw_joint_states` | `sensor_msgs/msg/JointState` | [`ros_gz_bridge`][ros-ros-gz-bridge] | [`gazebo_feedback_sampler`][ros-gazebo-feedback-sampler] | Gazebo profile에서 raw 이름으로 remap |
+69: | `/gazebo_cmd_vel` | `geometry_msgs/msg/Twist` | [`gazebo_command_guard`][ros-gazebo-command-guard] | [`ros_gz_bridge`][ros-ros-gz-bridge] | — |
+70: | `/gazebo_odom` | `nav_msgs/msg/Odometry` | [`ros_gz_bridge`][ros-ros-gz-bridge] | [`gazebo_odom_tf_publisher`][ros-gazebo-odom-tf-publisher] | — |
+71: | `/global_costmap/costmap` | `nav_msgs/msg/OccupancyGrid` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+72: | `/grasp/collision_geometry` | `cleany_interfaces/msg/ObservedObjectGeometry` | [`grasp_server`][ros-grasp-server] | [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator], [`grasp_selection_server`][ros-grasp-selection-server] | use_observed_collision_geometry=true; publish_collision_geometry=true |
+73: | `/grasp/debug_image` | `sensor_msgs/msg/Image` | [`grasp_server`][ros-grasp-server] | — | — |
+74: | `/grasp/debug_image_latched` | `sensor_msgs/msg/Image` | [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | — | — |
+75: | `/ground_truth/odom` | `nav_msgs/msg/Odometry` | [`ros_gz_bridge`][ros-ros-gz-bridge] | [`cleany_dev_monitor`][ros-cleany-dev-monitor], [`ground_truth_route_follower`][ros-ground-truth-route-follower] | — |
+76: | `/head_pan/command` | `std_msgs/msg/Float64` | [`pan_motion_gate`][ros-pan-motion-gate] | [`head_pan_bridge`][ros-head-pan-bridge] | Gazebo dynamic pan 구성 |
+77: | `/head_pan/coverage` | `std_msgs/msg/String` | [`depth_coverage`][ros-depth-coverage] | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+78: | `/head_pan/state` | `std_msgs/msg/String` | [`pan_motion_gate`][ros-pan-motion-gate] | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+79: | `/imu/data` | `sensor_msgs/msg/Imu` | [`ros_gz_bridge`][ros-ros-gz-bridge], [`cleany_imu`][ros-cleany-imu] | — | 실행 구성별 대안 |
+80: | `/imu/data_raw` | `sensor_msgs/msg/Imu` | [`cleany_imu`][ros-cleany-imu] | — | — |
+81: | `/imu/status` | `diagnostic_msgs/msg/DiagnosticArray` | [`cleany_imu`][ros-cleany-imu] | — | — |
+82: | `/joint_states` | `sensor_msgs/msg/JointState` | [`cleany_base_driver`][ros-cleany-base-driver], [`gazebo_feedback_sampler`][ros-gazebo-feedback-sampler], [`ros_gz_bridge`][ros-ros-gz-bridge], [`mujoco_sim`][ros-mujoco-sim] | [`wheel_odometry`][ros-wheel-odometry], [`gazebo_pan_tf_publisher`][ros-gazebo-pan-tf-publisher], [`simulated_encoder`][ros-simulated-encoder], [`single_pose_handeye_orchestrator`][ros-single-pose-handeye-orchestrator], [`multi_pose_handeye_orchestrator`][ros-multi-pose-handeye-orchestrator], [`pan_motion_gate`][ros-pan-motion-gate], [`reactive_guard`][ros-reactive-guard], [`grasp_selection_server`][ros-grasp-selection-server], [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator], [`robot_state_publisher`][ros-robot-state-publisher] | Bridge 직접 발행은 override 구성; profile은 sampler 경유 |
+83: | `/left_arm_controller/controller_state` | `control_msgs/msg/JointTrajectoryControllerState` | [`left_arm_controller`][ros-left-arm-controller] | [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | — |
+84: | `/left_wrist_camera/camera_info` | `sensor_msgs/msg/CameraInfo` | [`left_wrist_camera_contract_adapter`][ros-left-wrist-camera-contract-adapter], [`sorting_cameras`][ros-sorting-cameras] | [`single_pose_handeye_orchestrator`][ros-single-pose-handeye-orchestrator], [`multi_pose_handeye_orchestrator`][ros-multi-pose-handeye-orchestrator], [`perception_inspector`][ros-perception-inspector] | 손목 구독은 enable_wrist_observation=true; MuJoCo camera 또는 adapter 경로 선택; 실물 camera 제공자는 별도 |
+85: | `/left_wrist_camera/image_raw` | `sensor_msgs/msg/Image` | [`left_wrist_camera_contract_adapter`][ros-left-wrist-camera-contract-adapter], [`sorting_cameras`][ros-sorting-cameras] | [`single_pose_handeye_orchestrator`][ros-single-pose-handeye-orchestrator], [`multi_pose_handeye_orchestrator`][ros-multi-pose-handeye-orchestrator], [`perception_inspector`][ros-perception-inspector] | 손목 구독은 enable_wrist_observation=true; MuJoCo camera 또는 adapter 경로 선택; 실물 camera 제공자는 별도 |
+86: | `/local_costmap/costmap` | `nav_msgs/msg/OccupancyGrid` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+87: | `/local_costmap/published_footprint` | `geometry_msgs/msg/PolygonStamped` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+88: | `/local_plan` | `nav_msgs/msg/Path` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+89: | `/map` | `nav_msgs/msg/OccupancyGrid` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor], [`obstacle_memory`][ros-obstacle-memory] | — |
+90: | `/mission/debug_snapshot` | `cleany_interfaces/msg/RuntimeDebugSnapshot` | [`mission_runtime`][ros-mission-runtime] | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+91: | `/mission/result` | `cleany_interfaces/msg/MissionResult` | [`mission_runtime`][ros-mission-runtime] | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+92: | `/mission/runtime_events` | `cleany_interfaces/msg/RuntimeEvent` | [`mission_runtime`][ros-mission-runtime] | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+93: | `/mission/status` | `cleany_interfaces/msg/MissionStatus` | [`mission_runtime`][ros-mission-runtime] | — | — |
+94: | `/mock/manipulation/execution_events` | `discovery 타입` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | 실행 graph에서 타입 확인; 발행자 존재는 실행 구성에서 확인 |
+95: | `/monitored_planning_scene` | `moveit_msgs/msg/PlanningScene` | [`move_group`][ros-move-group] | [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | — |
+96: | `/mujoco_sim/joint_cmd` | `sensor_msgs/msg/JointState` | — | [`mujoco_sim`][ros-mujoco-sim] | — |
+97: | `/nav2/cmd_vel` | `geometry_msgs/msg/Twist` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor], [`depth_coverage`][ros-depth-coverage], [`pan_motion_gate`][ros-pan-motion-gate], [`reactive_guard`][ros-reactive-guard] | — |
+98: | `/navigate_to_pose/_action/status` | `action_msgs/msg/GoalStatusArray` | [`bt_navigator`][ros-bt-navigator] | [`mission_runtime`][ros-mission-runtime], [`nav2_bt_trace`][ros-nav2-bt-trace] | — |
+99: | `/navigation/bt_trace` | `std_msgs/msg/String` | [`nav2_bt_trace`][ros-nav2-bt-trace] | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+100: | `/obstacle_memory/depth` | `nav_msgs/msg/OccupancyGrid` | [`obstacle_memory`][ros-obstacle-memory] | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+101: | `/obstacle_memory/grid` | `nav_msgs/msg/OccupancyGrid` | [`obstacle_memory`][ros-obstacle-memory] | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+102: | `/obstacle_memory/lidar` | `nav_msgs/msg/OccupancyGrid` | [`obstacle_memory`][ros-obstacle-memory] | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+103: | `/obstacle_memory/local_voxels` | `sensor_msgs/msg/PointCloud2` | [`obstacle_memory`][ros-obstacle-memory] | — | — |
+104: | `/obstacle_memory/navigation_grid` | `nav_msgs/msg/OccupancyGrid` | [`obstacle_memory`][ros-obstacle-memory] | — | — |
+105: | `/obstacle_memory/voxel_status` | `std_msgs/msg/String` | [`obstacle_memory`][ros-obstacle-memory] | [`voxel_guard`][ros-voxel-guard] | — |
+106: | `/obstacle_memory/voxels` | `sensor_msgs/msg/PointCloud2` | [`obstacle_memory`][ros-obstacle-memory] | [`voxel_guard`][ros-voxel-guard] | — |
+107: | `/odom` | `nav_msgs/msg/Odometry` | [`base_odom_relay`][ros-base-odom-relay], [`gazebo_odom_tf_publisher`][ros-gazebo-odom-tf-publisher], [`mujoco_sim`][ros-mujoco-sim] | [`mission_runtime`][ros-mission-runtime], [`depth_coverage`][ros-depth-coverage], [`pan_motion_gate`][ros-pan-motion-gate], [`reactive_guard`][ros-reactive-guard], [`voxel_guard`][ros-voxel-guard], [`cleany_telemetry`][ros-cleany-telemetry] | — |
+108: | `/pan_ready/cmd_vel` | `geometry_msgs/msg/Twist` | [`pan_motion_gate`][ros-pan-motion-gate] | — | — |
+109: | `/perception/debug_image` | `sensor_msgs/msg/Image` | [`perception_inspector`][ros-perception-inspector] | — | — |
+110: | `/perception/debug_image_latched` | `sensor_msgs/msg/Image` | [`perception_inspector`][ros-perception-inspector] | [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | — |
+111: | `/perception/detections_2d` | `cleany_interfaces/msg/DetectedObject2DArray` | [`perception_inspector`][ros-perception-inspector] | — | — |
+112: | `/perception/objects` | `cleany_interfaces/msg/DetectedObject3DArray` | [`perception_inspector`][ros-perception-inspector] | — | — |
+113: | `/perception/scene_cloud` | `sensor_msgs/msg/PointCloud2` | [`depth_scene_node`][ros-depth-scene-node] | [`move_group`][ros-move-group] | occupancy updater 설정 시 |
+114: | `/perception/scene_cloud_filtered` | `sensor_msgs/msg/PointCloud2` | [`move_group`][ros-move-group] | [`scene_cloud_receipt`][ros-scene-cloud-receipt], [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | occupancy updater 설정 시 |
+115: | `/perception/scene_cloud_receipt` | `std_msgs/msg/Header` | [`scene_cloud_receipt`][ros-scene-cloud-receipt] | [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | sensor_scene_receipt_topic 지정 시 cloud 구독 대체 |
+116: | `/plan` | `nav_msgs/msg/Path` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+117: | `/reactive_guard/state` | `std_msgs/msg/String` | [`reactive_guard`][ros-reactive-guard] | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+118: | `/right_arm_controller/controller_state` | `control_msgs/msg/JointTrajectoryControllerState` | [`right_arm_controller`][ros-right-arm-controller] | [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | — |
+119: | `/right_wrist_camera/camera_info` | `sensor_msgs/msg/CameraInfo` | [`sorting_cameras`][ros-sorting-cameras] | [`perception_inspector`][ros-perception-inspector] | 손목 구독은 enable_wrist_observation=true; MuJoCo camera 또는 adapter 경로 선택; 실물 camera 제공자는 별도 |
+120: | `/right_wrist_camera/image_raw` | `sensor_msgs/msg/Image` | [`sorting_cameras`][ros-sorting-cameras] | [`perception_inspector`][ros-perception-inspector] | 손목 구독은 enable_wrist_observation=true; MuJoCo camera 또는 adapter 경로 선택; 실물 camera 제공자는 별도 |
+121: | `/robot/safety_fault` | `std_msgs/msg/String` | — | [`mission_runtime`][ros-mission-runtime] | — |
+122: | `/robot/safety_released` | `std_msgs/msg/String` | — | [`mission_runtime`][ros-mission-runtime] | — |
+123: | `/robot_description` | `std_msgs/msg/String` | [`robot_state_publisher`][ros-robot-state-publisher] | [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator], [`grasp_selection_server`][ros-grasp-selection-server] | — |
+124: | `/rosout` | `rcl_interfaces/msg/Log` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+125: | `/safety/slow_zone` | `geometry_msgs/msg/PolygonStamped` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+126: | `/safety/stop_zone` | `geometry_msgs/msg/PolygonStamped` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+127: | `/safety_2d/cmd_vel` | `geometry_msgs/msg/Twist` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor], [`reactive_guard`][ros-reactive-guard], [`voxel_guard`][ros-voxel-guard] | — |
+128: | `/scan` | `sensor_msgs/msg/LaserScan` | [`ros_gz_bridge`][ros-ros-gz-bridge], [`mujoco_sim`][ros-mujoco-sim] | [`cleany_dev_monitor`][ros-cleany-dev-monitor], [`reactive_guard`][ros-reactive-guard], [`obstacle_memory`][ros-obstacle-memory] | — |
+129: | `/scan_matched_points2` | `sensor_msgs/msg/PointCloud2` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+130: | `/simulation/contact_diagnostics` | `diagnostic_msgs/msg/DiagnosticArray` | [`SortingObserver`][ros-sortingobserver] | — | MuJoCo 전용; publish_contacts=true |
+131: | `/simulation/sorting_ground_truth` | `visualization_msgs/msg/MarkerArray` | [`SortingObserver`][ros-sortingobserver] | [`simulation_placement_verifier`][ros-simulation-placement-verifier] | MuJoCo 전용 |
+132: | `/sorting/status` | `std_msgs/msg/String` | [`sorting_coordinator`][ros-sorting-coordinator] | — | — |
+133: | `/submap_list` | `cartographer_ros_msgs/msg/SubmapList` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+134: | `/tf` | `tf2_msgs/msg/TFMessage` | [`base_odom_relay`][ros-base-odom-relay], [`gazebo_odom_tf_publisher`][ros-gazebo-odom-tf-publisher], [`gazebo_pan_tf_publisher`][ros-gazebo-pan-tf-publisher], [`mujoco_sim`][ros-mujoco-sim], [`robot_state_publisher`][ros-robot-state-publisher] | [`cleany_dev_monitor`][ros-cleany-dev-monitor], [`grasp_server`][ros-grasp-server], [`mission_runtime`][ros-mission-runtime], [`depth_clearance`][ros-depth-clearance], [`depth_coverage`][ros-depth-coverage], [`reactive_guard`][ros-reactive-guard], [`obstacle_memory`][ros-obstacle-memory], [`voxel_guard`][ros-voxel-guard], [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | — |
+135: | `/tf_static` | `tf2_msgs/msg/TFMessage` | [`gazebo_sensor_tf_publisher`][ros-gazebo-sensor-tf-publisher], [`mujoco_sim`][ros-mujoco-sim], [`robot_state_publisher`][ros-robot-state-publisher] | [`cleany_dev_monitor`][ros-cleany-dev-monitor], [`grasp_server`][ros-grasp-server], [`mission_runtime`][ros-mission-runtime], [`depth_clearance`][ros-depth-clearance], [`depth_coverage`][ros-depth-coverage], [`reactive_guard`][ros-reactive-guard], [`obstacle_memory`][ros-obstacle-memory], [`voxel_guard`][ros-voxel-guard], [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | — |
+136: | `/trajectory_node_list` | `visualization_msgs/msg/MarkerArray` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+137: | `/wheel/odom` | `nav_msgs/msg/Odometry` | [`wheel_odometry`][ros-wheel-odometry], [`simulated_odometry_error`][ros-simulated-odometry-error] | [`base_odom_relay`][ros-base-odom-relay], [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+138: | `/wheel/odom_raw` | `nav_msgs/msg/Odometry` | — | [`simulated_odometry_error`][ros-simulated-odometry-error] | — |
+139: | `/wheel_encoder/joint_states` | `sensor_msgs/msg/JointState` | [`simulated_encoder`][ros-simulated-encoder] | — | — |
+140: | `<사용자 선택 / camera / recording 토픽>` | `discovery 타입` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | 실행 graph에서 타입 확인 |
+141: 
+142: ### Action 목록
+143: 
+144: | 기본 이름 (root namespace) | ROS 타입 | Server | Client | 조건 / 연결 |
+145: |---|---|---|---|---|
+146: | `/execute_trajectory` | `moveit_msgs/action/ExecuteTrajectory` | [`move_group`][ros-move-group] | [`single_pose_handeye_orchestrator`][ros-single-pose-handeye-orchestrator], [`multi_pose_handeye_orchestrator`][ros-multi-pose-handeye-orchestrator], [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | — |
+147: | `/grasp/select_reachable` | `cleany_interfaces/action/SelectReachableGrasp` | [`grasp_selection_server`][ros-grasp-selection-server] | [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | 도달성 검사; controller 실행 없음 |
+148: | `/left_arm_controller/follow_joint_trajectory` | `control_msgs/action/FollowJointTrajectory` | [`left_arm_controller`][ros-left-arm-controller] | [`move_group`][ros-move-group] | MoveIt이 호출하는 외부 controller |
+149: | `/left_gripper_controller/follow_joint_trajectory` | `control_msgs/action/FollowJointTrajectory` | [`left_gripper_controller`][ros-left-gripper-controller] | [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | ros2_control backend 구성 필요 |
+150: | `/mock/manipulation/execute_skill` | `cleany_interfaces/action/ExecuteManipulationSkill` | — | [`mission_runtime`][ros-mission-runtime] | action_mock 전용; 외부 server 별도 필요 |
+151: | `/move_action` | `moveit_msgs/action/MoveGroup` | [`move_group`][ros-move-group] | [`single_pose_handeye_orchestrator`][ros-single-pose-handeye-orchestrator], [`multi_pose_handeye_orchestrator`][ros-multi-pose-handeye-orchestrator], [`grasp_selection_server`][ros-grasp-selection-server], [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | grasp_selection_server는 plan-only |
+152: | `/navigate_to_pose` | `nav2_msgs/action/NavigateToPose` | [`bt_navigator`][ros-bt-navigator] | [`mission_runtime`][ros-mission-runtime] | 외부 Nav2; navigation_backend=nav2 |
+153: | `/perception/inspect_scene` | `cleany_interfaces/action/InspectScene` | [`perception_inspector`][ros-perception-inspector] | [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | — |
+154: | `/right_arm_controller/follow_joint_trajectory` | `control_msgs/action/FollowJointTrajectory` | [`right_arm_controller`][ros-right-arm-controller] | [`move_group`][ros-move-group] | MoveIt이 호출하는 외부 controller |
+155: | `/right_gripper_controller/follow_joint_trajectory` | `control_msgs/action/FollowJointTrajectory` | [`right_gripper_controller`][ros-right-gripper-controller] | [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | ros2_control backend 구성 필요 |
+156: 
+157: ### Service 목록
+158: 
+159: | 기본 이름 (root namespace) | ROS 타입 | Server | Client | 조건 / 연결 |
+160: |---|---|---|---|---|
+161: | `/apply_planning_scene` | `moveit_msgs/srv/ApplyPlanningScene` | [`move_group`][ros-move-group] | [`collision_scene_applier`][ros-collision-scene-applier], [`grasp_selection_server`][ros-grasp-selection-server], [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | — |
+162: | `/base/enable` | `std_srvs/srv/SetBool` | [`cleany_base_driver`][ros-cleany-base-driver] | — | — |
+163: | `/check_state_validity` | `moveit_msgs/srv/GetStateValidity` | [`move_group`][ros-move-group] | [`single_pose_handeye_orchestrator`][ros-single-pose-handeye-orchestrator], [`multi_pose_handeye_orchestrator`][ros-multi-pose-handeye-orchestrator], [`grasp_selection_server`][ros-grasp-selection-server], [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | — |
+164: | `/compute_fk` | `moveit_msgs/srv/GetPositionFK` | [`move_group`][ros-move-group] | [`single_pose_handeye_orchestrator`][ros-single-pose-handeye-orchestrator], [`multi_pose_handeye_orchestrator`][ros-multi-pose-handeye-orchestrator], [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator], [`grasp_selection_server`][ros-grasp-selection-server] | — |
+165: | `/compute_ik` | `moveit_msgs/srv/GetPositionIK` | [`move_group`][ros-move-group] | [`single_pose_handeye_orchestrator`][ros-single-pose-handeye-orchestrator], [`multi_pose_handeye_orchestrator`][ros-multi-pose-handeye-orchestrator], [`grasp_selection_server`][ros-grasp-selection-server], [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | — |
+166: | `/get_planning_scene` | `moveit_msgs/srv/GetPlanningScene` | [`move_group`][ros-move-group] | [`single_pose_handeye_orchestrator`][ros-single-pose-handeye-orchestrator], [`multi_pose_handeye_orchestrator`][ros-multi-pose-handeye-orchestrator], [`grasp_selection_server`][ros-grasp-selection-server], [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | — |
+167: | `/grasp/plan` | `cleany_interfaces/srv/PlanGrasp` | [`grasp_server`][ros-grasp-server] | [`nearest_pregrasp_coordinator`][ros-nearest-pregrasp-coordinator], [`sorting_coordinator`][ros-sorting-coordinator] | — |
+168: | `/grasp/prepare_window` | `std_srvs/srv/SetBool` | [`grasp_server`][ros-grasp-server] | `perception_inspector` | AnyGrasp 준비 뒤 cuRobo 예열; `vlm_anygrasp_prepare_service` |
+169: | `/handeye/cancel_run` | `std_srvs/srv/Trigger` | [`multi_pose_handeye_orchestrator`][ros-multi-pose-handeye-orchestrator] | — | — |
+170: | `/mission/cancel` | `cleany_interfaces/srv/CancelMission` | [`mission_runtime`][ros-mission-runtime] | [`control_bridge`][ros-control-bridge] | — |
+171: | `/mission/offer` | `cleany_interfaces/srv/OfferMission` | [`mission_runtime`][ros-mission-runtime] | [`control_bridge`][ros-control-bridge] | — |
+172: | `/mission/reset_error` | `std_srvs/srv/Trigger` | [`mission_runtime`][ros-mission-runtime] | — | — |
+173: | `/mission/snapshot` | `cleany_interfaces/srv/GetRuntimeSnapshot` | [`mission_runtime`][ros-mission-runtime] | [`control_bridge`][ros-control-bridge] | — |
+174: | `/mock/drop_next_enable` | `std_srvs/srv/Trigger` | [`mock_base_mcu`][ros-mock-base-mcu] | — | — |
+175: | `/mock/force_disarm` | `std_srvs/srv/Trigger` | [`mock_base_mcu`][ros-mock-base-mcu] | — | — |
+176: | `/mock/manipulation/execute_skill/_action/cancel_goal` | `action_msgs/srv/CancelGoal` | — | [`mission_runtime`][ros-mission-runtime] | action_mock 전용; 외부 server 별도 필요 |
+177: | `/mock/manipulation/get_execution` | `cleany_interfaces/srv/GetManipulationExecution` | — | [`mission_runtime`][ros-mission-runtime] | action_mock 전용; 외부 server 별도 필요 |
+178: | `/mock/reboot` | `std_srvs/srv/Trigger` | [`mock_base_mcu`][ros-mock-base-mcu] | — | — |
+179: | `/mock/transport` | `std_srvs/srv/SetBool` | [`mock_base_mcu`][ros-mock-base-mcu] | — | — |
+180: | `/navigate_to_pose/_action/cancel_goal` | `action_msgs/srv/CancelGoal` | [`bt_navigator`][ros-bt-navigator] | [`mission_runtime`][ros-mission-runtime] | — |
+181: | `/obstacle_memory/save` | `std_srvs/srv/Trigger` | [`obstacle_memory`][ros-obstacle-memory] | — | — |
+182: | `/obstacle_memory/set_enabled` | `std_srvs/srv/SetBool` | [`obstacle_memory`][ros-obstacle-memory] | — | — |
+183: | `/perception/observe_wrist_target` | `cleany_interfaces/srv/ObserveWristTarget` | [`perception_inspector`][ros-perception-inspector] | [`sorting_coordinator`][ros-sorting-coordinator] | enable_wrist_observation=true |
+184: | `/sorting/verify_placement` | `cleany_interfaces/srv/VerifyPlacement` | [`simulation_placement_verifier`][ros-simulation-placement-verifier] | [`sorting_coordinator`][ros-sorting-coordinator] | 현재 server는 시뮬레이션 전용; 실물은 독립 센서 제공자 필요 |
+185: | `/sorting_cameras/set_parameters` | `rcl_interfaces/srv/SetParameters` | [`sorting_cameras`][ros-sorting-cameras] | [`sorting_coordinator`][ros-sorting-coordinator] | MuJoCo 카메라 선택; 명시적으로 호출하는 parameter 서비스 |
+186: | `/submap_query` | `cartographer_ros_msgs/srv/SubmapQuery` | — | [`cleany_dev_monitor`][ros-cleany-dev-monitor] | — |
+
+302: ## 외부 노드와 타입만 있는 계약
+303: 
+304: | 경계 | 연결 위치와 현재 상태 |
+305: |---|---|
+306: | Gazebo `ros_gz_bridge` | [Bridge 표](../ros2_ws/src/cleany_gazebo_sim/docs/interfaces.md#ros_gz_bridge). ROS/Gazebo sensor와 명령 변환 |
+307: | Nav2 / AMCL / Collision Monitor | [Navigation launch](../ros2_ws/src/cleany_navigation/launch/navigation.launch.py)와 [설정](../ros2_ws/src/cleany_navigation/config)이 조합을 선택. Mission이 호출하는 action/lifecycle 서비스는 Mission 노드 표에 포함 |
+308: | MoveIt `move_group` | `/compute_ik`, `/compute_fk`, `/check_state_validity`, `/get_planning_scene`, `/apply_planning_scene`, `/move_action`, `/execute_trajectory`를 이용. 자체 호출 노드 표와 [Planning 계약](../ros2_ws/src/cleany_moveit_config/docs/planning.md)에서 연결 확인 |
+309: | ros2_control | Arm/gripper의 FollowJointTrajectory와 joint_state_broadcaster. [Controller 설정](../ros2_ws/src/cleany_moveit_config/config/mock_ros2_controllers.yaml)과 [MuJoCo backend launch](../ros2_ws/src/cleany_mujoco_sim/launch/study_cafe_backend.launch.py)이 선택 |
+310: | `robot_state_publisher` | `joint_states` 구독, `/tf`, `/tf_static` 발행. URDF와 [모델 계약](../ros2_ws/src/cleany_description/docs/model.md)이 frame 의미를 관리 |
+311: | `InspectScene` | `perception_inspector`가 `perception/inspect_scene`을 제공. [Perception API](../ros2_ws/src/cleany_perception/docs/runtime.md#ros-api) |
+312: | `ExecuteManipulationSkill` | Runtime의 action client와 [타입](../ros2_ws/src/cleany_interfaces/action/ExecuteManipulationSkill.action)은 존재. 기본 mock는 process 내부 구현이며 `action_mock`은 선택형 Python Mock 서버에 연결 |
+313: 
+314: 위 표는 외부 패키지의 연결 경계다. 외부 패키지의 전체 API 목록은 해당 패키지 문서와 실행 graph를 기준으로 확인한다. RViz, rqt, controller spawner와 검증용 probe 노드는 실행 보조 도구이며 자체 제품 endpoint 목록에 포함하지 않는다.
+315: 

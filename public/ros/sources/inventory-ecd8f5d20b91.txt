@@ -1,0 +1,190 @@
+ros2_ws/src/cleany_robot_interface/cleany_robot_interface/wrist_rgb_camera.py
+Review: 2026-11-01
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 370465887b06826d5dfea0eab3a410b39a07f4d86e5f34040ff9b8a9055dcede
+
+1: """Publish rectified USB wrist RGB using the existing intrinsic calibration."""
+2: from __future__ import annotations
+3: 
+4: from copy import deepcopy
+5: import json
+6: import math
+7: from pathlib import Path
+8: import time
+9: 
+10: import cv2
+11: import numpy as np
+12: import rclpy
+13: from rclpy.node import Node
+14: from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+15: from sensor_msgs.msg import CameraInfo, CompressedImage, Image
+16: from std_msgs.msg import Bool
+17: from std_srvs.srv import SetBool
+18: 
+19: 
+20: def load_camera_profile(config_file: Path, repository_root: Path) -> tuple[dict, dict]:
+21:     def resolve(raw: str) -> Path:
+22:         path = Path(raw).expanduser()
+23:         return path if path.is_absolute() else repository_root / path
+24:     config = json.loads(config_file.read_text())
+25:     if config['arm'] not in ('left', 'right') or config['frame_id'] != config['arm'] + '_wrist_rgb_optical_frame':
+26:         raise ValueError('Wrist camera arm/frame mismatch')
+27:     camera = json.loads(resolve(config['camera_config']).read_text())
+28:     calibration = json.loads(resolve(config['calibration_config']).read_text())
+29:     path = resolve(calibration['intrinsics_file'])
+30:     intrinsic = json.loads(path.read_text())
+31:     source = json.loads((path.parent / 'manifest.json').read_text())['config']
+32:     for key in ('camera_device', 'width', 'height'):
+33:         if source[key] != camera[key]:
+34:             raise ValueError('Wrist calibration mismatch: ' + key)
+35:     if (intrinsic['width'], intrinsic['height']) != (camera['width'], camera['height']):
+36:         raise ValueError('Wrist calibration image dimensions mismatch')
+37:     rate = config['publish_rate_hz']
+38:     if not math.isfinite(rate) or not 0 < rate <= 30:
+39:         raise ValueError('Wrist publish rate must be in (0, 30] Hz')
+40:     return {**config, **camera}, intrinsic
+41: 
+42: 
+43: class WristRgbCamera(Node):
+44:     def __init__(self, **kwargs):
+45:         super().__init__('wrist_rgb_camera', **kwargs)
+46:         self.declare_parameter('repository_root', '')
+47:         self.declare_parameter('config_file', '')
+48:         self.declare_parameter('start_enabled', False)
+49:         self.declare_parameter('preview_rate_hz', 5.0)
+50:         self.declare_parameter('preview_jpeg_quality', 75)
+51:         self.config, intrinsic = load_camera_profile(
+52:             Path(self.get_parameter('config_file').value),
+53:             Path(self.get_parameter('repository_root').value))
+54:         width, height = self.config['width'], self.config['height']
+55:         self.preview_rate = float(self.get_parameter('preview_rate_hz').value)
+56:         self.preview_quality = self.get_parameter('preview_jpeg_quality').value
+57:         if not math.isfinite(self.preview_rate) or not 0 < self.preview_rate <= 30:
+58:             raise ValueError('Preview rate must be in (0, 30] Hz')
+59:         self.preview_rate = min(self.preview_rate, self.config['publish_rate_hz'])
+60:         if type(self.preview_quality) is not int or not 1 <= self.preview_quality <= 100:
+61:             raise ValueError('Preview JPEG quality must be an integer in [1, 100]')
+62:         self.next_preview_at = 0.0
+63:         matrix = np.asarray(intrinsic['K'], dtype=float).reshape(3, 3)
+64:         distortion = np.asarray(intrinsic['D'], dtype=float).ravel()
+65:         if (not np.isfinite(matrix).all() or not np.isfinite(distortion).all()
+66:                 or matrix[0, 0] <= 0 or matrix[1, 1] <= 0):
+67:             raise ValueError('Invalid wrist camera intrinsics')
+68:         self.maps = cv2.initUndistortRectifyMap(
+69:             matrix, distortion, None, matrix, (width, height), cv2.CV_32FC1)
+70:         self.info = CameraInfo(width=width, height=height, distortion_model='plumb_bob',
+71:             d=[0.] * 5, k=matrix.ravel().tolist(), r=np.eye(3).ravel().tolist(),
+72:             p=np.column_stack((matrix, np.zeros(3))).ravel().tolist())
+73:         topic = '/' + self.config['arm'] + '_wrist_camera'
+74:         self.images = self.create_publisher(Image, topic + '/image_raw', qos_profile_sensor_data)
+75:         self.infos = self.create_publisher(CameraInfo, topic + '/camera_info', qos_profile_sensor_data)
+76:         self.previews = self.create_publisher(
+77:             CompressedImage, topic + '/preview/compressed', qos_profile_sensor_data)
+78:         self.camera = None
+79:         self.enabled_state = self.create_publisher(Bool, topic + '/enabled', QoSProfile(
+80:             depth=1, reliability=ReliabilityPolicy.RELIABLE,
+81:             durability=DurabilityPolicy.TRANSIENT_LOCAL))
+82:         self.state_timer = self.create_timer(1.0, self.publish_enabled)
+83:         self.publish_enabled()
+84:         self.enable_service = self.create_service(SetBool, topic + '/set_enabled', self.set_enabled)
+85:         self.timer = self.create_timer(1. / self.config['publish_rate_hz'], self.publish_frame)
+86:         if self.get_parameter('start_enabled').value:
+87:             self.open_camera()
+88: 
+89:     def open_camera(self) -> None:
+90:         if self.camera is not None:
+91:             return
+92:         camera = cv2.VideoCapture(self.config['camera_device'], cv2.CAP_V4L2)
+93:         try:
+94:             if not camera.isOpened():
+95:                 raise RuntimeError('Cannot open configured wrist USB camera')
+96:             camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.config['width'])
+97:             camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config['height'])
+98:             camera.set(cv2.CAP_PROP_FPS, self.config['publish_rate_hz'])
+99:             camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+100:         except Exception:
+101:             camera.release()
+102:             raise
+103:         self.camera = camera
+104:         self.publish_enabled()
+105:         self.get_logger().info(f"Wrist camera enabled: {self.config['arm']}")
+106: 
+107:     def close_camera(self) -> None:
+108:         if self.camera is not None:
+109:             self.camera.release()
+110:             self.camera = None
+111:             self.next_preview_at = 0.0
+112:             self.publish_enabled()
+113:             self.get_logger().info(f"Wrist camera disabled: {self.config['arm']}")
+114: 
+115:     def set_enabled(self, request: SetBool.Request, response: SetBool.Response) -> SetBool.Response:
+116:         try:
+117:             if request.data:
+118:                 self.open_camera()
+119:             else:
+120:                 self.close_camera()
+121:         except Exception as error:
+122:             response.success, response.message = False, str(error)
+123:         else:
+124:             response.success = True
+125:             response.message = 'Wrist camera enabled' if self.camera is not None else 'Wrist camera disabled'
+126:         self.publish_enabled()
+127:         return response
+128: 
+129:     def publish_enabled(self) -> None:
+130:         """Capture ownership, including an idle heartbeat; not proof of valid frames."""
+131:         if self.context.ok():
+132:             self.enabled_state.publish(Bool(data=self.camera is not None))
+133: 
+134:     def publish_frame(self) -> None:
+135:         if self.camera is None:
+136:             return
+137:         # USB driver supplies no exposure timestamp here: stamp host acquisition.
+138:         ok, frame = self.camera.read()
+139:         expected = (self.config['height'], self.config['width'], 3)
+140:         if not ok or frame.shape != expected:
+141:             self.get_logger().error('Missing wrist RGB or unexpected image dimensions')
+142:             return
+143:         stamp = self.get_clock().now().to_msg()
+144:         rectified = cv2.remap(frame, *self.maps, interpolation=cv2.INTER_LINEAR)
+145:         message = Image(height=expected[0], width=expected[1], encoding='bgr8',
+146:                         step=expected[1] * 3, data=rectified.tobytes())
+147:         message.header.stamp, message.header.frame_id = stamp, self.config['frame_id']
+148:         info = deepcopy(self.info)
+149:         info.header = deepcopy(message.header)
+150:         self.images.publish(message)
+151:         self.infos.publish(info)
+152:         now = time.monotonic()
+153:         if self.previews.get_subscription_count() and now >= self.next_preview_at:
+154:             period = 1. / self.preview_rate
+155:             if not self.next_preview_at or now - self.next_preview_at >= period:
+156:                 self.next_preview_at = now + period
+157:             else:
+158:                 self.next_preview_at += period
+159:             encoded, jpeg = cv2.imencode(
+160:                 '.jpg', rectified, [cv2.IMWRITE_JPEG_QUALITY, self.preview_quality])
+161:             if encoded:
+162:                 preview = CompressedImage(
+163:                     header=deepcopy(message.header), format='bgr8; jpeg compressed bgr8',
+164:                     data=jpeg.tobytes())
+165:                 self.previews.publish(preview)
+166:             else:
+167:                 self.get_logger().error('Wrist preview JPEG encoding failed')
+168: 
+169:     def destroy_node(self):
+170:         self.close_camera()
+171:         return super().destroy_node()
+172: 
+173: 
+174: def main(args=None):
+175:     rclpy.init(args=args)
+176:     node = None
+177:     try:
+178:         node = WristRgbCamera()
+179:         rclpy.spin(node)
+180:     except KeyboardInterrupt:
+181:         pass
+182:     finally:
+183:         if node is not None:
+184:             node.destroy_node()
+185:         rclpy.try_shutdown()

@@ -1,0 +1,267 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/manipulation_node.py
+Review: 2026-11-01
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 72d692170ac0242f948c226444149bef0872f731fb5d3a6808d5af02eeba1aa6
+
+1: """ROS Action/Service wrapper for the mock manipulation execution core."""
+2: 
+3: from __future__ import annotations
+4: 
+5: from dataclasses import asdict, fields
+6: from pathlib import Path
+7: 
+8: from ament_index_python.packages import get_package_share_directory
+9: from action_msgs.srv import CancelGoal
+10: from cleany_interfaces.action import ExecuteManipulationSkill
+11: from cleany_interfaces.msg import ManipulationExecutionRecord
+12: from cleany_interfaces.srv import CancelManipulation, GetManipulationExecution
+13: import rclpy
+14: from rclpy.action import ActionServer, CancelResponse, GoalResponse
+15: from rclpy.callback_groups import ReentrantCallbackGroup
+16: from rclpy.clock import Clock, ClockType
+17: from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
+18: from rclpy.node import Node
+19: from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+20: from rclpy.task import Future
+21: 
+22: from .manipulation.core import ExecutionCore
+23: from .manipulation.mock import MockAdapter, MockConfig
+24: from .manipulation.models import Goal, Record, Stage, Status, resolve_cancel_mode
+25: from .manipulation.store import ExecutionStore, StoreError, default_database_path
+26: 
+27: 
+28: def goal_from_message(message: ExecuteManipulationSkill.Goal) -> Goal:
+29:     return Goal(**{field.name: getattr(message, field.name) for field in fields(Goal)})
+30: 
+31: 
+32: def result_message(record: Record) -> ExecuteManipulationSkill.Result:
+33:     return ExecuteManipulationSkill.Result(**asdict(record.result))
+34: 
+35: 
+36: def record_message(record: Record) -> ManipulationExecutionRecord:
+37:     values = asdict(record.goal)
+38:     values.update({field.name: getattr(record, field.name) for field in fields(Record)
+39:                    if field.name not in ('goal', 'result')})
+40:     if record.result is not None:
+41:         values.update(asdict(record.result))
+42:     values['has_result'] = record.result is not None
+43:     return ManipulationExecutionRecord(**values)
+44: 
+45: 
+46: class ManipulationNode(Node):
+47:     """Generate Mock manipulation evidence for one active execution.
+48: 
+49:     Actions:
+50:         manipulation/execute_skill (ExecuteManipulationSkill): Single-object
+51:             execution server; remapping also applies to the cancel client.
+52: 
+53:     Services:
+54:         manipulation/get_execution (GetManipulationExecution): Latest execution
+55:             evidence, including history loaded at startup.
+56:         manipulation/cancel (CancelManipulation): Forward a selected mode to
+57:             the exact active ROS Goal UUID through its CancelGoal service.
+58: 
+59:     Publishers:
+60:         manipulation/execution_events (ManipulationExecutionRecord): Changed
+61:             records; reliable, transient-local, depth 100.
+62: 
+63:     Notes:
+64:         Names are relative defaults. Steady-clock ticks do not depend on /clock.
+65:         Records use wall timestamps. No physical commands or TF are published.
+66:     """
+67: 
+68:     def __init__(self, **kwargs) -> None:
+69:         super().__init__('manipulation_server', **kwargs)
+70:         self.declare_parameter('backend', 'mock')
+71:         self.declare_parameter('database_path', default_database_path())
+72:         self.declare_parameter('mock_config', str(Path(get_package_share_directory(
+73:             'cleany_skill_executor')) / 'config/manipulation_mock.yaml'))
+74:         self.declare_parameter('scenario', 'success')
+75:         if self.get_parameter('backend').value != 'mock':
+76:             raise ValueError('This server supports only backend=mock')
+77:         config = MockConfig.load(self.get_parameter('mock_config').value)
+78:         port = MockAdapter(config, self.get_parameter('scenario').value)
+79:         self.store = ExecutionStore(self.get_parameter('database_path').value)
+80:         try:
+81:             self.core = ExecutionCore(port, self.store, config.timeout)
+82:         except Exception:
+83:             self.store.close()
+84:             raise
+85:         self._handle = None
+86:         self._closing = False
+87:         self._result_future: Future | None = None
+88:         self._futures: dict[str, Future] = {}
+89:         group = ReentrantCallbackGroup()
+90:         self._events = self.create_publisher(
+91:             ManipulationExecutionRecord, 'manipulation/execution_events',
+92:             QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE,
+93:                        durability=DurabilityPolicy.TRANSIENT_LOCAL))
+94:         self._service = self.create_service(GetManipulationExecution,
+95:                                             'manipulation/get_execution', self._get,
+96:                                             callback_group=group)
+97:         action_name = self.resolve_topic_name('manipulation/execute_skill')
+98:         self._action = ActionServer(
+99:             self, ExecuteManipulationSkill, action_name,
+100:             execute_callback=self._execute, goal_callback=self._goal,
+101:             handle_accepted_callback=self._accepted, cancel_callback=self._cancel,
+102:             callback_group=group)
+103:         self._setup_cancel_service(group, action_name)
+104:         # Steady clock also works when ROS use_sim_time is paused or unset.
+105:         self._timer = self.create_timer(0.05, self._tick, callback_group=group,
+106:                                        clock=Clock(clock_type=ClockType.STEADY_TIME))
+107:         self._publish_events()
+108:         self.get_logger().info(f'Mock manipulation ready; database={self.store.path}; '
+109:                                f'inhibited={self.core.inhibited}')
+110: 
+111:     def _goal(self, request) -> GoalResponse:
+112:         with self.core.lock:
+113:             if self._closing or self._handle is not None:
+114:                 return GoalResponse.REJECT
+115:             accepted, reason = self.core.accept(goal_from_message(request))
+116:             if not accepted:
+117:                 self.get_logger().warning(f'Goal rejected: {reason}')
+118:             return GoalResponse.ACCEPT if accepted else GoalResponse.REJECT
+119: 
+120:     def _accepted(self, handle) -> None:
+121:         with self.core.lock:
+122:             self._handle = handle
+123:             self._result_future = Future(executor=self.executor)
+124:             self._futures[handle.request.execution_id] = self._result_future
+125:             handle.execute()
+126: 
+127:     async def _execute(self, handle) -> ExecuteManipulationSkill.Result:
+128:         # Suspending a coroutine leaves executor threads free for cancels/timers.
+129:         with self.core.lock:
+130:             future = self._futures[handle.request.execution_id]
+131:         try:
+132:             return await future
+133:         finally:
+134:             with self.core.lock:
+135:                 self._futures.pop(handle.request.execution_id, None)
+136: 
+137:     def _cancel(self, handle) -> CancelResponse:
+138:         with self.core.lock:
+139:             execution_id = handle.request.execution_id
+140:             mode = self._cancel_modes.pop(execution_id, None)
+141:             accepted = self.core.request_cancel(execution_id, mode)
+142:             return CancelResponse.ACCEPT if accepted else CancelResponse.REJECT
+143: 
+144:     def _setup_cancel_service(self, group: ReentrantCallbackGroup,
+145:                               action_name: str | None = None) -> None:
+146:         action_name = action_name or self.resolve_topic_name('manipulation/execute_skill')
+147:         self._cancel_modes: dict[str, str] = {}
+148:         self._cancel_client = self.create_client(
+149:             CancelGoal, action_name + '/_action/cancel_goal', callback_group=group)
+150:         self._cancel_service = self.create_service(
+151:             CancelManipulation, 'manipulation/cancel', self._request_cancel, callback_group=group)
+152: 
+153:     async def _request_cancel(self, request: CancelManipulation.Request,
+154:                               response: CancelManipulation.Response) -> CancelManipulation.Response:
+155:         # Forward through the standard Action service so the goal really enters
+156:         # CANCELING before we report its terminal ROS status. Never set that
+157:         # state through rclpy's private GoalHandle API.
+158:         with self.core.lock:
+159:             handle, record = self._handle, self.core.record
+160:             if (handle is None or record is None or record.result is not None
+161:                     or record.stage == Stage.FINALIZING
+162:                     or record.goal.execution_id != request.execution_id):
+163:                 response.message = 'No matching active execution'
+164:                 return response
+165:             try:
+166:                 mode = resolve_cancel_mode(
+167:                     record.cancel_mode or self._cancel_modes.get(request.execution_id, ''), request.mode)
+168:             except ValueError as error:
+169:                 response.message = str(error)
+170:                 return response
+171:             if handle.is_cancel_requested:
+172:                 response.accepted = self.core.request_cancel(request.execution_id, mode)
+173:                 response.message = f'Cancellation mode: {mode.value}'
+174:                 return response
+175:             self._cancel_modes[request.execution_id] = mode.value
+176:             forwarded = CancelGoal.Request()
+177:             forwarded.goal_info.goal_id = handle.goal_id
+178:             future = self._cancel_client.call_async(forwarded)
+179:         reply = await future
+180:         with self.core.lock:
+181:             response.accepted = bool(reply is not None and reply.goals_canceling)
+182:             if not response.accepted and self._handle is handle and handle.is_cancel_requested:
+183:                 # A concurrent request may have performed the ROS transition.
+184:                 response.accepted = self.core.request_cancel(request.execution_id, mode)
+185:             self._cancel_modes.pop(request.execution_id, None)
+186:             response.message = (f'Cancellation mode: {mode.value}' if response.accepted
+187:                                 else 'Action cancellation was rejected')
+188:         return response
+189: 
+190:     def _get(self, request, response):
+191:         with self.core.lock:
+192:             try:
+193:                 record = self.core.get(request.execution_id)
+194:             except StoreError as exc:
+195:                 self.core.inhibited = True
+196:                 self.get_logger().error(f'Execution lookup failed: {exc}')
+197:                 record = None
+198:             response.found = record is not None
+199:             if record is not None:
+200:                 response.record = record_message(record)
+201:         return response
+202: 
+203:     def _publish_events(self) -> None:
+204:         for record in self.core.drain_events():
+205:             self._events.publish(record_message(record))
+206:             if self._handle is not None and record.goal.execution_id == self._handle.request.execution_id:
+207:                 self._handle.publish_feedback(ExecuteManipulationSkill.Feedback(
+208:                     execution_id=record.goal.execution_id, stage=record.stage.value,
+209:                     substage=record.substage,
+210:                     selected_arm=record.selected_arm, message=record.message))
+211: 
+212:     def _tick(self) -> None:
+213:         with self.core.lock:
+214:             if self._closing:
+215:                 return
+216:             if self._handle is not None:
+217:                 self.core.tick()
+218:             self._publish_events()
+219:             record = self.core.record
+220:             if self._handle is None or record.result is None:
+221:                 return
+222:             status = record.result.status
+223:             # rclpy transitions to CANCELING just after our cancel callback returns.
+224:             # Wait for that transition before issuing CANCELED, under the same lock.
+225:             if status == Status.CANCELED and not self._handle.is_cancel_requested:
+226:                 return
+227:             if status in (Status.SUCCESS, Status.BLOCKED):
+228:                 self._handle.succeed()
+229:             elif status == Status.CANCELED:
+230:                 self._handle.canceled()
+231:             else:
+232:                 self._handle.abort()
+233:             self._result_future.set_result(result_message(record))
+234:             self._handle, self._result_future = None, None
+235: 
+236:     def destroy_node(self):
+237:         with self.core.lock:
+238:             self._closing = True
+239:             self._timer.cancel()
+240:             self._action.destroy()
+241:             # Closing cannot race a tick's SQLite write. ACTIVE remains
+242:             # unfinished for recovery; shutdown is not stop evidence.
+243:             self.store.close()
+244:         return super().destroy_node()
+245: 
+246: 
+247: def main(args=None) -> None:
+248:     rclpy.init(args=args)
+249:     node = None
+250:     executor = MultiThreadedExecutor(num_threads=4)
+251:     try:
+252:         node = ManipulationNode()
+253:         executor.add_node(node)
+254:         executor.spin()
+255:     except (KeyboardInterrupt, ExternalShutdownException):
+256:         pass
+257:     finally:
+258:         executor.shutdown()
+259:         if node is not None:
+260:             node.destroy_node()
+261:         if rclpy.ok():
+262:             rclpy.shutdown()

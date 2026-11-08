@@ -1,0 +1,19 @@
+ros2_ws/src/cleany_handeye_calibration/cleany_handeye_calibration/motion_port.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 74dd28945003e41950d10124fc53812a989c3643fe7628ed211aec8d58367628
+
+224:         self._planning_group = planning_group
+225:         self._joint_contract = joint_contract
+226:         self._plan_client = (
+227:             ActionClient(node, MoveGroup, MOVE_GROUP_ACTION_NAME)
+228:             if plan_client is None
+229:             else plan_client
+230:         )
+231:         self._execute_client = (
+232:             ActionClient(
+233:                 node,
+234:                 ExecuteTrajectory,
+235:                 EXECUTE_TRAJECTORY_ACTION_NAME,
+236:             )
+237:             if execute_client is None

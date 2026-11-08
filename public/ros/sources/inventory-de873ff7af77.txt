@@ -1,0 +1,29 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/runtime_readiness.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 1bb7db5537500607aae2cf495a5cec269a42489f52e6fba523469f4ce470a4f1
+
+59: 
+60: class ReadinessProbe(Node):
+61:     def __init__(self, *, gui: bool):
+62:         super().__init__('collection_readiness')
+63:         self.gui = gui
+64:         self.received = {}
+65:         self.feedback_after = None
+66:         self.graph_ready_at = None
+67:         self.guard = None
+68:         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+69:         self.subscriptions_owned = [self.create_subscription(kind, topic,
+70:             lambda message, topic=topic: self.received.__setitem__(topic, time.monotonic()), qos)
+71:             for topic, kind in FEEDBACK.items()]
+72:         self.subscriptions_owned.append(self.create_subscription(
+73:             String, '/real_control/status', self._guard, qos))
+74:         self.parameter_client = self.create_client(GetParameters, '/move_group/get_parameters')
+75:         self.controllers_client = self.create_client(ListControllers, '/controller_manager/list_controllers')
+76:         self.parameter_future = self.controllers_future = None
+77:         self.warmup_client = self.create_client(Trigger, '/grasp/warmup_status')
+78:         self.warmup_future = None
+79:         self.warmup_ready = False
+80:         self.warmup_poll_after = 0.
+81: 
+82:     def _guard(self, message):

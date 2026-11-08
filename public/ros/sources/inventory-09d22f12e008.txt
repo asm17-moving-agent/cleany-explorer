@@ -1,0 +1,18 @@
+ros2_ws/src/cleany_dev_monitor/cleany_dev_monitor/proposal_ros.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: bcc6f1abc9447cd8f78a2de30b3088774934b5832468cae714c06bcfa591cbb7
+
+37:         super().__init__()
+38:         self.store, self.policy = ProposalStore(root), policy
+39:         self.images = deque(maxlen=3)
+40:         self.image_subscription = self.node.create_subscription(Image,
+41:             policy['proposal_debug_image_topic'], self.images.append,
+42:             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+43:         self.lookup = self.node.create_client(GetSceneSnapshot, '/perception/get_scene_snapshot')
+44:         self.target_observation = self.node.create_client(RevalidateTarget, '/perception/revalidate_target')
+45: 
+46:     @staticmethod
+47:     def config():
+48:         path = os.environ.get('CLEANY_MANIPULATION_COLLECTION_CONFIG')
+49:         if not path:

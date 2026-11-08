@@ -1,0 +1,24 @@
+ros2_ws/src/cleany_handeye_calibration/cleany_handeye_calibration/multi_pose_runtime.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 01d44df47993f83615570e1558bd2f8446adf33f210404ddc2cf441987a254e2
+
+317:         response.message = 'calibration run cancellation requested'
+318:         return response
+319: 
+320:     node.create_service(Trigger, '/handeye/cancel_run', cancel_callback)
+321:     ros_executor = MultiThreadedExecutor(num_threads=4)
+322:     ros_executor.add_node(node)
+323:     executor_thread = threading.Thread(
+324:         target=ros_executor.spin,
+325:         name='multi-pose-ros-executor',
+358: def main(args=None) -> None:
+359:     rclpy.init(args=args)
+360:     bootstrap = Node('multi_pose_handeye_config')
+361:     bootstrap.declare_parameter('pose_manifest', '')
+362:     bootstrap.declare_parameter('runtime_config', '')
+363:     pose_manifest = bootstrap.get_parameter(
+364:         'pose_manifest'
+365:     ).get_parameter_value().string_value
+366:     runtime_config = bootstrap.get_parameter(
+367:         'runtime_config'

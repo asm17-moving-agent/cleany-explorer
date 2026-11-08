@@ -1,0 +1,41 @@
+ros2_ws/src/cleany_gazebo_sim/cleany_gazebo_sim/simulated_odometry_error_node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: a3ad5c239b5c4c479a07bc9e989bf389dedd15331d26233939e57d6ca71ae0f0
+
+32:     """
+33: 
+34:     def __init__(self) -> None:
+35:         super().__init__('simulated_odometry_error')
+36:         self.declare_parameter('input_topic', 'wheel/odom_raw')
+37:         self.declare_parameter('output_topic', 'wheel/odom')
+38:         self.declare_parameter('forward_scale', 1.0)
+39:         self.declare_parameter('lateral_scale', 1.0)
+40:         self.declare_parameter('rotation_scale', 1.0)
+41:         self.declare_parameter('forward_noise_stddev_per_sqrt_m', 0.0)
+42:         self.declare_parameter('lateral_noise_stddev_per_sqrt_m', 0.0)
+43:         self.declare_parameter('rotation_noise_stddev_per_sqrt_rad', 0.0)
+44:         self.declare_parameter('yaw_bias_walk_stddev_per_sqrt_m', 0.0)
+45:         self.declare_parameter('max_abs_yaw_bias_rad_per_m', 0.0)
+46:         self.declare_parameter('yaw_drift_rad_per_forward_m', 0.0)
+47:         self.declare_parameter('slip_events_per_second', 0.0)
+48:         self.declare_parameter('slip_duration_min_sec', 0.0)
+49:         self.declare_parameter('slip_duration_max_sec', 0.0)
+50:         self.declare_parameter('slip_gain_min', 1.0)
+51:         self.declare_parameter('slip_gain_max', 1.0)
+52:         self.declare_parameter('random_seed', 42)
+53: 
+54:         self._model = StatefulOdometryError(
+55:             OdometryErrorParameters(
+56:                 forward_scale=self._float_parameter('forward_scale'),
+57:                 lateral_scale=self._float_parameter('lateral_scale'),
+91:         self._slip_active = False
+92:         input_topic = str(self.get_parameter('input_topic').value)
+93:         output_topic = str(self.get_parameter('output_topic').value)
+94:         self._publisher = self.create_publisher(Odometry, output_topic, 10)
+95:         self.create_subscription(Odometry, input_topic, self._on_odometry, 10)
+96: 
+97:     def _float_parameter(self, name: str) -> float:
+98:         return float(self.get_parameter(name).value)
+99: 
+100:     def _on_odometry(self, message: Odometry) -> None:

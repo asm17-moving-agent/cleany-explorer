@@ -1,0 +1,14 @@
+ros2_ws/src/cleany_handeye_calibration/cleany_handeye_calibration/moveit_fk.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: e3f35c90b205d814d6cc3315dfee69f9940e81a1883362e7d8796bcecfd11098
+
+141: 
+142:         self._node = node
+143:         self._client = (
+144:             node.create_client(GetPositionFK, COMPUTE_FK_SERVICE_NAME)
+145:             if client is None
+146:             else client
+147:         )
+148:         self._joint_contract = joint_contract
+149:         self._monotonic = monotonic

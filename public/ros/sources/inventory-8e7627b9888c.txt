@@ -1,0 +1,2100 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/collection_pipeline.py
+Review: 2026-11-01
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: ae6fb3afcced32b5c3674c06069049064da3ead4c95713ba946b0d16f5d06e6e
+
+1: """Explicit physical collection entrypoint. Default invocation audits config only."""
+2: from __future__ import annotations
+3: import argparse
+4: from collections.abc import Callable
+5: from contextlib import contextmanager
+6: from copy import deepcopy
+7: from dataclasses import replace
+8: import json
+9: import math
+10: from pathlib import Path
+11: import threading
+12: import time
+13: from typing import Any
+14: 
+15: import numpy as np
+16: 
+17: import rclpy
+18: from rclpy.action import ActionClient
+19: from rclpy.executors import MultiThreadedExecutor
+20: from cleany_interfaces.action import SelectReachableGrasp
+21: from cleany_interfaces.srv import CheckManipulation
+22: from geometry_msgs.msg import Pose
+23: from sensor_msgs.msg import JointState
+24: from moveit_msgs.msg import (AttachedCollisionObject, CollisionObject, Constraints, MoveItErrorCodes,
+25:                             JointConstraint, PlanningScene, PlanningSceneComponents)
+26: from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath, GetMotionPlan, GetPositionFK, GetPlanningScene
+27: from shape_msgs.msg import SolidPrimitive
+28: from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+29: 
+30: from .core.collection import (RETURN_TO_PICK, PickupReturnPolicy, configuration_issues, load_arm,
+31:                               check_evidence, contact_verification_required,
+32:                               grasp_identity_verification_required, temporary_return_mode)
+33: from .core.cartesian import (
+34:     CartesianPose, bounded_cartesian_step, coordinate_median, estimate_measured_path_pose,
+35:     grasp_capture_metrics, observation_corrected_pose, orientation_error_rad,
+36:     validate_corridor_samples, validate_pose_endpoint, validate_position_endpoint,
+37: )
+38: from .core.physical_grasp_selection import ARM_JOINT_NAMES, JointSolution, PlannedPath, PoseValue
+39: from .core.alignment import rotation_from_quaternion, quaternion_from_rotation
+40: from .core.approach_path import (
+41:     ApproachRoute, CartesianPathUnavailable, approach_detours, validate_detour_samples,
+42: )
+43: from .core.hardware_execution import (
+44:     CollisionValidationError, CommandPathValidationError, JointRangeValidationError,
+45: )
+46: from .core.joint_path import executable_joint_path
+47: from .core.measured_fk_cache import MeasuredFkCache
+48: from .execution_timing import timed_operation
+49: from .core.height_correction import (
+50:     HeightCorrection, HeightCorrectionPolicy, height_correction_enabled,
+51:     validate_height_correctable_endpoint,
+52: )
+53: from .core.recorded_trajectory import (
+54:     descending_height_time, reversed_command_history, validate_command_history,
+55: )
+56: from .core.fixed_jaw_clearance import closing_clearance
+57: from .core.urdf_fk import UrdfChain
+58: from .fixed_jaw_geometry import load_fixed_jaw_bounds, target_box
+59: from .planning_scene import TargetSceneTransaction, collision_pair_is_allowed
+60: from .pregrasp_pipeline import (
+61:     PregraspPipeline, ReferenceObservationFailure, reference_observation_metrics,
+62: )
+63: from .trajectory_io import path_to_message
+64: 
+65: 
+66: def return_hold_mode(config: dict) -> bool:
+67:     return config.get('operation_mode') == 'grasp_lift_return_hold'
+68: 
+69: 
+70: def hold_mode(config: dict) -> bool:
+71:     return config.get('operation_mode') in ('grasp_lift_hold', 'grasp_lift_return_hold')
+72: 
+73: 
+74: def observation_center(observation) -> tuple[float, float, float]:
+75:     return (
+76:         float(observation.observed_center.x),
+77:         float(observation.observed_center.y),
+78:         float(observation.observed_center.z),
+79:     )
+80: 
+81: 
+82: def observation_stamp_ns(observation) -> int:
+83:     return observation.header.stamp.sec*10**9+observation.header.stamp.nanosec
+84: 
+85: 
+86: def observation_extent_ratio(left, right) -> float:
+87:     left_values = (
+88:         float(left.observed_extent.x),
+89:         float(left.observed_extent.y),
+90:         float(left.observed_extent.z),
+91:     )
+92:     right_values = (
+93:         float(right.observed_extent.x),
+94:         float(right.observed_extent.y),
+95:         float(right.observed_extent.z),
+96:     )
+97:     if (not all(math.isfinite(value) and value > 0
+98:                 for value in (*left_values, *right_values))):
+99:         raise RuntimeError('Visual observation extent is invalid')
+100:     return max(
+101:         max(left_value/right_value, right_value/left_value)
+102:         for left_value, right_value in zip(
+103:             left_values, right_values, strict=True)
+104:     )
+105: 
+106: 
+107: class CollectionPipeline(PregraspPipeline):
+108:     """One process owns serial motion ordering; MoveIt only returns plans."""
+109:     def __init__(self, config: dict, **kwargs):
+110:         issues = configuration_issues(config)
+111:         if issues:
+112:             raise ValueError('; '.join(issues))
+113:         super().__init__(mode='hardware', **kwargs)
+114:         if not self.scene_monitor.required:
+115:             raise ValueError('Physical collection requires require_sensor_scene:=true')
+116:         self.config = config
+117:         self._reuse_measured_fk = self.declare_parameter('execution_reuse_measured_fk', True).value
+118:         self._measured_fk_cache = MeasuredFkCache()
+119:         self.evidence = self.create_client(CheckManipulation, '/manipulation/check_evidence')
+120:         self.cartesian = self.create_client(GetCartesianPath, '/compute_cartesian_path')
+121:         self.joint_plan = self.create_client(GetMotionPlan, '/plan_kinematic_path')
+122:         self.fk = self.create_client(GetPositionFK, '/compute_fk')
+123:         self.apply_scene = self.create_client(ApplyPlanningScene, '/apply_planning_scene')
+124:         self.get_scene = self.create_client(GetPlanningScene, '/get_planning_scene')
+125:         self.carrying = None
+126:         self.payload_future = None
+127:         self.payload_request = None
+128:         self.payload_evidence_time = 0.
+129:         self.wrist_reference_id = ''
+130:         self.wrist_request = None
+131:         self.payload_selected = None
+132:         self.releasing = False
+133:         self.events = []
+134:         self.destination = ''
+135:         self.arm_config = None
+136: 
+137:     @property
+138:     def hold_mode(self) -> bool:
+139:         return hold_mode(self.config)
+140: 
+141:     def wrist_observation_required(self) -> bool:
+142:         return bool(self.config.get('wrist_observation_enabled', True))
+143: 
+144:     def head_reobservation_required(self) -> bool:
+145:         return not self.config.get('assume_stationary_target', False)
+146: 
+147:     def execute_pregrasp(self, selected):
+148:         if self.config.get('pregrasp_motion_enabled', True):
+149:             return super().execute_pregrasp(selected)
+150:         # Opening the jaw is still required before entering the grasp pose.
+151:         # Do not reuse the selected current->pregrasp or pregrasp->grasp path.
+152:         self.scene_monitor.wait()
+153:         arm = selected.selected_arm
+154:         width = min(self.arm_config.width, float(selected.selected_candidate.required_opening_m)
+155:                     + self.config['pregrasp_opening_margin_m'])
+156:         opening = self.arm_config.opening(width)
+157:         self.jaw(arm, opening, 'open_before_direct_grasp',
+158:                  check_collisions=self.config.get('gripper_opening_collision_check_enabled', True))
+159:         self.motion.set_gripper_position(arm, opening)
+160:         self.event('pregrasp_motion_skipped', arm=arm)
+161:         state = self.real.monitor()
+162:         return state.header.stamp.sec * 10**9 + state.header.stamp.nanosec
+163: 
+164:     def confirm_wrist_target(self, report: dict, step: int) -> dict:
+165:         """Confirm the fixed head-camera target from a fresh wrist RGB frame."""
+166:         if self.wrist_request is None or not self.wrist_reference_id:
+167:             raise RuntimeError('Wrist target handoff is unavailable')
+168:         request = deepcopy(self.wrist_request)
+169:         request.operation = request.CHECK
+170:         request.reference_id = self.wrist_reference_id
+171:         response = self.call(self.wrist, request, 60.)
+172:         if (response.reference_id != self.wrist_reference_id
+173:                 or response.source_snapshot_id != request.source_snapshot_id
+174:                 or response.source_object_id != request.source_object_id):
+175:             raise RuntimeError('Wrist tracking returned a different target identity')
+176:         stamp = response.header.stamp.sec*10**9+response.header.stamp.nanosec
+177:         if stamp <= request.after_stamp_ns:
+178:             raise RuntimeError('Wrist tracking did not advance during head-camera occlusion')
+179:         self.wrist_request.after_stamp_ns = stamp
+180:         report['wrist_checks'] = int(report.get('wrist_checks', 0))+1
+181:         result = {
+182:             'reference_id': response.reference_id,
+183:             'stamp_ns': stamp,
+184:             'source_snapshot_id': response.source_snapshot_id,
+185:             'source_object_id': response.source_object_id,
+186:         }
+187:         self.event('visual_wrist_occlusion_confirmed', step=step, **result)
+188:         return result
+189: 
+190:     def target_translation_limit(self) -> float:
+191:         if self.config.get('visual_servo_enabled', False):
+192:             return float(self.config['visual_servo_maximum_correction_m'])
+193:         return super().target_translation_limit()
+194: 
+195:     def validate_target_translation(self, selected, before, after,
+196:                                     displacement: float, report: dict) -> None:
+197:         if not self.config.get('visual_servo_enabled', False):
+198:             return super().validate_target_translation(
+199:                 selected, before, after, displacement, report)
+200:         if displacement > self.target_translation_limit():
+201:             # Do not stop on a single head-camera surface centroid.  The visual
+202:             # approach will recapture it and either reject a confirmed move or
+203:             # finish from the last stable target once the TCP is in the grasp
+204:             # capture corridor.
+205:             self.event(
+206:                 'visual_target_translation_deferred',
+207:                 measured_translation_m=displacement,
+208:                 soft_limit_m=self.target_translation_limit(),
+209:             )
+210: 
+211:     def monitor_payload(self):
+212:         if not contact_verification_required(self.config):
+213:             return
+214:         if self.carrying is None or self.releasing:
+215:             return
+216:         from .core.gripper_contact import ContactState
+217:         decision = self.real.contact_decision(self.payload_selected.selected_arm)
+218:         if decision.state == ContactState.CONTACT:
+219:             self.payload_evidence_time = time.monotonic()
+220:         elif decision.state == ContactState.EMPTY:
+221:             raise RuntimeError('Held-object motor contact was lost')
+222:         if time.monotonic()-self.payload_evidence_time > self.config['evidence_max_age_sec']:
+223:             raise RuntimeError('Held-object motor evidence became unknown or stale: '+decision.reason)
+224: 
+225:     def wait(self, future, timeout, *, monitor=False, cancel_on_timeout=True):
+226:         return super().wait(future,timeout,monitor=monitor or self.carrying is not None,
+227:                             cancel_on_timeout=cancel_on_timeout)
+228: 
+229:     def event(self, stage: str, **fields):
+230:         item = {'stage': stage, 'stamp_ns': self.get_clock().now().nanoseconds, **fields}
+231:         if (getattr(self, '_execution_timing_enabled', False) and stage in
+232:                 ('pickup_pose_captured', 'pickup_departure_recorded', 'return_planned')):
+233:             item.update(measured_fk_cache_hits=getattr(self, '_measured_fk_cache_hits', 0),
+234:                         measured_fk_service_calls=getattr(self, '_measured_fk_cache_misses', 0))
+235:         self.events.append(item)
+236:         self.get_logger().info(json.dumps(item))
+237: 
+238:     def capture_pickup(self, arm: str) -> None:
+239:         """Save the measured pickup and its release goal before closing the jaw."""
+240:         self.pickup_return_pose = None
+241:         self._pickup_departure_paths = self._pickup_departure_arm = None
+242:         state = self.real.monitor()
+243:         positions = dict(zip(state.name, state.position))
+244:         self.pickup_joints = tuple(positions[name] for name in ARM_JOINT_NAMES[arm])
+245:         if not all(math.isfinite(q) for q in self.pickup_joints):
+246:             raise RuntimeError('Original pickup position requires finite measured joints')
+247:         policy = PickupReturnPolicy.from_config(self.config)
+248:         if policy.height_offset_m > 0:
+249:             pickup = self.cartesian_pose(self.pose(arm))
+250:             self.pickup_return_pose = self.pose_message(CartesianPose(
+251:                 (*pickup.position[:2], pickup.position[2] + policy.height_offset_m),
+252:                 pickup.orientation))
+253:         self.pickup_arm = arm
+254:         self.event('pickup_pose_captured', arm=arm, joint_positions=self.pickup_joints)
+255: 
+256:     def return_to_pickup(self, arm: str, pregrasp: Pose) -> dict:
+257:         policy = PickupReturnPolicy.from_config(self.config)
+258:         if policy.height_offset_m > 0:
+259:             target = self.pickup_destination_pose(arm)
+260:             goal = self.cartesian_pose(target)
+261:             details = dict(destination_id=RETURN_TO_PICK, destination_frame='base_link',
+262:                            destination_position_m=goal.position,
+263:                            destination_orientation_xyzw=goal.orientation,
+264:                            return_to_pick_height_offset_m=policy.height_offset_m,
+265:                            pickup_joint_rad=self.pickup_joints)
+266:             self.event('pickup_return_target', arm=arm, **details)
+267:             if policy.reverse_enabled:
+268:                 details.update(self.reverse_to_pickup(arm, target, policy))
+269:             else:
+270:                 self.linear(arm, target, 'return_to_pickup',
+271:                             validate_command_path=True, check_collisions=True)
+272:             self.check_pickup_arrival(arm)
+273:             return details
+274:         stage = ('lower_to_pregrasp' if self.config.get('pregrasp_motion_enabled', True)
+275:                  else 'lower_to_pickup')
+276:         self.linear(arm, pregrasp, stage)
+277:         self.move_joint_pose(arm, self.pickup_joints, 'return_to_pickup')
+278:         self.check_pickup_arrival(arm)
+279:         return dict(destination_id=RETURN_TO_PICK, destination_joint_rad=self.pickup_joints)
+280: 
+281:     @contextmanager
+282:     def record_pickup_departure(self, arm: str):
+283:         """Retain the closed-jaw retreat, lift and every successful height correction."""
+284:         if not PickupReturnPolicy.from_config(self.config).reverse_enabled:
+285:             yield
+286:             return
+287:         self._pickup_departure_paths = self._pickup_departure_arm = None
+288:         with self.real.record_arm_commands(arm) as recording:
+289:             yield
+290:         if recording.interrupted:
+291:             raise CommandPathValidationError('Interrupted departure cannot authorize reverse return')
+292:         validate_command_history(recording.trajectories, ARM_JOINT_NAMES[arm])
+293:         self._pickup_departure_paths = tuple(recording.trajectories)
+294:         self._pickup_departure_arm = arm
+295:         self.event('pickup_departure_recorded', arm=arm,
+296:                    trajectories=len(recording.trajectories),
+297:                    command_points=sum(len(path.points) for path in recording.trajectories))
+298: 
+299:     @timed_operation('reverse_pickup')
+300:     def reverse_to_pickup(self, arm: str, target: Pose, policy: PickupReturnPolicy) -> dict:
+301:         paths = getattr(self, '_pickup_departure_paths', None)
+302:         if not paths or getattr(self, '_pickup_departure_arm', None) != arm:
+303:             raise CommandPathValidationError('Reverse return has no recorded departure for this arm')
+304:         # Consume once; a failed replay may have moved with the payload attached.
+305:         self._pickup_departure_paths = self._pickup_departure_arm = None
+306:         validate_command_history(paths, ARM_JOINT_NAMES[arm])
+307:         state = self.real.wait_for_settle(ARM_JOINT_NAMES[arm])
+308:         hold = self.real.arm_holds.get(arm)
+309:         if hold is None or any(abs(a-b) > 1e-9 for a, b in zip(
+310:                 hold.command, paths[-1].points[-1].positions, strict=True)):
+311:             raise CommandPathValidationError('Reverse return history no longer matches the held command')
+312:         goal = self.cartesian_pose(target)
+313:         self.motion.set_current_state(state)
+314:         def fk(q):
+315:             self.real.monitor()
+316:             value = self.motion.forward_kinematics(arm, JointSolution(ARM_JOINT_NAMES[arm], q))
+317:             return CartesianPose(value.position, value.orientation_xyzw)
+318:         positions = dict(zip(state.name, state.position, strict=True))
+319:         measured_joints = tuple(positions[name] for name in ARM_JOINT_NAMES[arm])
+320:         actual = fk(measured_joints)
+321:         commanded = fk(tuple(hold.command))
+322:         position_tolerance = self.real.value('hardware_tcp_position_tolerance_m')
+323:         orientation_tolerance = math.radians(self.real.value('hardware_tcp_orientation_tolerance_deg'))
+324:         # The next movement starts at measured FK. The saved motor commands
+325:         # supply relative displacement while retaining loaded-arm support.
+326:         # Height correction deliberately makes their absolute TCP differ from
+327:         # the physical goal; that difference is not an arrival failure here.
+328:         residual = tuple(c-a for c, a in zip(commanded.position, actual.position, strict=True))
+329:         reverse = reversed_command_history(paths)
+330:         stop_ns = self.pickup_return_height_time(reverse,
+331:             lambda q: actual.position[2]+fk(q).position[2]-commanded.position[2],
+332:             goal.position[2])
+333:         endpoint = fk(reverse.sample_at(stop_ns).positions)
+334:         predicted = estimate_measured_path_pose(actual, commanded, endpoint)
+335:         validate_pose_endpoint(predicted, goal, position_tolerance, orientation_tolerance)
+336:         details = dict(return_route='reversed_departure',
+337:                        return_start_source='measured',
+338:                        return_measured_start_joint_rad=measured_joints,
+339:                        return_measured_start_position_m=actual.position,
+340:                        return_measured_start_orientation_xyzw=actual.orientation,
+341:                        return_collision_checks_enabled=policy.check_collisions,
+342:                        return_recorded_trajectories=len(paths),
+343:                        return_source_duration_sec=stop_ns/1e9,
+344:                        return_tracking_residual_m=residual,
+345:                        return_command_endpoint_m=endpoint.position)
+346:         self.event('return_to_pickup_replay', arm=arm, **details)
+347:         cursor = 0
+348:         corrections = []
+349:         details['return_height_corrections'] = corrections
+350:         for attempt in range(policy.correction_max_attempts+1):
+351:             self.real.execute_return_segment(arm, reverse, cursor, stop_ns,
+352:                                              check_collisions=policy.check_collisions,
+353:                                              endpoint_pose=goal)
+354:             cursor = stop_ns
+355:             state = self.real.wait_for_settle(ARM_JOINT_NAMES[arm])
+356:             actual = self.cartesian_pose(self.pose(arm))
+357:             validate_pose_endpoint(actual, goal, position_tolerance, orientation_tolerance)
+358:             error = actual.position[2]-goal.position[2]
+359:             sample = dict(attempt=attempt, target_z_m=goal.position[2],
+360:                           actual_z_m=actual.position[2], height_error_m=error)
+361:             corrections.append(sample)
+362:             self.event('pickup_return_height_checked', arm=arm, **sample)
+363:             if abs(error) <= policy.height_tolerance_m+1e-9:
+364:                 break
+365:             # A high arrival may continue down the saved path in small bounded
+366:             # steps. Low arrivals, unrelated pose errors and faults stop here.
+367:             if error < 0 or attempt == policy.correction_max_attempts:
+368:                 raise ValueError('Measured TCP did not reach the raised pickup release height: '
+369:                                  f'target={goal.position[2]:.6f}m actual={actual.position[2]:.6f}m '
+370:                                  f'error={error:.6f}m tolerance={policy.height_tolerance_m:.6f}m')
+371:             self.motion.set_current_state(state)
+372:             command = reverse.sample_at(cursor).positions
+373:             hold = self.real.arm_holds.get(arm)
+374:             if hold is None or any(abs(a-b) > 1e-9 for a,b in zip(command,hold.command,strict=True)):
+375:                 raise CommandPathValidationError('Return height correction lost its held command')
+376:             command_pose = fk(command)
+377:             step = min(error, policy.correction_max_step_m)
+378:             stop_ns = self.pickup_return_height_time(
+379:                 reverse, lambda q: fk(q).position[2], command_pose.position[2]-step,
+380:                 start_ns=cursor)
+381:             endpoint = fk(reverse.sample_at(stop_ns).positions)
+382:             predicted = estimate_measured_path_pose(actual, command_pose, endpoint)
+383:             validate_pose_endpoint(predicted, goal, position_tolerance, orientation_tolerance)
+384:             self.event('pickup_return_height_correction', arm=arm, attempt=attempt+1,
+385:                        step_m=step, actual_z_m=actual.position[2], target_z_m=goal.position[2])
+386:         return details
+387: 
+388:     @timed_operation('pickup_height_search')
+389:     def pickup_return_height_time(self, path, height, target_z: float, *, start_ns: int = 0) -> int:
+390:         """Find the release height on the saved path without changing its commands."""
+391:         tolerance = self.real.value('hardware_pickup_height_search_tolerance_m')
+392:         if tolerance > PickupReturnPolicy.from_config(self.config).height_tolerance_m:
+393:             raise ValueError('Height search tolerance exceeds release height tolerance')
+394:         return descending_height_time(path, height, target_z, start_ns=start_ns,
+395:                                       step_rad=self.real.value('hardware_path_step_rad'),
+396:                                       height_tolerance_m=tolerance)
+397: 
+398:     def pickup_destination_pose(self, arm: str) -> Pose:
+399:         target = getattr(self, 'pickup_return_pose', None)
+400:         if target is None or getattr(self, 'pickup_arm', None) != arm:
+401:             raise ValueError('Raised pickup destination was not captured for this arm')
+402:         self.cartesian_pose(target)  # Reject nonfinite positions/invalid orientations.
+403:         return deepcopy(target)
+404: 
+405:     def pickup_release_retreat(self, arm: str, pregrasp: Pose) -> None:
+406:         retreat = deepcopy(pregrasp)
+407:         if not self.config.get('pregrasp_motion_enabled', True):
+408:             retreat.position.z += self.config['lift_height_m']
+409:         if PickupReturnPolicy.from_config(self.config).height_offset_m > 0:
+410:             actual = self.cartesian_pose(self.pose(arm))
+411:             retreat.position.z = max(retreat.position.z,
+412:                                      self.pickup_destination_pose(arm).position.z,
+413:                                      actual.position[2])
+414:             target = self.cartesian_pose(retreat)
+415:             distance = math.dist(actual.position, target.position)
+416:             angle = orientation_error_rad(actual.orientation, target.orientation)
+417:             # A small lateral residual may be complete, but never skip an
+418:             # upward retreat while measured TCP is below the requested height.
+419:             if (distance <= self.real.value('hardware_release_retreat_position_tolerance_m')
+420:                     and angle <= math.radians(self.real.value(
+421:                         'hardware_release_retreat_orientation_tolerance_deg'))
+422:                     and actual.position[2] >= target.position[2]-1e-9):
+423:                 self.event('retreat_after_release_already_reached', arm=arm,
+424:                            position_error_m=distance, orientation_error_rad=angle,
+425:                            measured_z_m=actual.position[2], required_z_m=target.position[2])
+426:                 return
+427:         check_collisions = self.config.get('retreat_after_release_collision_check_enabled', True)
+428:         if not check_collisions:
+429:             self.event('retreat_after_release_collision_checks_disabled', arm=arm)
+430:         self.linear(arm, retreat, 'retreat_after_release', check_collisions=check_collisions)
+431: 
+432:     def check_pickup_arrival(self, arm: str) -> None:
+433:         """Confirm the configured release destination using fresh measured state."""
+434:         policy = PickupReturnPolicy.from_config(self.config)
+435:         if policy.height_offset_m > 0:
+436:             target = self.cartesian_pose(self.pickup_destination_pose(arm))
+437:             self.real.monitor()
+438:             actual = self.cartesian_pose(self.pose(arm))
+439:             validate_pose_endpoint(actual, target,
+440:                                    self.real.value('hardware_tcp_position_tolerance_m'),
+441:                                    math.radians(self.real.value('hardware_tcp_orientation_tolerance_deg')))
+442:             # The general 30mm pose envelope alone would accept the old height
+443:             # for a +20mm goal. Keep release strictly above the pickup height.
+444:             height_error = actual.position[2] - target.position[2]
+445:             if abs(height_error) > policy.height_tolerance_m + 1e-9:
+446:                 raise ValueError('Measured TCP did not reach the raised pickup release height: '
+447:                                  f'target={target.position[2]:.6f}m actual={actual.position[2]:.6f}m '
+448:                                  f'error={height_error:.6f}m tolerance={policy.height_tolerance_m:.6f}m')
+449:             self.event('pickup_destination_reached', arm=arm,
+450:                        target_position_m=target.position, actual_position_m=actual.position,
+451:                        height_error_m=height_error)
+452:             return
+453:         target = getattr(self, 'pickup_joints', None)
+454:         names = ARM_JOINT_NAMES[arm]
+455:         if target is None or len(target) != len(names) or not all(math.isfinite(q) for q in target):
+456:             raise ValueError('Original pickup destination was not captured')
+457:         state = self.real.monitor()
+458:         actual = dict(zip(state.name, state.position))
+459:         tolerance = self.real.value('hardware_arrival_tolerance_rad')
+460:         if (not math.isfinite(tolerance) or tolerance <= 0
+461:                 or any(name not in actual or not math.isfinite(actual[name])
+462:                        or abs(actual[name] - q) > tolerance for name, q in zip(names, target))):
+463:             raise ValueError('Measured arm did not return to the original pickup position')
+464:         self.event('pickup_destination_reached', arm=arm, joint_positions=target)
+465: 
+466:     def before_execution(self, selected):
+467:         self._approach_command_paths = None
+468:         self._approach_command_arm = None
+469:         arm = selected.selected_arm
+470:         if (grasp_identity_verification_required(self.config)
+471:                 and not self.config.get('wrist_observation_enabled', True)):
+472:             raise RuntimeError('Physical grasp verification requires wrist target observation')
+473:         if arm not in self.config['arms']:
+474:             raise RuntimeError('Selected arm is not commissioned/configured')
+475:         self.arm_config = load_arm(
+476:             self.config['arms'][arm], require_bins=self.config.get('operation_mode', 'full_collection') == 'full_collection'
+477:         )
+478:         full_collection = self.config.get('operation_mode', 'full_collection') == 'full_collection'
+479:         if temporary_return_mode(self.config):
+480:             self.destination = RETURN_TO_PICK
+481:         if full_collection:
+482:             self.destination = self.config['label_destinations'].get(
+483:                 selected.selected_object.label,
+484:                 self.config['label_destinations'].get('*', ''),
+485:             )
+486:             if not self.destination or self.destination not in self.arm_config.bins:
+487:                 raise RuntimeError('No approved destination for selected label')
+488:         expected = self.arm_config.opening(float(selected.selected_candidate.required_opening_m))
+489:         if abs(expected-selected.gripper_joint_position) > 1e-4:
+490:             raise RuntimeError('Selector gripper mapping differs from physical calibration')
+491:         limits = self.real.verify(arm)
+492:         if self.arm_config.home is None:
+493:             measured = self.real.monitor()
+494:             positions = dict(zip(measured.name, measured.position))
+495:             self.arm_config = replace(
+496:                 self.arm_config,
+497:                 home=tuple(positions[name] for name in ARM_JOINT_NAMES[arm]),
+498:             )
+499:             self.event('startup_home_captured', arm=arm, joint_positions=self.arm_config.home)
+500:         poses = [self.arm_config.home]
+501:         if full_collection:
+502:             poses.append(self.arm_config.bins[self.destination])
+503:         for pose in poses:
+504:             for name,q in zip(ARM_JOINT_NAMES[arm],pose):
+505:                 limits[name].check(q)
+506:         for q in (self.arm_config.closed, self.arm_config.opened):
+507:             limits[f'{arm}_gripper_joint'].check(q)
+508:         if contact_verification_required(self.config):
+509:             self.real.closed_contact_position(arm, limits)
+510:         if (grasp_identity_verification_required(self.config)
+511:                 and not self.evidence.wait_for_service(timeout_sec=2.)):
+512:             raise RuntimeError('Physical contact/tracking/release evidence provider is unavailable')
+513:         self.event('preflight', arm=arm, destination=self.destination,
+514:                    operation_mode=self.config.get('operation_mode', 'full_collection'))
+515: 
+516:     def pose(self, arm: str, link: str | None = None):
+517:         """Resolve measured FK, reusing geometry only after fresh hardware checks."""
+518:         state = self.real.monitor()
+519:         frame, link = 'base_link', link or f'{arm}_grasp_tcp'
+520:         description = self.description
+521:         cache = self._measured_fk_cache
+522:         recovery = self.real.communication_recovery_count
+523:         key = (cache.key(description, frame, link, state.name, state.position, recovery)
+524:                if self._reuse_measured_fk else None)
+525:         cached = cache.get(key)
+526:         if (cached is not None and description == self.description
+527:                 and recovery == self.real.communication_recovery_count):
+528:             self._measured_fk_cache_hits = getattr(self, '_measured_fk_cache_hits', 0) + 1
+529:             return self.pose_message(cached)
+530:         request = GetPositionFK.Request()
+531:         request.header.frame_id = frame
+532:         request.fk_link_names = [link]
+533:         request.robot_state.joint_state = state
+534:         request.robot_state.is_diff = True
+535:         response = self.call(self.fk, request)
+536:         if response.error_code.val != 1 or len(response.pose_stamped) != 1:
+537:             raise RuntimeError('Measured-state FK failed')
+538:         self._measured_fk_cache_misses = getattr(self, '_measured_fk_cache_misses', 0) + 1
+539:         if (key is not None and description == self.description
+540:                 and recovery == self.real.communication_recovery_count
+541:                 and response.fk_link_names == [link]
+542:                 and response.pose_stamped[0].header.frame_id == frame):
+543:             cache.put(key, self.cartesian_pose(response.pose_stamped[0].pose))
+544:         return response.pose_stamped[0].pose
+545: 
+546:     @staticmethod
+547:     def cartesian_pose(message: Pose) -> CartesianPose:
+548:         return CartesianPose(
+549:             (message.position.x, message.position.y, message.position.z),
+550:             (message.orientation.x, message.orientation.y,
+551:              message.orientation.z, message.orientation.w),
+552:         )
+553: 
+554:     @staticmethod
+555:     def pose_message(value: CartesianPose) -> Pose:
+556:         message = Pose()
+557:         (message.position.x, message.position.y,
+558:          message.position.z) = value.position
+559:         (message.orientation.x, message.orientation.y,
+560:          message.orientation.z, message.orientation.w) = value.orientation
+561:         return message
+562: 
+563:     @staticmethod
+564:     def retarget_wrist_roll(trajectory: JointTrajectory, measured,
+565:                             arm: str, target_roll: float | None) -> None:
+566:         """Keep position-only Cartesian IK from choosing an arbitrary tool roll."""
+567:         wrist = f'{arm}_wrist_roll_joint'
+568:         if wrist not in trajectory.joint_names:
+569:             raise RuntimeError('Cartesian response is missing wrist roll')
+570:         positions = dict(zip(measured.name, measured.position))
+571:         if wrist not in positions or not math.isfinite(positions[wrist]):
+572:             raise RuntimeError('Measured wrist roll is unavailable')
+573:         start = float(positions[wrist])
+574:         target_roll = start if target_roll is None else float(target_roll)
+575:         if not math.isfinite(target_roll):
+576:             raise RuntimeError('Cartesian wrist-roll target is not finite')
+577:         if len(trajectory.points) < 2:
+578:             raise RuntimeError('Cartesian response requires at least two points')
+579:         index = trajectory.joint_names.index(wrist)
+580:         denominator = len(trajectory.points)-1
+581:         for number, point in enumerate(trajectory.points):
+582:             values = list(point.positions)
+583:             if len(values) != len(trajectory.joint_names):
+584:                 raise RuntimeError('Cartesian response point width mismatch')
+585:             fraction = number/denominator
+586:             values[index] = start+(target_roll-start)*fraction
+587:             point.positions = values
+588: 
+589:     @staticmethod
+590:     def selected_grasp_roll(selected, arm: str) -> float:
+591:         wrist = f'{arm}_wrist_roll_joint'
+592:         positions = dict(zip(
+593:             selected.grasp_joint_state.name,
+594:             selected.grasp_joint_state.position,
+595:         ))
+596:         if wrist not in positions or not math.isfinite(positions[wrist]):
+597:             raise RuntimeError('Selected grasp wrist roll is unavailable')
+598:         return float(positions[wrist])
+599: 
+600:     @contextmanager
+601:     def record_approach_commands(self, arm: str):
+602:         if (not self.config.get('retreat_reverse_approach_enabled', False)
+603:                 or not self.config.get('pregrasp_motion_enabled', True)):
+604:             yield
+605:             return
+606:         self._approach_command_paths = None
+607:         self._approach_command_arm = None
+608:         with self.real.record_arm_commands(arm) as recording:
+609:             yield
+610:         if recording.interrupted or not recording.trajectories:
+611:             raise CommandPathValidationError('Approach has no complete command history for reverse retreat')
+612:         names = ARM_JOINT_NAMES[arm]
+613:         for trajectory in recording.trajectories:
+614:             trajectory.validate()
+615:             if trajectory.joint_names != names:
+616:                 raise CommandPathValidationError('Approach command history belongs to another arm')
+617:         for first, second in zip(recording.trajectories, recording.trajectories[1:]):
+618:             if any(abs(a-b) > 1e-9 for a, b in zip(
+619:                     first.points[-1].positions, second.points[0].positions, strict=True)):
+620:                 raise CommandPathValidationError('Approach command history is discontinuous')
+621:         self._approach_command_paths = tuple(recording.trajectories)
+622:         self._approach_command_arm = arm
+623:         self.event('approach_command_path_recorded', arm=arm,
+624:                    trajectories=len(recording.trajectories),
+625:                    command_points=sum(len(path.points) for path in recording.trajectories))
+626: 
+627:     def retreat_to_pregrasp(self, arm: str, target: Pose, report: dict | None = None, *,
+628:                            check_collisions: bool = True):
+629:         if type(check_collisions) is not bool:
+630:             raise ValueError('check_collisions must be boolean')
+631:         if not self.config.get('retreat_reverse_approach_enabled', False):
+632:             return self.linear(arm, target, 'retreat', check_collisions=check_collisions)
+633:         paths = getattr(self, '_approach_command_paths', None)
+634:         if not paths or getattr(self, '_approach_command_arm', None) != arm:
+635:             raise CommandPathValidationError('Reverse retreat has no recorded approach for this arm')
+636:         measured = self.real.monitor()
+637:         positions = dict(zip(measured.name, measured.position))
+638:         wrist = f'{arm}_wrist_roll_joint'
+639:         if wrist not in positions or not math.isfinite(positions[wrist]):
+640:             raise CommandPathValidationError('Reverse retreat has no finite measured wrist roll')
+641:         roll = float(positions[wrist])
+642:         reversed_paths = [path.reversed_with_roll(wrist, roll) for path in reversed(paths)]
+643:         # Consume once: a failed retreat may have moved with a payload attached.
+644:         self._approach_command_paths = None
+645:         self._approach_command_arm = None
+646:         self.event('retreat_reverse_approach', arm=arm, trajectories=len(reversed_paths),
+647:                    wrist_roll_rad=roll, collision_checks_enabled=check_collisions)
+648:         actual = None
+649:         defer_shortfall = height_correction_enabled(self.config)
+650:         endpoint_options = {'defer_height_shortfall': True} if defer_shortfall else {}
+651:         goal = self.cartesian_pose(target)
+652:         for index, path in enumerate(reversed_paths):
+653:             state = self.real.monitor()
+654:             self.motion.set_current_state(state)
+655:             positions = dict(zip(state.name, state.position, strict=True))
+656:             def fk(q):
+657:                 value = self.motion.forward_kinematics(arm, JointSolution(ARM_JOINT_NAMES[arm], tuple(q)))
+658:                 return CartesianPose(value.position, value.orientation_xyzw)
+659:             origin = fk(tuple(positions[name] for name in ARM_JOINT_NAMES[arm]))
+660:             command_origin = fk(path.points[0].positions)
+661:             predicted = estimate_measured_path_pose(origin, command_origin, fk(path.points[-1].positions))
+662:             endpoint = goal if index == len(reversed_paths)-1 else predicted
+663:             if index == len(reversed_paths)-1:
+664:                 if defer_shortfall:
+665:                     validate_height_correctable_endpoint(predicted, goal,
+666:                         self.real.value('hardware_tcp_position_tolerance_m'),
+667:                         math.radians(self.real.value('hardware_tcp_orientation_tolerance_deg')))
+668:                 else:
+669:                     validate_position_endpoint(predicted, goal,
+670:                                                self.real.value('hardware_tcp_position_tolerance_m'))
+671:             self.event('retreat_measured_start', arm=arm, start_source='measured', segment=index,
+672:                        measured_joint_rad=[positions[name] for name in ARM_JOINT_NAMES[arm]],
+673:                        measured_tcp_position_m=origin.position,
+674:                        predicted_endpoint_position_m=predicted.position,
+675:                        physical_target_position_m=endpoint.position)
+676:             actual = self.real.execute_recorded_trajectory(
+677:                 arm, path, check_collisions=check_collisions, endpoint_pose=endpoint, **endpoint_options)
+678:         try:
+679:             actual_pose, goal = self.cartesian_pose(self.pose(arm)), self.cartesian_pose(target)
+680:             if defer_shortfall:
+681:                 validate_height_correctable_endpoint(actual_pose, goal,
+682:                     self.real.value('hardware_tcp_position_tolerance_m'),
+683:                     math.radians(self.real.value('hardware_tcp_orientation_tolerance_deg')))
+684:             else:
+685:                 validate_position_endpoint(actual_pose, goal,
+686:                                            self.real.value('hardware_tcp_position_tolerance_m'))
+687:         except ValueError as error:
+688:             raise RuntimeError(f'retreat: measured pregrasp TCP target not reached: {error}') from error
+689:         if report is not None:
+690:             report.update(retreat_route='reversed_approach', retreat_wrist_roll_rad=roll,
+691:                           retreat_recorded_trajectories=len(reversed_paths))
+692:         self.event('retreat_reverse_approach_completed', arm=arm)
+693:         return actual
+694: 
+695:     def correct_height_endpoint(self, arm: str, target: Pose, phase: str,
+696:                                 report: dict | None = None, *,
+697:                                 check_collisions: bool = True) -> None:
+698:         """Correct lift shortfall beyond tolerance once, without a final height gate."""
+699:         policy = HeightCorrectionPolicy.from_config(self.config)
+700:         if not policy.enabled:
+701:             return
+702:         if phase != 'lift':
+703:             raise ValueError('Height correction is restricted to lift')
+704:         goal = self.cartesian_pose(deepcopy(target))
+705:         position_tolerance = self.real.value('hardware_tcp_position_tolerance_m')
+706:         orientation_tolerance = math.radians(self.real.value('hardware_tcp_orientation_tolerance_deg'))
+707:         history = []
+708:         summary = {'target_z_m': goal.position[2], 'tolerance_m': policy.tolerance_m,
+709:                    'history': history, 'status': 'checking'}
+710:         if report is not None:
+711:             report.setdefault('height_corrections', {})[phase] = summary
+712:         try:
+713:             # Includes fresh feedback, fault, cancellation and payload gates.
+714:             state = self.real.wait_for_settle(ARM_JOINT_NAMES[arm])
+715:             actual = self.cartesian_pose(self.pose(arm))
+716:             validate_height_correctable_endpoint(actual, goal, position_tolerance,
+717:                 orientation_tolerance)
+718:             hold = self.real.arm_holds.get(arm)
+719:             if hold is None:
+720:                 raise RuntimeError('Height correction requires a completed held arm command')
+721:             self.motion.set_current_state(state)
+722:             fk = self.motion.forward_kinematics(
+723:                 arm, JointSolution(ARM_JOINT_NAMES[arm], hold.command))
+724:             # Retain the sent command's support against the tracking residual.
+725:             command = CartesianPose(fk.position, fk.orientation_xyzw)
+726:             correction = HeightCorrection(goal.position[2], command.position[2], policy)
+727:             summary['initial_command_z_m'] = command.position[2]
+728:             sample = {'attempt': 0, 'target_z_m': goal.position[2],
+729:                       'command_z_m': command.position[2], 'actual_z_m': actual.position[2],
+730:                       'error_m': goal.position[2] - actual.position[2],
+731:                       'total_correction_m': 0.}
+732:             history.append(sample)
+733:             summary.update(sample)
+734:             self.event('height_correction_measured', arm=arm, phase=phase, **sample)
+735:             next_z = correction.next_command(actual.position[2])
+736:             if next_z is None:
+737:                 summary['status'] = 'not_needed'
+738:             else:
+739:                 command_waypoint = CartesianPose(
+740:                     (command.position[0], command.position[1], next_z), command.orientation)
+741:                 step = next_z-command.position[2]
+742:                 # Physical planning starts at measured FK; motor support remains
+743:                 # separate from the requested physical upward increment.
+744:                 waypoint = self.pose_message(CartesianPose(
+745:                     (*goal.position[:2], actual.position[2]+step), goal.orientation))
+746:                 self.event('height_correction_command', arm=arm, phase=phase,
+747:                            attempt=1, target_z_m=goal.position[2], command_z_m=next_z,
+748:                            actual_z_m=actual.position[2], correction_step_m=step,
+749:                            collision_checks_enabled=check_collisions)
+750:                 self.linear(arm, waypoint, phase+'_height_correction',
+751:                             check_orientation=True, check_collisions=check_collisions,
+752:                             command_target=command_waypoint, validate_command_path=True)
+753:                 # Record the remaining height error without retrying or gating return.
+754:                 final = self.cartesian_pose(self.pose(arm))
+755:                 sample = {'attempt': 1, 'target_z_m': goal.position[2],
+756:                           'command_z_m': next_z, 'actual_z_m': final.position[2],
+757:                           'error_m': goal.position[2]-final.position[2],
+758:                           'total_correction_m': step}
+759:                 history.append(sample)
+760:                 summary.update(sample, status='applied')
+761:             self.event('height_correction_completed', arm=arm, phase=phase, **summary)
+762:         except Exception as error:
+763:             summary.update(status='failed', message=str(error))
+764:             self.event('height_correction_failed', arm=arm, phase=phase, **summary)
+765:             raise
+766: 
+767:     @timed_operation('cartesian_planning')
+768:     def _cartesian_trajectory(self, arm: str, measured: JointState,
+769:                               waypoints: tuple[CartesianPose, ...], stage: str,
+770:                               wrist_roll_target: float | None,
+771:                               check_collisions: bool) -> JointTrajectory:
+772:         """Plan in the explicitly supplied physical or motor-command frame."""
+773:         request = GetCartesianPath.Request()
+774:         request.header.frame_id = 'base_link'
+775:         request.group_name = f'{arm}_grasp_arm'
+776:         request.link_name = f'{arm}_grasp_tcp'
+777:         request.start_state.joint_state = deepcopy(measured)
+778:         request.start_state.is_diff = True  # retain payload in planning state
+779:         request.waypoints = [self.pose_message(point) for point in waypoints]
+780:         request.max_step = self.config['cartesian_step_m']
+781:         request.jump_threshold = 2.
+782:         request.revolute_jump_threshold = .15
+783:         request.avoid_collisions = check_collisions
+784:         response = self.call(self.cartesian, request, 30.)
+785:         if not math.isfinite(response.fraction) or not 0 <= response.fraction <= 1:
+786:             raise RuntimeError(f'{stage}: invalid Cartesian path fraction')
+787:         if response.error_code.val != 1 or response.fraction < 1.-1e-6:
+788:             if response.error_code.val in (
+789:                     MoveItErrorCodes.SUCCESS, MoveItErrorCodes.PLANNING_FAILED,
+790:                     MoveItErrorCodes.START_STATE_IN_COLLISION, MoveItErrorCodes.GOAL_IN_COLLISION,
+791:                     MoveItErrorCodes.NO_IK_SOLUTION):
+792:                 raise CartesianPathUnavailable(
+793:                     f'{stage}: complete Cartesian path unavailable: '
+794:                     f'code={response.error_code.val} fraction={response.fraction:.6f}',
+795:                     error_code=response.error_code.val, fraction=response.fraction)
+796:             raise RuntimeError(f'{stage}: complete Cartesian path unavailable')
+797:         trajectory = response.solution.joint_trajectory
+798:         if tuple(trajectory.joint_names) != ARM_JOINT_NAMES[arm]:
+799:             raise RuntimeError('Cartesian response joint order mismatch')
+800:         # KDL is deliberately position-only for this five-axis arm.  The
+801:         # unconstrained wrist roll does not move the TCP position, so the
+802:         # Cartesian service may otherwise replace it with an arbitrary value.
+803:         # Restore a continuous roll ending at the already validated grasp roll
+804:         # (or hold the current roll for retreat/lift) before any validation or
+805:         # command is allowed.
+806:         CollectionPipeline.retarget_wrist_roll(
+807:             trajectory, request.start_state.joint_state, arm, wrist_roll_target)
+808:         return trajectory
+809: 
+810:     def linear(self, arm: str, target: Pose, stage: str,
+811:                wrist_roll_target: float | None = None, *,
+812:                check_orientation: bool = True, route: ApproachRoute | None = None,
+813:                check_collisions: bool = True, validate_command_path: bool = False,
+814:                command_target: CartesianPose | None = None):
+815:         """Plan physical geometry from measured FK, then convert motor support."""
+816:         if type(check_collisions) is not bool:
+817:             raise ValueError('check_collisions must be boolean')
+818:         if command_target is not None and (stage != 'lift_height_correction'
+819:                                           or not isinstance(command_target, CartesianPose)):
+820:             raise ValueError('Explicit command target is restricted to lift height correction')
+821:         defer_shortfall = (stage in ('retreat', 'lift', 'lift_height_correction')
+822:                            and height_correction_enabled(self.config))
+823:         measured = self.real.monitor()
+824:         self.motion.set_current_state(measured)
+825:         names = ARM_JOINT_NAMES[arm]
+826:         positions = dict(zip(measured.name, measured.position, strict=True))
+827:         measured_joints = tuple(positions[name] for name in names)
+828:         def fk(q):
+829:             self.real.monitor()
+830:             value = self.motion.forward_kinematics(arm, JointSolution(names, tuple(q)))
+831:             return CartesianPose(value.position, value.orientation_xyzw)
+832:         start, goal = fk(measured_joints), self.cartesian_pose(target)
+833:         self.event(stage+'_measured_start', arm=arm, start_source='measured',
+834:                    measured_joint_rad=list(measured_joints), measured_tcp_position_m=list(start.position))
+835:         if route is not None and route.waypoints[-1] != goal:
+836:             raise RuntimeError('Approach detour changed the approved grasp target')
+837:         waypoints = (goal,) if route is None else route.waypoints
+838:         def validate(poses, origin):
+839:             if route is None:
+840:                 validate_corridor_samples(
+841:                     poses, origin, goal,
+842:                     self.config['cartesian_tolerance_m'],
+843:                     math.radians(15) if check_orientation else None,
+844:                     math.radians(30) if check_orientation else None)
+845:             else:
+846:                 validate_detour_samples(
+847:                     poses, origin, route, radius_m=self.config['cartesian_tolerance_m'],
+848:                     maximum_extra_length_m=self.config['approach_collision_max_extra_length_m'])
+849: 
+850:         # This request always starts from one measured snapshot and uses the
+851:         # unchanged physical destination. Previous command FK cannot replace it.
+852:         trajectory = self._cartesian_trajectory(
+853:             arm, measured, waypoints, stage, wrist_roll_target, check_collisions)
+854:         try:
+855:             nominal = executable_joint_path([tuple(p.positions) for p in trajectory.points])
+856:             nominal_poses = []
+857:             for index, sample in enumerate(nominal.samples(.01, 2, 10000)):
+858:                 if check_collisions and not self.motion.state_is_valid(
+859:                         arm, JointSolution(names, sample.positions)):
+860:                     raise CollisionValidationError(
+861:                         f'{stage}: wrist-roll-preserved Cartesian path is in collision: sample={index}',
+862:                         phase='cartesian_path', sample_index=index)
+863:                 nominal_poses.append(fk(sample.positions))
+864:             validate(nominal_poses, start)
+865:         except ValueError as error:
+866:             raise CartesianPathUnavailable(
+867:                 f'{stage}: Cartesian FK corridor rejected: {error}',
+868:                 error_code=MoveItErrorCodes.PLANNING_FAILED, fraction=1.) from error
+869: 
+870:         # Motor support is an explicit conversion after measured geometry has
+871:         # been checked. Its FK is a command coordinate, never the current TCP.
+872:         # Opening the jaw does not cancel the arm's active position command.
+873:         # Keep its support at release-to-retreat handoff; physical waypoints
+874:         # still originate at measured FK and retain the requested destination.
+875:         hold = (None if stage == 'return_to_pickup' else
+876:                 self.real.arm_holds.get(arm))
+877:         command_start = None
+878:         if hold is not None:
+879:             command_start = fk(hold.command)
+880:             if command_target is None:
+881:                 command_waypoints = tuple(estimate_measured_path_pose(command_start, start, p)
+882:                                           for p in waypoints)
+883:             else:
+884:                 command_waypoints = (command_target,)
+885:             if (command_target is not None or math.dist(start.position, command_start.position) > 1e-9
+886:                     or orientation_error_rad(start.orientation, command_start.orientation) > 1e-9):
+887:                 command_state = deepcopy(measured)
+888:                 sent = dict(zip(names, hold.command, strict=True))
+889:                 command_state.position = [sent.get(name, value) for name, value in
+890:                                           zip(measured.name, measured.position, strict=True)]
+891:                 roll = (None if wrist_roll_target is None else wrist_roll_target
+892:                         +hold.command[-1]-measured_joints[-1])
+893:                 trajectory = self._cartesian_trajectory(
+894:                     arm, command_state, command_waypoints, stage+'_command_support', roll,
+895:                     check_collisions)
+896:             else:
+897:                 trajectory.points[0].positions = list(hold.command)
+898:             self.event('cartesian_command_support', arm=arm, phase=stage,
+899:                        measured_start_position_m=start.position,
+900:                        command_start_position_m=command_start.position,
+901:                        physical_target_position_m=goal.position,
+902:                        command_target_position_m=command_waypoints[-1].position)
+903:         elif command_target is not None:
+904:             raise CommandPathValidationError('Height correction lost its supporting command')
+905:         self.event(stage)
+906:         execution_options = {'endpoint_pose': goal}
+907:         if hold is None:
+908:             execution_options['start_from_measured'] = True
+909:         else:
+910:             execution_options['held_command'] = hold.command
+911:         if stage == 'lift_height_correction':
+912:             execution_options['minimum_duration_sec'] = self.real.value(
+913:                 'hardware_height_correction_min_duration_sec')
+914:         elif stage == 'retreat_after_release':
+915:             execution_options['minimum_duration_sec'] = self.real.value(
+916:                 'hardware_release_retreat_min_duration_sec')
+917:         if defer_shortfall:
+918:             execution_options['defer_height_shortfall'] = True
+919:         def validate_final_command(samples, actual):
+920:             self.motion.set_current_state(actual)
+921:             current = dict(zip(actual.name, actual.position, strict=True))
+922:             origin = fk(tuple(current[name] for name in names))
+923:             final_poses = []
+924:             for sample in samples:
+925:                 pose = fk(sample.positions)
+926:                 if command_start is not None:
+927:                     pose = estimate_measured_path_pose(origin, command_start, pose)
+928:                 final_poses.append(pose)
+929:             try:
+930:                 validate(final_poses, origin)
+931:             except ValueError as error:
+932:                 raise CommandPathValidationError(
+933:                     f'{stage}: final held-command FK corridor rejected: {error}') from error
+934:         # Timing changes the shared Hermite slopes. Verify the exact resulting
+935:         # FK corridor for every Cartesian phase, including detours and retreat.
+936:         execution_options['command_path_validator'] = validate_final_command
+937:         self.execute_trajectory(
+938:             arm, trajectory, 'arm', check_orientation=check_orientation,
+939:             check_collisions=check_collisions, **execution_options)
+940:         reuse = (getattr(self.real, 'reuse_release_retreat_endpoint', None)
+941:                  if stage == 'retreat_after_release' else None)
+942:         actual = reuse(arm, goal) if reuse is not None else None
+943:         if actual is None:
+944:             actual = self.cartesian_pose(self.pose(arm))
+945:         try:
+946:             if defer_shortfall:
+947:                 validate_height_correctable_endpoint(actual, goal,
+948:                     self.real.value('hardware_tcp_position_tolerance_m'),
+949:                     math.radians(self.real.value('hardware_tcp_orientation_tolerance_deg'))
+950:                     if check_orientation else math.pi)
+951:             elif check_orientation:
+952:                 validate_pose_endpoint(
+953:                     actual, goal,
+954:                     self.real.value('hardware_tcp_position_tolerance_m'),
+955:                     math.radians(self.real.value(
+956:                         'hardware_tcp_orientation_tolerance_deg')),
+957:                 )
+958:             else:
+959:                 validate_position_endpoint(
+960:                     actual, goal,
+961:                     self.real.value('hardware_tcp_position_tolerance_m'))
+962:         except ValueError as error:
+963:             raise RuntimeError(f'{stage}: measured TCP target not reached: {error}') from error
+964:         # Require the next camera capture to be newer than all endpoint checks.
+965:         return self.real.monitor()
+966: 
+967:     def move_direct_to_grasp(self, selected, report: dict):
+968:         """Plan from live joints to the selected grasp, without a pregrasp waypoint."""
+969:         arm = selected.selected_arm
+970:         goal = selected.grasp_joint_state
+971:         positions = tuple(float(q) for q in goal.position)
+972:         if (tuple(goal.name) != ARM_JOINT_NAMES[arm]
+973:                 or len(positions) != len(ARM_JOINT_NAMES[arm])
+974:                 or not all(math.isfinite(q) for q in positions)):
+975:             raise RuntimeError('Direct grasp requires a complete finite selected joint target')
+976:         pose_checks = self.config.get('direct_grasp_pose_checks_enabled', True)
+977:         endpoint_options = {} if pose_checks else {'allow_endpoint_error': True}
+978:         report['direct_grasp_pose_checks_enabled'] = pose_checks
+979:         # The selector's path starts at pregrasp. Prefer a checked direct
+980:         # joint connection from live feedback before requesting a free RRT route.
+981:         checked = None
+982:         if self.config.get('direct_grasp_shortcut_enabled', False):
+983:             self.scene_monitor.wait()
+984:             measured = self.real.monitor()
+985:             self.motion.set_current_state(measured)
+986:             joints = dict(zip(measured.name, measured.position, strict=True))
+987:             start = tuple(float(joints[name]) for name in ARM_JOINT_NAMES[arm])
+988:             checked = self.motion._validated_cubic_path(
+989:                 arm, PlannedPath(ARM_JOINT_NAMES[arm], (start, positions)))
+990:         report['direct_grasp_route'] = 'joint_direct' if checked is not None else 'rrt'
+991:         self.event('direct_grasp_route_selected', arm=arm,
+992:                    route=report['direct_grasp_route'])
+993:         if checked is not None:
+994:             self.event('direct_grasp')
+995:             self.execute_trajectory(arm, path_to_message(checked), 'arm', **endpoint_options)
+996:         else:
+997:             self.move_joint_pose(arm, positions, 'direct_grasp', **endpoint_options)
+998:         actual = self.cartesian_pose(self.pose(arm))
+999:         target = self.cartesian_pose(selected.fk_grasp_pose)
+1000:         position_error = math.dist(actual.position, target.position)
+1001:         orientation_error = math.degrees(orientation_error_rad(actual.orientation, target.orientation))
+1002:         if not math.isfinite(position_error):
+1003:             raise RuntimeError('Direct grasp requires finite measured and target TCP positions')
+1004:         try:
+1005:             validate_position_endpoint(
+1006:                 actual, target, self.real.value('hardware_tcp_position_tolerance_m'))
+1007:         except ValueError as error:
+1008:             if pose_checks:
+1009:                 raise RuntimeError(f'direct_grasp: measured TCP target not reached: {error}') from error
+1010:             self.event('direct_grasp_position_error_ignored', arm=arm,
+1011:                        position_error_m=position_error, orientation_error_deg=orientation_error)
+1012:             self.get_logger().warning(
+1013:                 f'Grasp trial: TCP position error {position_error:.6f}m; proceeding to gripper close')
+1014:         report.update(pregrasp_executed=False, direct_grasp_executed=True,
+1015:                       direct_grasp_tcp_position_error_m=position_error,
+1016:                       direct_grasp_tcp_orientation_error_deg=orientation_error,
+1017:                       direct_grasp_execution_metrics=deepcopy(self.real.last_execution_metrics))
+1018:         return self.real.monitor()
+1019: 
+1020:     def approach_target(self, selected, report: dict):
+1021:         """Use corrected selection goals; inspect the physical fixed-finger path."""
+1022:         if not self.config.get('pregrasp_motion_enabled', True):
+1023:             return self.move_direct_to_grasp(selected, report)
+1024:         if not self.config.get('approach_collision_check_enabled', True):
+1025:             # Explicitly scoped to this approach; subsequent retreat, lift,
+1026:             # gripper commands and joint-space moves keep their default checks.
+1027:             report['approach_collision_checks_enabled'] = False
+1028:             self.event('approach_collision_checks_disabled', arm=selected.selected_arm)
+1029:             if self.config.get('approach_execution_replanning_enabled', False):
+1030:                 return self.replan_approach_from_arrival(selected, report)
+1031:             return self.linear(
+1032:                 selected.selected_arm, selected.fk_grasp_pose, 'approach',
+1033:                 self.selected_grasp_roll(selected, selected.selected_arm),
+1034:                 check_orientation=False, check_collisions=False)
+1035:         if not self.config.get('fixed_jaw_clearance_enabled', False):
+1036:             return CollectionPipeline._approach_target(self, selected, report)
+1037:         arm = selected.selected_arm
+1038:         # Hardware verify applies this same controller/MoveIt URDF before each
+1039:         # execution. Use serial-chain FK here to avoid an extra ROS FK service
+1040:         # call for every gravity-biased command and mandatory hold-bridge sample.
+1041:         description = self.description
+1042:         meshes = tuple(self.config['fixed_jaw_collision_meshes'])
+1043:         key = (description, arm, meshes)
+1044:         cache = getattr(self, '_fixed_jaw_geometry_cache', None)
+1045:         if cache is None or cache[0] != key:
+1046:             cache = (key, load_fixed_jaw_bounds(description, arm, meshes),
+1047:                      UrdfChain(description, 'base_link', f'{arm}_grasp_tcp'))
+1048:             self._fixed_jaw_geometry_cache = cache
+1049:         _, jaw, chain = cache
+1050:         corners = target_box(selected.selected_candidate.target_object).corners()
+1051:         diagnostics = {'arm': arm, 'checked_samples': 0, 'minimum_gap_m': None,
+1052:                        'outcome': 'checking'}
+1053:         report['fixed_jaw_approach_clearance'] = diagnostics
+1054: 
+1055:         def guard(positions, index, phase):
+1056:             # Do not accept a model change while validating an active path.
+1057:             if self.description != description:
+1058:                 raise RuntimeError('Runtime URDF changed during fixed-jaw approach validation')
+1059:             position, rotation = chain.pose(positions)
+1060:             pose = PoseValue(tuple(position), quaternion_from_rotation(rotation))
+1061:             gap = closing_clearance(jaw, corners, [pose])
+1062:             diagnostics['checked_samples'] += 1
+1063:             if gap is not None:
+1064:                 old = diagnostics['minimum_gap_m']
+1065:                 diagnostics['minimum_gap_m'] = gap if old is None else min(old, gap)
+1066:             if gap is not None and gap <= 0:
+1067:                 diagnostics.update(outcome='collision', sample_index=index, phase=phase)
+1068:                 self.event('fixed_jaw_approach_rejected', **diagnostics)
+1069:                 raise CollisionValidationError(
+1070:                     f'Fixed finger overlaps target on physical approach: '
+1071:                     f'gap={gap * 1000:.3f}mm phase={phase} sample={index}',
+1072:                     phase=phase, sample_index=index,
+1073:                     contacts=({'body_1': f'{arm}_gripper_frame', 'body_2': 'approved_target',
+1074:                                'geometry': 'fixed_finger_bounds',
+1075:                                'closing_gap_m': gap},))
+1076: 
+1077:         previous = getattr(self.real, '_approach_clearance_guard', None)
+1078:         if previous is not None:
+1079:             raise RuntimeError('Fixed-jaw approach validation is already active')
+1080:         self.real._approach_clearance_guard = guard
+1081:         try:
+1082:             result = self._approach_target(selected, report)
+1083:             diagnostics['outcome'] = 'executed'
+1084:             return result
+1085:         except BaseException:
+1086:             if diagnostics['outcome'] == 'checking':
+1087:                 diagnostics['outcome'] = 'not_executed'
+1088:             raise
+1089:         finally:
+1090:             self.real._approach_clearance_guard = previous
+1091:             self.event('fixed_jaw_approach_clearance', **diagnostics)
+1092: 
+1093:     def _approach_target(self, selected, report: dict):
+1094:         """Retry only unexecuted, rejected paths; retain the selected grasp pose."""
+1095:         if self.config.get('approach_execution_replanning_enabled', False):
+1096:             return self.replan_approach_from_arrival(selected, report)
+1097:         arm, target = selected.selected_arm, selected.fk_grasp_pose
+1098:         roll = self.selected_grasp_roll(selected, arm)
+1099:         if not self.config.get('approach_collision_replanning_enabled', False):
+1100:             return self.linear(arm, target, 'approach', roll, check_orientation=False)
+1101:         recovery = {'scene_refreshes': 0, 'detour_attempts': 0, 'failures': [],
+1102:                     'selected_route': '', 'outcome': 'planning'}
+1103:         report['approach_collision_replanning'] = recovery
+1104: 
+1105:         def reject(error) -> None:
+1106:             if isinstance(error, CollisionValidationError) and error.motion_started:
+1107:                 raise error  # Endpoint/communication recovery cannot become a new approach.
+1108:             recovery['failures'].append({
+1109:                 'phase': getattr(error, 'phase', 'cartesian_planning'),
+1110:                 'sample_index': getattr(error, 'sample_index', None),
+1111:                 'message': str(error),
+1112:                 'contacts': list(getattr(error, 'contacts', ())),
+1113:             })
+1114:             self.event('approach_path_rejected', **recovery['failures'][-1])
+1115: 
+1116:         try:
+1117:             result = self.linear(arm, target, 'approach', roll, check_orientation=False)
+1118:         except (CollisionValidationError, CartesianPathUnavailable) as error:
+1119:             reject(error)
+1120:             last_error = error
+1121:         else:
+1122:             recovery.update(selected_route='straight', outcome='executed')
+1123:             return result
+1124:         for _ in range(self.config['approach_collision_scene_refresh_attempts']):
+1125:             after = self.get_clock().now().nanoseconds
+1126:             def monitor_while_waiting() -> bool:
+1127:                 # monitor raises on cancellation, stale encoders or a fault.
+1128:                 self.real.monitor()
+1129:                 return False
+1130:             self.scene_monitor.wait(after_stamp_ns=after, canceled=monitor_while_waiting)
+1131:             self.real.monitor()
+1132:             recovery['scene_refreshes'] += 1
+1133:             self.event('approach_collision_scene_refreshed', after_stamp_ns=after)
+1134:             try:
+1135:                 result = self.linear(arm, target, 'approach', roll, check_orientation=False)
+1136:             except (CollisionValidationError, CartesianPathUnavailable) as error:
+1137:                 reject(error)
+1138:                 last_error = error
+1139:             else:
+1140:                 recovery.update(selected_route='straight_after_scene_refresh', outcome='executed')
+1141:                 return result
+1142:         if last_error.entry_blocked:
+1143:             recovery['outcome'] = 'entry_blocked'
+1144:             self.event('approach_entry_blocked', phase=getattr(last_error, 'phase', 'cartesian_planning'),
+1145:                        message=str(last_error))
+1146:             raise last_error  # Changing a later waypoint cannot clear this mandatory entry.
+1147:         routes = approach_detours(
+1148:             self.cartesian_pose(self.pose(arm)), self.cartesian_pose(target),
+1149:             offset_m=self.config['approach_collision_detour_offset_m'],
+1150:             final_straight_m=self.config['approach_collision_final_straight_m'],
+1151:             maximum_extra_length_m=self.config['approach_collision_max_extra_length_m'],
+1152:             attempts=self.config['approach_collision_detour_attempts'])
+1153:         for route in routes:
+1154:             recovery['detour_attempts'] += 1
+1155:             self.event('approach_detour_planning', route=route.name,
+1156:                        waypoints_m=[point.position for point in route.waypoints])
+1157:             try:
+1158:                 result = self.linear(arm, target, 'approach_detour', roll,
+1159:                                      check_orientation=False, route=route)
+1160:             except (CollisionValidationError, CartesianPathUnavailable) as error:
+1161:                 reject(error)
+1162:                 last_error = error
+1163:                 if error.entry_blocked:
+1164:                     recovery['outcome'] = 'entry_blocked'
+1165:                     raise
+1166:             else:
+1167:                 recovery.update(selected_route=route.name, outcome='executed')
+1168:                 self.event('approach_detour_executed', route=route.name)
+1169:                 return result
+1170:         recovery['outcome'] = 'detours_exhausted' if routes else 'final_entry_or_length_limit'
+1171:         raise RuntimeError('Approach collision recovery stopped: '+recovery['outcome']+
+1172:                            '; '+str(last_error)) from last_error
+1173: 
+1174:     def replan_approach_from_arrival(self, selected, report: dict):
+1175:         """Replan from fresh arrival, then preserve the held start without rebiasing."""
+1176:         arm = selected.selected_arm
+1177:         attempts = report.setdefault('approach_execution_replanning', [])
+1178:         for attempt in range(self.config.get('approach_execution_replanning_attempts', 2)):
+1179:             self.real.monitor()
+1180:             submissions = getattr(self.real, 'motion_submissions', 0)
+1181:             item = {'arm': arm, 'candidate_index': int(selected.selected_candidate_index),
+1182:                     'original_candidate_index': report.get('approach_original_candidate_index',
+1183:                         int(selected.selected_candidate_index)),
+1184:                     'start': 'measured', 'outcome': 'planning'}
+1185:             attempts.append(item)
+1186:             self.event('approach_replanning', **item)
+1187:             try:
+1188:                 result = self.linear(arm, selected.fk_grasp_pose, 'approach',
+1189:                     self.selected_grasp_roll(selected, arm), check_orientation=False,
+1190:                     check_collisions=self.config.get('approach_collision_check_enabled', True),
+1191:                     validate_command_path=True)
+1192:             except (JointRangeValidationError, CommandPathValidationError,
+1193:                     CollisionValidationError, CartesianPathUnavailable) as error:
+1194:                 if (getattr(error, 'motion_started', False)
+1195:                         or getattr(self.real, 'motion_submissions', 0) != submissions):
+1196:                     raise
+1197:                 self.real.monitor()
+1198:                 item.update(outcome='rejected', message=str(error))
+1199:                 self.event('approach_command_rejected', **item)
+1200:                 last_error = error
+1201:                 if getattr(error, 'entry_blocked', False):
+1202:                     raise
+1203:             else:
+1204:                 item['outcome'] = 'executed'
+1205:                 self.event('approach_replanned_command_executed', **item)
+1206:                 return result
+1207:         raise last_error
+1208: 
+1209:     def approach_with_candidate_reselection(self, selected, report: dict, *, object_id: str,
+1210:                                            prepare_pregrasp: Callable[[Any], None]) -> tuple[Any, Pose]:
+1211:         """Recover only unsubmitted approaches for the same approved object and arm."""
+1212:         remaining = list(selected.candidates)
+1213:         original_indices = list(range(len(remaining)))
+1214:         maximum = self.config.get('approach_candidate_reselection_attempts', 2)
+1215:         report['approach_candidate_reselections'] = 0
+1216:         for attempt in range(maximum + 1):
+1217:             index = int(selected.selected_candidate_index)
+1218:             if not 0 <= index < len(remaining):
+1219:                 raise CommandPathValidationError('Selected candidate index does not match the candidate set')
+1220:             original_index = original_indices[index]
+1221:             report['approach_original_candidate_index'] = original_index
+1222:             submissions = getattr(self.real, 'motion_submissions', 0)
+1223:             try:
+1224:                 if attempt:
+1225:                     prepare_pregrasp(selected)
+1226:                     # A completed new pregrasp is the next safe checkpoint.
+1227:                     # Failures after a submitted, unfinished pregrasp cannot retry.
+1228:                     submissions = getattr(self.real, 'motion_submissions', 0)
+1229:                 self.scene.begin(selected.selected_candidate, object_id)
+1230:                 self.scene.allow_contacts_for(selected.selected_arm)
+1231:                 pregrasp = self.pose(selected.selected_arm)
+1232:                 with self.record_approach_commands(selected.selected_arm):
+1233:                     self.approach_target(selected, report)
+1234:             except (JointRangeValidationError, CommandPathValidationError,
+1235:                     CollisionValidationError, CartesianPathUnavailable) as error:
+1236:                 if (attempt == maximum or getattr(error, 'motion_started', False)
+1237:                         or getattr(self.real, 'motion_submissions', 0) != submissions
+1238:                         or getattr(error, 'entry_blocked', False)):
+1239:                     raise
+1240:                 del remaining[index]
+1241:                 del original_indices[index]
+1242:                 if not remaining:
+1243:                     raise
+1244:                 self.real.monitor()
+1245:                 self.scene.restore()
+1246:                 self.release_grasp_scene_freeze()
+1247:                 if self.wrist_request is not None:
+1248:                     request = deepcopy(self.wrist_request)
+1249:                     request.operation = request.CLEAR
+1250:                     self.call(self.wrist, request)
+1251:                     self.wrist_request, self.wrist_reference_id = None, ''
+1252:                 self.event('approach_candidate_reselection', rejected_candidate_index=index,
+1253:                     rejected_original_candidate_index=original_index,
+1254:                     remaining_original_candidate_indices=list(original_indices),
+1255:                     remaining_candidates=len(remaining), reason=str(error), arm=selected.selected_arm)
+1256:                 selected = self.reselect_approach_candidate(selected, remaining)
+1257:                 report['approach_candidate_reselections'] += 1
+1258:             else:
+1259:                 report.update(arm=selected.selected_arm,
+1260:                               candidate_index=int(selected.selected_candidate_index))
+1261:                 return selected, pregrasp
+1262: 
+1263:     def reselect_approach_candidate(self, previous, candidates):
+1264:         from .validate_pick_node import ValidatePickNode
+1265: 
+1266:         client = getattr(self, '_selection', None)
+1267:         owned = client is None
+1268:         if owned:
+1269:             client = ActionClient(self, SelectReachableGrasp, '/grasp/select_reachable')
+1270:         try:
+1271:             result = self.run_action(client, SelectReachableGrasp.Goal(
+1272:                 candidates=candidates, required_arm=previous.selected_arm),
+1273:                 self.config.get('approach_candidate_selection_timeout_sec', 60.), allow_aborted=True)
+1274:         finally:
+1275:             if owned:
+1276:                 client.destroy()
+1277:         if not result.success:
+1278:             raise CommandPathValidationError('No remaining approach candidate is reachable: '+result.message)
+1279:         approved = previous.selected_candidate
+1280:         candidate = result.selected_candidate
+1281:         if (result.selected_arm != previous.selected_arm
+1282:                 or candidate.snapshot_id != approved.snapshot_id or candidate.object_id != approved.object_id
+1283:                 or candidate.header.frame_id != approved.header.frame_id
+1284:                 or candidate.target_object != approved.target_object
+1285:                 or not 0 <= result.selected_candidate_index < len(candidates)):
+1286:             raise RuntimeError('Approach reselection changed the approved object, frame or arm')
+1287:         selected = deepcopy(previous)
+1288:         selected.candidates = list(candidates)
+1289:         ValidatePickNode._copy_selection_result(selected, result)
+1290:         home = self.arm_config.home
+1291:         self.before_execution(selected)
+1292:         # The original startup home is not the later candidate's current pregrasp.
+1293:         self.arm_config = replace(self.arm_config, home=home)
+1294:         return selected
+1295: 
+1296:     def prepare_reselected_pregrasp(self, selected, report: dict,
+1297:                                    cleanup_request: ObserveWristTarget.Request | None = None) -> None:
+1298:         """Repeat the original pregrasp observation/handoff checks after reselection."""
+1299:         before = after = None
+1300:         if self.head_reobservation_required():
+1301:             before = self.observe(selected.reference_id, self.get_clock().now().nanoseconds)
+1302:             center = selected.selected_object.obb_pose.position
+1303:             size = selected.selected_object.obb_size
+1304:             radius = math.hypot(size.x, size.y, size.z) / 2
+1305:             observed = before.observed_center
+1306:             if math.dist((center.x, center.y, center.z),
+1307:                          (observed.x, observed.y, observed.z)) > radius + self.target_translation_limit():
+1308:                 raise RuntimeError('Reselected target observation is outside the approved object')
+1309:         arrival = self.execute_pregrasp(selected)
+1310:         report['pregrasp_execution_metrics'] = deepcopy(self.real.last_execution_metrics)
+1311:         if before is not None:
+1312:             after = self.observe_arrival(selected, before, arrival, report)
+1313:             self.validate_target_translation(selected, before, after,
+1314:                 math.dist(observation_center(before), observation_center(after)), report)
+1315:         if self.wrist_observation_required():
+1316:             request = ObserveWristTarget.Request(operation=ObserveWristTarget.Request.HANDOFF,
+1317:                 arm=selected.selected_arm, source_snapshot_id=selected.selected_candidate.snapshot_id,
+1318:                 source_object_id=selected.selected_candidate.object_id,
+1319:                 label=after.source_label, source_confidence=float(after.source_confidence),
+1320:                 detector_label=after.source_detector_label,
+1321:                 after_stamp_ns=arrival)
+1322:             request.expected_pose.header = deepcopy(after.header)
+1323:             request.expected_pose.pose.position = deepcopy(after.observed_center)
+1324:             request.expected_pose.pose.orientation.w = 1.
+1325:             request.size = deepcopy(after.observed_extent)
+1326:             response = self.call(self.wrist, request, 60.)
+1327:             if (not response.reference_id or response.source_snapshot_id != request.source_snapshot_id
+1328:                     or response.source_object_id != request.source_object_id):
+1329:                 raise RuntimeError('Reselected wrist handoff identity mismatch')
+1330:             request.reference_id = response.reference_id
+1331:             request.operation = request.CHECK
+1332:             request.after_stamp_ns = response.header.stamp.sec * 10**9 + response.header.stamp.nanosec
+1333:             for _ in range(int(self.get_parameter('wrist_checks').value)):
+1334:                 observation = self.call(self.wrist, request, 60.)
+1335:                 stamp = observation.header.stamp.sec * 10**9 + observation.header.stamp.nanosec
+1336:                 if stamp <= request.after_stamp_ns:
+1337:                     raise RuntimeError('Reselected wrist tracking did not advance')
+1338:                 request.after_stamp_ns = stamp
+1339:                 report['wrist_checks'] += 1
+1340:             self.wrist_request, self.wrist_reference_id = request, request.reference_id
+1341:             if cleanup_request is not None:
+1342:                 for name in request.get_fields_and_field_types():
+1343:                     setattr(cleanup_request, name, deepcopy(getattr(request, name)))
+1344: 
+1345:     def observe_for_approach(self, reference_id: str, after: int):
+1346:         """Only target mask/depth loss can enter the wrist-confirmed fallback.
+1347: 
+1348:         Camera timeout, invalid reference/calibration, TF and internal errors
+1349:         remain fatal. A mask/depth failure is suspected occlusion, not proof.
+1350:         """
+1351:         try:
+1352:             return self.observe(reference_id, after)
+1353:         except ReferenceObservationFailure as error:
+1354:             response = error.response
+1355:             if (not self.config.get('visual_wrist_occlusion_fallback_enabled', False)
+1356:                     or not self.config.get('wrist_observation_enabled', True)
+1357:                     or error.error_code not in (response.ERROR_MASK, response.ERROR_DEPTH)
+1358:                     or response.reference_id != reference_id):
+1359:                 raise
+1360:             self.event('visual_head_target_unavailable',
+1361:                        error_code=error.error_code, message=str(error))
+1362:             return None
+1363: 
+1364:     def observe_arrival(self, selected, before, arrival, report):
+1365:         self._head_occluded_at_arrival = False
+1366:         observation = CollectionPipeline.observe_for_approach(
+1367:             self, selected.reference_id, arrival)
+1368:         if observation is not None:
+1369:             return observation
+1370:         age = (self.get_clock().now().nanoseconds-observation_stamp_ns(before))/1e9
+1371:         if not 0 <= age <= float(self.config['visual_wrist_occlusion_max_age_sec']):
+1372:             raise RuntimeError('Head target lost on arrival and the last 3D prior expired')
+1373:         self._head_occluded_at_arrival = True
+1374:         report['head_observation_after_pregrasp_missing'] = True
+1375:         report['reused_head_prior_age_sec'] = age
+1376:         self.event('wrist_handoff_using_last_head_prior', prior_age_sec=age)
+1377:         # Preserve the actual old capture stamp. HANDOFF still requires a wrist
+1378:         # exposure after arrival and confirms identity before any approach move.
+1379:         return deepcopy(before)
+1380: 
+1381:     def confirm_visual_observation(
+1382:         self,
+1383:         reference_id: str,
+1384:         observation,
+1385:         reference_center: tuple[float, float, float],
+1386:         previous_center: tuple[float, float, float],
+1387:         previous_observation,
+1388:     ) -> dict:
+1389:         """Median-filter a suspicious surface centroid before it can stop motion."""
+1390:         if observation is None:
+1391:             return {'accepted': False, 'suspicious': True, 'observation': None,
+1392:                     'reason': 'head_target_mask_or_depth_unavailable'}
+1393:         soft_limit = float(self.config['visual_servo_maximum_correction_m'])
+1394:         hard_limit = float(self.config.get(
+1395:             'visual_servo_hard_correction_limit_m', 2.*soft_limit))
+1396:         increment_limit = float(self.config.get(
+1397:             'visual_observation_increment_limit_m', .01))
+1398:         extent_limit = float(self.config.get(
+1399:             'visual_observation_extent_ratio_limit', 1.5))
+1400:         consistency = float(self.config.get(
+1401:             'visual_observation_consistency_m', .008))
+1402:         confirmation_frames = int(self.config.get(
+1403:             'visual_observation_confirmation_frames', 3))
+1404:         raw_center = observation_center(observation)
+1405:         raw_correction = math.dist(reference_center, raw_center)
+1406:         raw_increment = math.dist(previous_center, raw_center)
+1407:         extent_ratio = observation_extent_ratio(
+1408:             previous_observation, observation)
+1409:         suspicious = (
+1410:             raw_correction > soft_limit
+1411:             or raw_increment > increment_limit
+1412:             or extent_ratio > extent_limit
+1413:         )
+1414:         observations = [observation]
+1415:         if suspicious:
+1416:             for _ in range(confirmation_frames-1):
+1417:                 capture = CollectionPipeline.observe_for_approach(
+1418:                     self, reference_id, observation_stamp_ns(observations[-1]))
+1419:                 if capture is None:
+1420:                     return {'accepted': False, 'suspicious': True, 'observation': None,
+1421:                             'reason': 'head_target_lost_during_confirmation'}
+1422:                 observations.append(capture)
+1423:         centers = [observation_center(item) for item in observations]
+1424:         filtered_center = coordinate_median(centers)
+1425:         inliers = sum(
+1426:             math.dist(center, filtered_center) <= consistency
+1427:             for center in centers
+1428:         )
+1429:         correction = math.dist(reference_center, filtered_center)
+1430:         increment = math.dist(previous_center, filtered_center)
+1431:         consistent = inliers >= len(centers)//2+1
+1432:         accepted = (
+1433:             consistent
+1434:             and extent_ratio <= extent_limit
+1435:             and correction <= hard_limit
+1436:             and (correction <= soft_limit or increment <= increment_limit)
+1437:         )
+1438:         return {
+1439:             'accepted': accepted,
+1440:             'suspicious': suspicious,
+1441:             'observation': observations[-1],
+1442:             'confirmation_frames': len(observations),
+1443:             'confirmation_inliers': inliers,
+1444:             'raw_center_m': raw_center,
+1445:             'filtered_center_m': filtered_center,
+1446:             'raw_correction_m': raw_correction,
+1447:             'filtered_correction_m': correction,
+1448:             'filtered_increment_m': increment,
+1449:             'extent_ratio': extent_ratio,
+1450:             'soft_limit_m': soft_limit,
+1451:             'hard_limit_m': hard_limit,
+1452:             'stable_capture_stamp_ns': min(
+1453:                 observation_stamp_ns(item) for item in observations
+1454:                 if math.dist(observation_center(item), filtered_center) <= consistency
+1455:             ) if accepted else None,
+1456:         }
+1457: 
+1458:     def visual_approach(self, selected, before_observation, after_observation, report):
+1459:         """Reobserve each segment, rejecting one-frame centroid jumps near the jaws."""
+1460:         if before_observation is None or after_observation is None:
+1461:             raise RuntimeError('Visual approach requires before/after RGB-D observations')
+1462:         arm = selected.selected_arm
+1463:         reference = observation_center(before_observation)
+1464:         planned = self.cartesian_pose(selected.fk_grasp_pose)
+1465:         grasp_roll = CollectionPipeline.selected_grasp_roll(selected, arm)
+1466:         observation = (None if getattr(self, '_head_occluded_at_arrival', False)
+1467:                        else after_observation)
+1468:         previous_observation = before_observation
+1469:         accepted_center = reference
+1470:         hard_limit = float(self.config.get(
+1471:             'visual_servo_hard_correction_limit_m',
+1472:             2.*float(self.config['visual_servo_maximum_correction_m'])))
+1473:         accepted_target = planned
+1474:         records = []
+1475:         moves = 0
+1476:         wrist_fallbacks = 0
+1477:         fallback_distance = 0.
+1478:         last_head_stamp = observation_stamp_ns(after_observation)
+1479:         segment_m = float(self.config.get(
+1480:             'visual_approach_segment_m', self.config['visual_approach_step_m']))
+1481:         for index in range(int(self.config['visual_approach_max_steps'])):
+1482:             decision = CollectionPipeline.confirm_visual_observation(
+1483:                 self,
+1484:                 selected.reference_id,
+1485:                 observation,
+1486:                 reference,
+1487:                 accepted_center,
+1488:                 previous_observation,
+1489:             )
+1490:             observation = decision['observation']
+1491:             current = self.cartesian_pose(self.pose(arm))
+1492:             using_wrist_fallback = False
+1493:             if not decision['accepted']:
+1494:                 capture = grasp_capture_metrics(current, accepted_target)
+1495:                 capture_depth = float(self.config.get(
+1496:                     'visual_grasp_capture_depth_m', .045))
+1497:                 capture_lateral = float(self.config.get(
+1498:                     'visual_grasp_capture_lateral_tolerance_m', .012))
+1499:                 inside_capture = capture.inside(
+1500:                     capture_depth,
+1501:                     capture_lateral,
+1502:                     float(self.config['cartesian_tolerance_m']),
+1503:                 )
+1504:                 rejected = {
+1505:                     'step': index,
+1506:                     **decision,
+1507:                     'accepted': False,
+1508:                     'observation': (None if observation is None else
+1509:                                     reference_observation_metrics(observation)),
+1510:                     'capture_distance_m': capture.distance_m,
+1511:                     'capture_approach_remaining_m': capture.approach_remaining_m,
+1512:                     'capture_lateral_error_m': capture.lateral_error_m,
+1513:                     'inside_grasp_capture_corridor': inside_capture,
+1514:                 }
+1515:                 records.append(rejected)
+1516:                 self.event('visual_observation_rejected', **rejected)
+1517:                 fallback_enabled = bool(self.config.get(
+1518:                     'visual_wrist_occlusion_fallback_enabled', False)) and bool(
+1519:                         self.config.get('wrist_observation_enabled', True))
+1520:                 fallback_limit = int(self.config.get(
+1521:                     'visual_wrist_occlusion_max_steps', 0))
+1522:                 if fallback_enabled:
+1523:                     entry_distance = float(self.config.get(
+1524:                         'visual_wrist_occlusion_entry_distance_m', .06))
+1525:                     if capture.distance_m > entry_distance:
+1526:                         raise RuntimeError('Head target lost outside the bounded final approach')
+1527:                     maximum_age = self.config.get('visual_wrist_occlusion_max_age_sec')
+1528:                     if maximum_age is not None:
+1529:                         age = (self.get_clock().now().nanoseconds
+1530:                                - last_head_stamp)/1e9
+1531:                         if not 0 <= age <= float(maximum_age):
+1532:                             raise RuntimeError('Last stable 3D target is too old for wrist fallback')
+1533:                     if not inside_capture and wrist_fallbacks >= fallback_limit:
+1534:                         raise RuntimeError('Wrist-confirmed approach step budget exhausted')
+1535:                     wrist = self.confirm_wrist_target(report, index)
+1536:                     rejected.update(wrist_occlusion_fallback=True,
+1537:                                     wrist_confirmation=wrist)
+1538:                     self.event('visual_head_occlusion_fallback', step=index,
+1539:                                wrist_fallback_count=wrist_fallbacks,
+1540:                                fallback_distance_m=fallback_distance)
+1541:                 if inside_capture:
+1542:                     self.event(
+1543:                         'visual_capture_finalized',
+1544:                         tcp_remaining_m=capture.distance_m,
+1545:                         capture_approach_remaining_m=(
+1546:                             capture.approach_remaining_m),
+1547:                         capture_lateral_error_m=capture.lateral_error_m,
+1548:                         final_motion_skipped=True,
+1549:                         target_surface_correction_m=math.dist(
+1550:                             reference, accepted_center),
+1551:                     )
+1552:                     report['visual_approach'] = {
+1553:                         'steps': moves,
+1554:                         'final_target_surface_correction_m': math.dist(
+1555:                             reference, accepted_center),
+1556:                         'finalized_from_grasp_capture_corridor': True,
+1557:                         'wrist_occlusion_fallbacks': wrist_fallbacks,
+1558:                         'wrist_occlusion_distance_m': fallback_distance,
+1559:                         'observations': records,
+1560:                     }
+1561:                     return
+1562:                 if not fallback_enabled or wrist_fallbacks >= fallback_limit:
+1563:                     report['visual_approach'] = {
+1564:                         'steps': moves,
+1565:                         'wrist_occlusion_fallbacks': wrist_fallbacks,
+1566:                         'observations': records,
+1567:                     }
+1568:                     raise RuntimeError(
+1569:                         'Confirmed target observation is outside the visual correction '
+1570:                         'limit and the TCP grasp capture corridor')
+1571:                 wrist_fallbacks += 1
+1572:                 using_wrist_fallback = True
+1573:             else:
+1574:                 accepted_center = decision['filtered_center_m']
+1575:                 previous_observation = observation
+1576:                 last_head_stamp = decision['stable_capture_stamp_ns']
+1577:                 accepted_target = observation_corrected_pose(
+1578:                     planned, reference, accepted_center, hard_limit)
+1579:                 if getattr(self, 'wrist_request', None) is not None:
+1580:                     self.wrist_request.expected_pose.header = deepcopy(
+1581:                         observation.header)
+1582:                     wrist_center = self.wrist_request.expected_pose.pose.position
+1583:                     wrist_center.x, wrist_center.y, wrist_center.z = accepted_center
+1584:                     self.wrist_request.size = deepcopy(
+1585:                         observation.observed_extent)
+1586:             position_error = math.dist(current.position, accepted_target.position)
+1587:             orientation_error = orientation_error_rad(
+1588:                 current.orientation, accepted_target.orientation)
+1589:             correction = math.dist(reference, accepted_center)
+1590:             capture = grasp_capture_metrics(current, accepted_target)
+1591:             capture_depth = float(self.config.get(
+1592:                 'visual_grasp_capture_depth_m', .045))
+1593:             capture_lateral = float(self.config.get(
+1594:                 'visual_grasp_capture_lateral_tolerance_m', .012))
+1595:             inside_capture = capture.inside(
+1596:                 capture_depth,
+1597:                 capture_lateral,
+1598:                 float(self.config['cartesian_tolerance_m']),
+1599:             )
+1600:             record = {
+1601:                 'step': index,
+1602:                 'target_surface_correction_m': correction,
+1603:                 'tcp_remaining_m': position_error,
+1604:                 'tcp_orientation_remaining_deg': math.degrees(orientation_error),
+1605:                 'capture_approach_remaining_m': capture.approach_remaining_m,
+1606:                 'capture_lateral_error_m': capture.lateral_error_m,
+1607:                 'inside_grasp_capture_corridor': inside_capture,
+1608:                 'observation': (None if observation is None else
+1609:                                 reference_observation_metrics(observation)),
+1610:                 'filtered_center_m': accepted_center,
+1611:                 'confirmation_frames': decision.get('confirmation_frames', 0),
+1612:                 'confirmation_inliers': decision.get('confirmation_inliers', 0),
+1613:                 'raw_target_surface_correction_m': decision.get('raw_correction_m'),
+1614:                 'target_surface_increment_m': decision.get('filtered_increment_m'),
+1615:                 'observation_extent_ratio': decision.get('extent_ratio'),
+1616:                 'wrist_occlusion_fallback': using_wrist_fallback,
+1617:                 'segment_limit_m': segment_m,
+1618:                 'path_resolution_m': float(self.config['cartesian_step_m']),
+1619:             }
+1620:             records.append(record)
+1621:             self.event('visual_approach_feedback', **record)
+1622:             if position_error <= self.config['cartesian_tolerance_m']:
+1623:                 report['visual_approach'] = {
+1624:                     'steps': moves,
+1625:                     'final_target_surface_correction_m': correction,
+1626:                     'finalized_from_grasp_capture_corridor': False,
+1627:                     'wrist_occlusion_fallbacks': wrist_fallbacks,
+1628:                     'wrist_occlusion_distance_m': fallback_distance,
+1629:                     'observations': records,
+1630:                 }
+1631:                 return
+1632:             if inside_capture:
+1633:                 self.event(
+1634:                     'visual_capture_finalized',
+1635:                     tcp_remaining_m=capture.distance_m,
+1636:                     capture_approach_remaining_m=(
+1637:                         capture.approach_remaining_m),
+1638:                     capture_lateral_error_m=capture.lateral_error_m,
+1639:                     final_motion_skipped=True,
+1640:                     target_surface_correction_m=correction,
+1641:                 )
+1642:                 report['visual_approach'] = {
+1643:                     'steps': moves,
+1644:                     'final_target_surface_correction_m': correction,
+1645:                     'finalized_from_grasp_capture_corridor': True,
+1646:                     'wrist_occlusion_fallbacks': wrist_fallbacks,
+1647:                     'wrist_occlusion_distance_m': fallback_distance,
+1648:                     'observations': records,
+1649:                 }
+1650:                 return
+1651:             motion_segment_m = segment_m
+1652:             if using_wrist_fallback:
+1653:                 maximum_distance = float(self.config.get(
+1654:                     'visual_wrist_occlusion_max_distance_m', segment_m*fallback_limit))
+1655:                 remaining_distance = maximum_distance-fallback_distance
+1656:                 if remaining_distance <= 1e-9:
+1657:                     raise RuntimeError('Wrist-confirmed approach distance budget exhausted')
+1658:                 motion_segment_m = min(
+1659:                     segment_m, remaining_distance,
+1660:                     float(self.config.get('visual_wrist_occlusion_step_m', segment_m)))
+1661:             waypoint = bounded_cartesian_step(
+1662:                 current, accepted_target, motion_segment_m)
+1663:             measured = self.real.monitor()
+1664:             joint_positions = dict(zip(measured.name, measured.position))
+1665:             wrist = f'{arm}_wrist_roll_joint'
+1666:             if wrist not in joint_positions or not math.isfinite(
+1667:                     joint_positions[wrist]):
+1668:                 raise RuntimeError('Measured wrist roll is unavailable')
+1669:             fraction = min(1., motion_segment_m/position_error) if position_error > 0 else 1.
+1670:             waypoint_roll = joint_positions[wrist]+(
+1671:                 grasp_roll-joint_positions[wrist])*fraction
+1672:             arrived = self.linear(
+1673:                 arm, self.pose_message(waypoint), 'visual_approach_step',
+1674:                 waypoint_roll, check_orientation=False)
+1675:             moves += 1
+1676:             if using_wrist_fallback:
+1677:                 # Charge the planned distance even if motor tracking falls short.
+1678:                 fallback_distance += math.dist(current.position, waypoint.position)
+1679:             stamp = arrived.header.stamp.sec*10**9+arrived.header.stamp.nanosec
+1680:             if stamp <= 0:
+1681:                 raise RuntimeError('Visual approach received an unstamped arrival state')
+1682:             observation = CollectionPipeline.observe_for_approach(
+1683:                 self, selected.reference_id, stamp)
+1684:         report['visual_approach'] = {
+1685:             'steps': moves,
+1686:             'wrist_occlusion_fallbacks': wrist_fallbacks,
+1687:             'wrist_occlusion_distance_m': fallback_distance,
+1688:             'observations': records,
+1689:         }
+1690:         raise RuntimeError('Visual Cartesian approach exceeded its step budget')
+1691: 
+1692:     def move_joint_pose(self, arm: str, positions: tuple[float, ...], stage: str,
+1693:                         *, allow_endpoint_error=False):
+1694:         request = GetMotionPlan.Request()
+1695:         m = request.motion_plan_request
+1696:         m.group_name = f'{arm}_grasp_arm'
+1697:         m.pipeline_id = 'ompl'
+1698:         m.planner_id = 'RRTConnectkConfigDefault'
+1699:         m.allowed_planning_time = 5.
+1700:         m.num_planning_attempts = 2
+1701:         m.max_velocity_scaling_factor = .5
+1702:         m.max_acceleration_scaling_factor = .5
+1703:         m.start_state.joint_state = self.real.monitor()
+1704:         # Selection runs in another process; initialize this execution adapter
+1705:         # from the same live state used by the joint planner and endpoint FK.
+1706:         self.motion.set_current_state(m.start_state.joint_state)
+1707:         m.start_state.is_diff = True
+1708:         m.goal_constraints = [Constraints(joint_constraints=[
+1709:             JointConstraint(joint_name=n, position=q, tolerance_above=1e-4,
+1710:                             tolerance_below=1e-4, weight=1.)
+1711:             for n,q in zip(ARM_JOINT_NAMES[arm],positions)])]
+1712:         response = self.call(self.joint_plan, request, 15.).motion_plan_response
+1713:         if response.error_code.val != 1:
+1714:             raise RuntimeError(stage+': RRTConnect failed')
+1715:         self.event(stage)
+1716:         endpoint_options = {'allow_endpoint_error': True} if allow_endpoint_error else {}
+1717:         self.execute_trajectory(arm, response.trajectory.joint_trajectory, 'arm', **endpoint_options)
+1718: 
+1719:     def jaw(self, arm: str, position: float, stage: str, *, contact_close=False,
+1720:             check_collisions=True):
+1721:         state = self.real.monitor()
+1722:         q = dict(zip(state.name,state.position))
+1723:         joint = f'{arm}_gripper_joint'
+1724:         trajectory = JointTrajectory(joint_names=[joint], points=[
+1725:             JointTrajectoryPoint(positions=[q[joint]]), JointTrajectoryPoint(positions=[position])])
+1726:         self.event(stage)
+1727:         collision_options = {'check_collisions': False} if not check_collisions else {}
+1728:         if contact_close:
+1729:             self.real.execute(arm, trajectory, 'gripper', contact_close=True, **collision_options)
+1730:         else:
+1731:             self.execute_trajectory(arm, trajectory, 'gripper', **collision_options)
+1732: 
+1733:     def close_until_contact(self, selected, report=None):
+1734:         arm = selected.selected_arm
+1735:         after = self.get_clock().now().nanoseconds
+1736:         target = self.real.closed_contact_position(arm)
+1737:         self.jaw(arm, target, 'close_for_contact', contact_close=True,
+1738:                  check_collisions=self.config.get('grasp_collision_check_enabled', True))
+1739:         decision = self.real.wait_for_contact(arm, after)
+1740:         report = {} if report is None else report
+1741:         # Capture after the motor window completes, so the identity evidence
+1742:         # remains fresh while the service checks the same raw criterion.
+1743:         identity_required = grasp_identity_verification_required(self.config)
+1744:         if identity_required:
+1745:             self.confirm_wrist_target(report, 0)
+1746:             self.verify_evidence(selected, CheckManipulation.Request.GRASP, after)
+1747:         report.update(grasp_contact_confirmed=True, grasp_assumed=False, grasp_verified=False,
+1748:                       grasp_identity_verified=identity_required,
+1749:                       contact_verification='RAW_FEEDBACK')
+1750:         self.event('grasp_confirmed', minimum_residual_ticks=decision.minimum_residual_ticks,
+1751:                    median_current_raw=decision.median_current_raw,
+1752:                    minimum_load_raw=decision.minimum_load_raw,
+1753:                    position_span_ticks=decision.position_span_ticks,
+1754:                    window_sec=decision.window_sec)
+1755: 
+1756:     def verify_evidence(self, selected, stage: int, after: int):
+1757:         request = CheckManipulation.Request(stage=stage, arm=selected.selected_arm,
+1758:             reference_id=selected.reference_id, wrist_reference_id=self.wrist_reference_id, source_snapshot_id=selected.selected_candidate.snapshot_id,
+1759:             source_object_id=selected.selected_candidate.object_id, after_stamp_ns=after)
+1760:         response = self.call(self.evidence, request, 10.)
+1761:         check_evidence(response, request, self.get_clock().now().nanoseconds,
+1762:                        self.config['evidence_max_age_sec'])
+1763:         self.event('evidence', evidence_stage=stage)
+1764: 
+1765:     def apply(self, scene):
+1766:         response = self.call(self.apply_scene, ApplyPlanningScene.Request(scene=scene))
+1767:         if not response.success:
+1768:             raise RuntimeError('Payload planning-scene update failed')
+1769: 
+1770:     def attach(self, selected, object_id: str):
+1771:         """Attach perceived OBB to measured gripper frame via MoveIt's frame transform."""
+1772:         arm = selected.selected_arm
+1773:         obj = CollisionObject(id=object_id, operation=CollisionObject.ADD)
+1774:         obj.header = deepcopy(selected.selected_candidate.header)
+1775:         obj.header.stamp = self.get_clock().now().to_msg()
+1776:         obj.primitives = [SolidPrimitive(type=SolidPrimitive.BOX,
+1777:             dimensions=[getattr(selected.selected_object.obb_size,a) for a in ('x','y','z')])]
+1778:         obj.primitive_poses = [deepcopy(selected.selected_object.obb_pose)]
+1779:         payload = AttachedCollisionObject(link_name=f'{arm}_gripper_frame', object=obj,
+1780:             touch_links=[f'{arm}_gripper_frame',f'{arm}_moving_jaw_link'])
+1781:         scene = PlanningScene(is_diff=True)
+1782:         scene.robot_state.is_diff = True
+1783:         scene.robot_state.attached_collision_objects = [payload]
+1784:         saved_payload_acm = None
+1785:         if not self.config.get('held_object_octomap_collision_check_enabled', True):
+1786:             query = GetPlanningScene.Request()
+1787:             query.components.components = PlanningSceneComponents.ALLOWED_COLLISION_MATRIX
+1788:             saved_payload_acm = deepcopy(self.call(self.get_scene, query).scene.allowed_collision_matrix)
+1789:             # An empty ACM in a MoveIt diff means "leave unchanged", so require
+1790:             # the registered target matrix that can later be restored exactly.
+1791:             if not saved_payload_acm.entry_names:
+1792:                 raise RuntimeError('Held-object OctoMap exemption requires an active target collision matrix')
+1793:             # Allow exactly this attached object against the sensor map. Robot
+1794:             # links, other objects and named world obstacles keep their checks.
+1795:             scene.allowed_collision_matrix = TargetSceneTransaction._with_allowed_links(
+1796:                 saved_payload_acm, object_id, {'<octomap>'})
+1797:         # MoveIt transfers an ADDed AttachedCollisionObject out of the world.
+1798:         # An explicit world REMOVE in the same diff runs after that transfer,
+1799:         # reports the now-absent object as a failure, and rejects the service.
+1800:         # Mark ownership BEFORE sending: a timeout is an uncertain attachment.
+1801:         self.payload_selected = selected
+1802:         self.payload_evidence_time = time.monotonic()
+1803:         self.carrying = {'object_id':object_id,'arm':arm,'attachment':payload,
+1804:                          'grasp_tcp_pose':self.pose(arm), 'release_confirmed':False}
+1805:         if saved_payload_acm is not None:
+1806:             self.carrying['payload_octomap_saved_acm'] = saved_payload_acm
+1807:         self.apply(scene)
+1808:         request = GetPlanningScene.Request()
+1809:         request.components.components = PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS
+1810:         if saved_payload_acm is not None:
+1811:             request.components.components |= PlanningSceneComponents.ALLOWED_COLLISION_MATRIX
+1812:         confirmed = self.call(self.get_scene,request).scene
+1813:         attached = confirmed.robot_state.attached_collision_objects
+1814:         payloads = [a for a in attached if a.object.id == object_id]
+1815:         if len(payloads) != 1 or payloads[0].link_name != f'{arm}_gripper_frame':
+1816:             raise RuntimeError('MoveIt did not confirm payload attachment')
+1817:         if (saved_payload_acm is not None and not collision_pair_is_allowed(
+1818:                 confirmed.allowed_collision_matrix, object_id, '<octomap>')):
+1819:             raise RuntimeError('MoveIt did not confirm held-object OctoMap collision permission')
+1820:         from rosidl_runtime_py.convert import message_to_ordereddict
+1821:         state = self.measured()
+1822:         roll = dict(zip(state.name,state.position))[f'{arm}_wrist_roll_joint']
+1823:         self.event('attach', object_id=object_id, wrist_roll_rad=roll,
+1824:                    attachment=message_to_ordereddict(payloads[0]))
+1825:         if saved_payload_acm is not None:
+1826:             self.event('held_object_octomap_collision_check_disabled',
+1827:                        object_id=object_id, allowed_pair=[object_id, '<octomap>'])
+1828: 
+1829:     def confirm_held_target(self, selected, tcp_pose: Pose, report: dict) -> None:
+1830:         """Check fresh wrist RGB against a kinematic held-object prior after lift."""
+1831:         if self.wrist_request is None or not self.wrist_reference_id or self.carrying is None:
+1832:             raise RuntimeError('Post-lift wrist reference is unavailable')
+1833:         def rotation(pose):
+1834:             q = pose.orientation
+1835:             return rotation_from_quaternion((q.x, q.y, q.z, q.w))
+1836:         def position(pose):
+1837:             p = pose.position
+1838:             return np.array((p.x, p.y, p.z))
+1839:         original_tcp = self.carrying['grasp_tcp_pose']
+1840:         original_object = selected.selected_candidate.target_object.obb_pose
+1841:         delta_rotation = rotation(tcp_pose) @ rotation(original_tcp).T
+1842:         center = position(tcp_pose) + delta_rotation @ (position(original_object)-position(original_tcp))
+1843:         request = deepcopy(self.wrist_request)
+1844:         request.operation, request.reference_id = request.CHECK, self.wrist_reference_id
+1845:         request.after_stamp_ns = max(request.after_stamp_ns, self.get_clock().now().nanoseconds)
+1846:         request.expected_pose.header.frame_id = 'base_link'
+1847:         request.expected_pose.header.stamp = self.get_clock().now().to_msg()
+1848:         pose = request.expected_pose.pose
+1849:         pose.position.x, pose.position.y, pose.position.z = map(float, center)
+1850:         q = quaternion_from_rotation(delta_rotation @ rotation(original_object))
+1851:         pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = q
+1852:         request.size = deepcopy(selected.selected_candidate.target_object.obb_size)
+1853:         response = self.call(self.wrist, request, 60.)
+1854:         stamp = response.header.stamp.sec*10**9 + response.header.stamp.nanosec
+1855:         if (response.reference_id != self.wrist_reference_id
+1856:                 or response.source_snapshot_id != request.source_snapshot_id
+1857:                 or response.source_object_id != request.source_object_id
+1858:                 or stamp <= request.after_stamp_ns):
+1859:             raise RuntimeError('Post-lift wrist observation provenance/freshness failed')
+1860:         self.wrist_request = deepcopy(request)
+1861:         self.wrist_request.after_stamp_ns = stamp
+1862:         report['wrist_confirmed_after_lift'] = True
+1863:         report['wrist_checks'] = int(report.get('wrist_checks', 0)) + 1
+1864:         self.event('wrist_target_confirmed_after_lift', stamp_ns=stamp,
+1865:                    prior_source='held_object_kinematics', measured_depth=False)
+1866: 
+1867:     def detach(self, *, assume_released: bool = False):
+1868:         # Manual arm return explicitly opens the jaw without object evidence.
+1869:         # Normal collection still requires its original release confirmation.
+1870:         if not self.carrying or (not self.carrying['release_confirmed'] and not assume_released):
+1871:             raise RuntimeError('Cannot detach before physical release evidence')
+1872:         item = self.carrying
+1873:         scene = PlanningScene(is_diff=True)
+1874:         scene.robot_state.is_diff = True
+1875:         scene.robot_state.attached_collision_objects = [AttachedCollisionObject(
+1876:             link_name=f"{item['arm']}_gripper_frame",
+1877:             object=CollisionObject(id=item['object_id'],operation=CollisionObject.REMOVE))]
+1878:         saved_payload_acm = item.get('payload_octomap_saved_acm')
+1879:         if saved_payload_acm is not None:
+1880:             scene.allowed_collision_matrix = deepcopy(saved_payload_acm)
+1881:         # MoveIt detachment preserves the object's current world transform.
+1882:         self.apply(scene)
+1883:         if saved_payload_acm is not None:
+1884:             query = GetPlanningScene.Request()
+1885:             query.components.components = PlanningSceneComponents.ALLOWED_COLLISION_MATRIX
+1886:             restored = self.call(self.get_scene, query).scene.allowed_collision_matrix
+1887:             if restored != saved_payload_acm:
+1888:                 raise RuntimeError('MoveIt did not confirm held-object collision permission restoration')
+1889:             self.event('held_object_octomap_collision_permission_restored', object_id=item['object_id'])
+1890:         self.carrying = None
+1891:         if self.payload_future is not None:
+1892:             self.payload_future.cancel()
+1893:         self.payload_future = None
+1894:         self.releasing = False
+1895:         self.event('detach')
+1896: 
+1897:     def after_pregrasp(self, selected, wrist_request, report,
+1898:                        before_observation=None, after_observation=None):
+1899:         self.wrist_reference_id = '' if wrist_request is None else wrist_request.reference_id
+1900:         self.wrist_request = None if wrist_request is None else deepcopy(wrist_request)
+1901:         arm = selected.selected_arm
+1902:         object_id = f'physical_payload_{time.monotonic_ns()}'
+1903:         try:
+1904:             if self.config.get('approach_execution_replanning_enabled', False):
+1905:                 selected, pregrasp = self.approach_with_candidate_reselection(
+1906:                     selected, report, object_id=object_id,
+1907:                     prepare_pregrasp=lambda candidate: self.prepare_reselected_pregrasp(
+1908:                         candidate, report, wrist_request))
+1909:             else:
+1910:                 self.scene.begin(selected.selected_candidate, object_id)
+1911:                 self.scene.allow_contacts_for(arm)
+1912:                 pregrasp = self.pose(arm)
+1913:                 with self.record_approach_commands(arm):
+1914:                     if self.config.get('visual_servo_enabled', False):
+1915:                         self.visual_approach(
+1916:                             selected, before_observation, after_observation, report)
+1917:                     else:
+1918:                         self.approach_target(selected, report)
+1919:             if not self.config.get('pregrasp_motion_enabled', True):
+1920:                 pregrasp = self.pose(arm)  # Release destination is now the actual grasp pose.
+1921:             if temporary_return_mode(self.config):
+1922:                 self.capture_pickup(arm)
+1923:             if not contact_verification_required(self.config):
+1924:                 self.jaw(arm, self.arm_config.closed, 'close_assumed',
+1925:                          check_collisions=self.config.get('grasp_collision_check_enabled', True))
+1926:                 report.update(grasp_assumed=True, grasp_verified=False, contact_verification='SKIPPED')
+1927:                 self.event('grasp_assumed_without_evidence')
+1928:             else:
+1929:                 self.close_until_contact(selected, report)
+1930:             report['grasp_executed'] = True
+1931:             # Attached geometry is supplied to the continuously updated map.
+1932:             self.attach(selected, object_id)
+1933:             lift_collisions = self.config.get('lift_collision_check_enabled', True)
+1934:             report['lift_collision_checks_enabled'] = lift_collisions
+1935:             if not lift_collisions:
+1936:                 self.event('lift_collision_checks_disabled', arm=arm)
+1937:             with self.record_pickup_departure(arm):
+1938:                 # Retain the closed jaw/payload while reversing the sent approach.
+1939:                 if self.config.get('pregrasp_motion_enabled', True):
+1940:                     self.retreat_to_pregrasp(arm, pregrasp, report,
+1941:                                             check_collisions=lift_collisions)
+1942:                 bottom = self.pose(arm)
+1943:                 top = deepcopy(bottom)
+1944:                 if (self.config.get('lift_height_correction_enabled', False)
+1945:                         and self.config.get('pregrasp_motion_enabled', True)):
+1946:                     top.position.z = max(top.position.z, pregrasp.position.z)
+1947:                 top.position.z += self.config['lift_height_m']
+1948:                 before_lift = self.get_clock().now().nanoseconds
+1949:                 self.linear(arm, top, 'lift', check_collisions=lift_collisions)
+1950:                 if self.config.get('lift_height_correction_enabled', False):
+1951:                     self.correct_height_endpoint(arm, top, 'lift', report,
+1952:                                                  check_collisions=lift_collisions)
+1953:                 actual = self.pose(arm)
+1954:                 height = actual.position.z-bottom.position.z
+1955:                 report['lift_height_from_fk_m'] = height
+1956:             if self.wrist_observation_required():
+1957:                 self.confirm_held_target(selected, actual, report)
+1958:             if contact_verification_required(self.config):
+1959:                 if grasp_identity_verification_required(self.config):
+1960:                     self.verify_evidence(selected, CheckManipulation.Request.LIFT, before_lift)
+1961:                     report.update(grasp_verified=True,
+1962:                                   grasp_evidence='motor_contact_and_fresh_wrist_identity_after_lift')
+1963:                 else:
+1964:                     self.real.wait_for_contact(arm, before_lift)
+1965:                     report.update(grasp_verified=False, grasp_identity_verified=False,
+1966:                                   grasp_evidence='motor_contact_only_after_lift')
+1967:             self.stop_wrist_camera()
+1968:             if hold_mode(self.config):
+1969:                 if return_hold_mode(self.config):
+1970:                     self.move_joint_pose(arm, self.arm_config.home, 'return_holding_payload')
+1971:                     report['returned'] = True
+1972:                 else:
+1973:                     report['returned'] = False
+1974:                 report.update(payload_held=True,
+1975:                               message='Grasp/lift completed; holding payload without transport or release')
+1976:                 return
+1977:             if temporary_return_mode(self.config):
+1978:                 report.update(self.return_to_pickup(arm, pregrasp))
+1979:                 self.releasing = True
+1980:                 self.jaw(arm, self.arm_config.opened, 'release_at_pickup',
+1981:                          check_collisions=self.config.get('gripper_opening_collision_check_enabled', True))
+1982:                 self.carrying['release_confirmed'] = True
+1983:                 self.detach()
+1984:                 report.update(released=True, release_verified=False, placement_verified=False,
+1985:                               placement_state='ASSUMED',
+1986:                               contact_verification=('RAW_FEEDBACK' if contact_verification_required(self.config) else 'SKIPPED'))
+1987:                 self.pickup_release_retreat(arm, pregrasp)
+1988:                 self.scene.restore()
+1989:                 self.move_joint_pose(arm, self.arm_config.home, 'return')
+1990:                 report['returned'] = True
+1991:                 return
+1992:             self.move_joint_pose(arm, self.arm_config.bins[self.destination], 'transport')
+1993:             before_release = self.get_clock().now().nanoseconds
+1994:             self.releasing = True
+1995:             self.jaw(arm, self.arm_config.opened, 'release',
+1996:                      check_collisions=self.config.get('gripper_opening_collision_check_enabled', True))
+1997:             self.verify_evidence(selected, CheckManipulation.Request.RELEASE, before_release)
+1998:             self.carrying['release_confirmed'] = True
+1999:             self.detach()
+2000:             report['released'] = True
+2001:             # End target ACM/support transaction before returning. Fresh depth
+2002:             # remains authoritative; no deletion of an uncertain held object.
+2003:             self.scene.restore()
+2004:             self.move_joint_pose(arm, self.arm_config.home, 'return')
+2005:             report['returned'] = True
+2006:         finally:
+2007:             if self.carrying is None:
+2008:                 self.scene.restore()
+2009:             elif hold_mode(self.config) and report.get('payload_held'):
+2010:                 report['payload_preserved_on_success'] = True
+2011:             else:
+2012:                 report['payload_preserved_on_failure'] = True
+2013: 
+2014:     def run_collection(self, query: str):
+2015:         report = {'success':False,'cycles':[],'empty_confirmations':0}
+2016:         last_capture = 0
+2017:         try:
+2018:             for _ in range(int(self.config.get('maximum_cycles',20))):
+2019:                 cycle = self.run(query)
+2020:                 report['cycles'].append(cycle)
+2021:                 if cycle['success']:
+2022:                     if temporary_return_mode(self.config):
+2023:                         report.update(success=True, message='Single temporary pick/return/release cycle completed; placement assumed')
+2024:                         break
+2025:                     if hold_mode(self.config):
+2026:                         report.update(success=True,
+2027:                                       message='Single grasp/lift/hold cycle completed')
+2028:                         break
+2029:                     report['empty_confirmations'] = 0
+2030:                     continue
+2031:                 # No eligible target is NOT automatically an empty workspace.
+2032:                 if (cycle.get('error_code') == 2 and cycle.get('detection_count') == 0
+2033:                         and 'cleanup_error' not in cycle):
+2034:                     self.real.monitor()
+2035:                     capture = cycle.get('capture_stamp_ns',0)
+2036:                     if capture <= last_capture:
+2037:                         raise RuntimeError('Empty observation did not advance')
+2038:                     last_capture = capture
+2039:                     report['empty_confirmations'] += 1
+2040:                     if report['empty_confirmations'] >= self.config['empty_confirmations']:
+2041:                         report.update(success=True,message='Consecutive empty observations confirmed')
+2042:                         break
+2043:                     continue
+2044:                 raise RuntimeError(cycle.get('message','Collection failed'))
+2045:             else:
+2046:                 raise RuntimeError('Cycle limit reached without confirmed empty workspace')
+2047:         except BaseException as error:
+2048:             report['message'] = str(error)
+2049:             report['stop'] = self.real.fail_stop()
+2050:         report['events'] = self.events
+2051:         report['payload_attached_or_uncertain'] = self.carrying is not None
+2052:         return report
+2053: 
+2054: 
+2055: def main(args=None):
+2056:     parser = argparse.ArgumentParser(description=__doc__)
+2057:     parser.add_argument('--config', required=True)
+2058:     parser.add_argument('--execute', action='store_true', help='Explicitly request physical collection')
+2059:     parser.add_argument('--query', default='')
+2060:     parser.add_argument('--output', required=True)
+2061:     options, ros_args = parser.parse_known_args(args)
+2062:     config = json.loads(Path(options.config).expanduser().read_text())
+2063:     issues = configuration_issues(config)
+2064:     report = {'mode':'configuration_audit','motion_requested':False,'ready':not issues,'issues':issues}
+2065:     node = executor = thread = None
+2066:     try:
+2067:         if options.execute:
+2068:             if issues:
+2069:                 raise ValueError('; '.join(issues))
+2070:             rclpy.init(args=ros_args)
+2071:             node = CollectionPipeline(config)
+2072:             executor = MultiThreadedExecutor(num_threads=4)
+2073:             executor.add_node(node)
+2074:             thread = threading.Thread(target=executor.spin,daemon=True)
+2075:             thread.start()
+2076:             report = node.run_collection(options.query)
+2077:             report['mode'] = 'hardware'
+2078:     except BaseException as error:
+2079:         report.update(success=False,message=str(error))
+2080:     finally:
+2081:         path = Path(options.output).expanduser()
+2082:         path.parent.mkdir(parents=True,exist_ok=True)
+2083:         path.write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n')
+2084:         print(json.dumps(report,ensure_ascii=False))
+2085:         if node:
+2086:             node.scene_monitor.close()
+2087:         if executor:
+2088:             executor.shutdown(timeout_sec=5.)
+2089:         if thread:
+2090:             thread.join(timeout=5.)
+2091:         if node:
+2092:             node.destroy_node()
+2093:         if rclpy.ok():
+2094:             rclpy.try_shutdown()
+2095:     raise SystemExit(0 if report.get('success',report.get('ready')) else 1)

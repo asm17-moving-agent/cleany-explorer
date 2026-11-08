@@ -1,0 +1,23 @@
+ros2_ws/src/cleany_handeye_calibration/cleany_handeye_calibration/ik_port.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 9d4a0b8348b46a309279aa743d60f1afef1c9adced5899f17c7ee560e694b857
+
+324:         if node is None:
+325:             raise ValueError('node is required')
+326:         resolved_client = (
+327:             node.create_client(GetPositionIK, COMPUTE_IK_SERVICE_NAME)
+328:             if client is None
+329:             else client
+330:         )
+331:         super().__init__(
+332:             node,
+537:         if node is None:
+538:             raise ValueError('node is required')
+539:         resolved_client = (
+540:             node.create_client(
+541:                 GetStateValidity,
+542:                 CHECK_STATE_VALIDITY_SERVICE_NAME,
+543:             )
+544:             if client is None
+545:             else client

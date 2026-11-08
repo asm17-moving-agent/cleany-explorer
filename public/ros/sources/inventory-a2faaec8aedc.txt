@@ -1,0 +1,29 @@
+ros2_ws/src/cleany_navigation/cleany_navigation/voxel_guard_node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 382f40e5e0feff83f100aac82d193c7793928462cc44d04d091fe1e30dee90c5
+
+76:         time, transform discontinuity or exceeded processing budget.
+77:     """
+78:     def __init__(self):
+79:         super().__init__('voxel_guard')
+80:         defaults = dict(profile='', allow_simulation_limits=False, map_frame='map', base_frame='base_link', odom_frame='odom', output_directory='',
+81:                         command_topic='safety_2d/cmd_vel', output_topic='cmd_vel',
+82:                         odom_topic='odom', voxel_topic='obstacle_memory/voxels',
+83:                         status_topic='obstacle_memory/voxel_status',
+84:                         update_period_s=.05, command_timeout_s=.5, source_timeout_s=.8,
+118:         self.buffer = Buffer()
+119:         self.listener = TransformListener(self.buffer, self)
+120:         durable = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+121:         self.velocity = self.create_publisher(Twist, self.p['output_topic'], 10)
+122:         self.state = self.create_publisher(String, 'body_guard_3d/state', durable)
+123:         self.risks = self.create_publisher(PointCloud2, 'body_guard_3d/risk_voxels', durable)
+124:         self.create_subscription(Twist, self.p['command_topic'], self.on_command, 10)
+125:         self.create_subscription(Odometry, self.p['odom_topic'], self.on_odom, qos_profile_sensor_data)
+126:         self.create_subscription(PointCloud2, self.p['voxel_topic'], self.on_cloud, durable)
+127:         self.create_subscription(String, self.p['status_topic'], self.on_status, durable)
+128:         # A steady timer can still send zero when /clock or a data publisher stalls.
+129:         self.create_timer(self.p['update_period_s'], self.update, clock=Clock(clock_type=ClockType.STEADY_TIME))
+130: 
+131:     def on_command(self, msg):
+132:         self.command, self.command_wall = msg, time.monotonic()

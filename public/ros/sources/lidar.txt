@@ -1,0 +1,26 @@
+tools/odometry_evaluation/evaluation_stack.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: bdbe067a54b5e2bb2b1523fd22e1c0a5c8f1980503cf15456ba77d049cb1b49e
+
+71: 
+72: 
+73: def describe_commands(config: dict, root: Path) -> dict:
+74:     """Return argument vectors (never shell strings) for each stack component."""
+75:     base_config = (root / config["base"]["config"]).resolve()
+76:     return {
+77:         "agent": ["ros2", "run", "micro_ros_agent", "micro_ros_agent", "serial",
+78:                   "--dev", config["agent"]["serial_port"], "-b", str(config["agent"]["baudrate"])],
+79:         "base": ["ros2", "launch", "cleany_base_driver", "base_driver.launch.py",
+80:                  "mock:=false", f"config:={base_config}"],
+81:         "lidar": ["ros2", "run", "rplidar_ros", "rplidar_node", "--ros-args",
+82:                   "-r", f"__node:={config['lidar']['node_name']}",
+83:                   "-p", f"serial_port:={config['lidar']['serial_port']}",
+84:                   "-p", f"serial_baudrate:={config['lidar']['baudrate']}",
+85:                   "-p", f"frame_id:={config['lidar']['frame_id']}",
+86:                   "-p", f"inverted:={str(config['lidar']['inverted']).lower()}",
+87:                   "-p", f"angle_compensate:={str(config['lidar']['angle_compensate']).lower()}",
+88:                   "-p", f"scan_mode:={config['lidar']['scan_mode']}"],
+89:     }
+90: 
+91: 

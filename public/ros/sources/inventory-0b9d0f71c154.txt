@@ -1,0 +1,22 @@
+ros2_ws/src/cleany_base_driver/cleany_base_driver/mock_node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: e98f2f420dbcbde3f125446ef2af8bf0641186291ac2f8c686555d2b69404f69
+
+36:         Uses steady time and models protocol faults, not motor dynamics.
+37:     """
+38:     def __init__(self):
+39:         super().__init__('mock_base_mcu')
+40:         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
+41:                          durability=DurabilityPolicy.VOLATILE)
+42:         self.pub = self.create_publisher(WheelState, 'base/wheel_state', qos)
+43:         self.create_subscription(WheelCommand, 'base/wheel_command', self.command, qos)
+44:         self.create_service(Trigger, 'mock/reboot', self.reboot)
+45:         self.create_service(SetBool, 'mock/transport', self.transport)
+46:         self.create_service(Trigger, 'mock/drop_next_enable', self.drop_enable)
+47:         self.create_service(Trigger, 'mock/force_disarm', self.force_disarm)
+48:         self.boot, self.sequence, self.last_accepted_seq = 1234, 0, 0
+49:         self.have_command_sequence = False
+50:         self.enabled, self.target, self.valid_until_us = False, [0.] * 4, 0
+51:         self.last_command = None
+52:         self.faults, self.connected, self.drop_enable_count = 0, True, 0

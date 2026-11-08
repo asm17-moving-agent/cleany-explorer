@@ -1,0 +1,633 @@
+ros2_ws/src/cleany_handeye_calibration/cleany_handeye_calibration/single_pose_runtime.py
+Review: 2026-11-02
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: b86caee2af9d7c7e99f759316cb98dc3195aaf94744a971dace32fe8272e2b94
+
+1: """ROS executable that wires the single-pose core to MoveIt and MuJoCo."""
+2: 
+3: from __future__ import annotations
+4: 
+5: import math
+6: import threading
+7: import time
+8: from typing import Any, Mapping
+9: 
+10: import numpy as np
+11: from moveit_msgs.msg import PlanningSceneComponents
+12: from moveit_msgs.srv import GetPlanningScene
+13: import rclpy
+14: from rclpy.executors import MultiThreadedExecutor
+15: from rclpy.node import Node
+16: from rclpy.parameter import Parameter
+17: from rclpy.qos import qos_profile_sensor_data
+18: from sensor_msgs.msg import CameraInfo, Image, JointState
+19: 
+20: from cleany_handeye_calibration.camera_acquisition import CameraFramePair
+21: from cleany_handeye_calibration.dataset_writer import DatasetWriter
+22: from cleany_handeye_calibration.ik_port import (
+23:     MoveItPositionIKAdapter,
+24:     MoveItStateValidityAdapter,
+25: )
+26: from cleany_handeye_calibration.joint_state_sync import (
+27:     DEFAULT_DUAL_ARM_JOINT_CONTRACT,
+28:     InterpolatedJointState,
+29:     JointStateRingBuffer,
+30: )
+31: from cleany_handeye_calibration.models import (
+32:     CalibrationSample,
+33:     JointPose,
+34:     TimedJointSample,
+35: )
+36: from cleany_handeye_calibration.motion_config import (
+37:     ValidatedCurrentState,
+38:     validate_dual_arm_current_state,
+39: )
+40: from cleany_handeye_calibration.motion_port import (
+41:     MoveItMotionAdapter,
+42:     PlannedMotion,
+43: )
+44: from cleany_handeye_calibration.moveit_fk import (
+45:     MoveItForwardKinematicsAdapter,
+46:     timed_joint_sample_from_message,
+47: )
+48: from cleany_handeye_calibration.pnp import solve_planar_pnp
+49: from cleany_handeye_calibration.ros_camera_adapter import (
+50:     RosExactCameraPairAdapter,
+51: )
+52: from cleany_handeye_calibration.schema import CalibrationSampleRecord
+53: from cleany_handeye_calibration.settle_detector import JointSettleDetector
+54: from cleany_handeye_calibration.single_pose_orchestrator import (
+55:     FeedbackFkObservation,
+56:     JsonlStageJournal,
+57:     ResolvedPoseValidation,
+58:     SinglePoseOrchestrator,
+59:     SinglePoseRequest,
+60:     TargetObservation,
+61: )
+62: from cleany_handeye_calibration.single_pose_runtime_config import (
+63:     ExpectedResolvedPoseEvidence,
+64:     SinglePoseRuntimeConfig,
+65:     load_single_pose_runtime_config,
+66: )
+67: from cleany_handeye_calibration.target_detector import CharucoTargetDetector
+68: 
+69: 
+70: IMAGE_TOPIC = '/left_wrist_camera/image_raw'
+71: CAMERA_INFO_TOPIC = '/left_wrist_camera/camera_info'
+72: JOINT_STATE_TOPIC = '/joint_states'
+73: REQUIRED_COLLISION_OBJECT_IDS = {
+74:     'handeye_table',
+75:     'handeye_target_stand',
+76:     'charuco_target',
+77: }
+78: 
+79: 
+80: class SinglePoseRuntimeEffects:
+81:     """Synchronous effects driven by a background ROS executor."""
+82: 
+83:     def __init__(
+84:         self,
+85:         node: Node,
+86:         config: SinglePoseRuntimeConfig,
+87:         writer: DatasetWriter,
+88:         *,
+89:         expected_by_pose_id: Mapping[
+90:             str, ExpectedResolvedPoseEvidence
+91:         ] | None = None,
+92:     ) -> None:
+93:         self._node = node
+94:         self._config = config
+95:         self._writer = writer
+96:         expected_values = (
+97:             {config.request.pose_id: config.expected}
+98:             if expected_by_pose_id is None
+99:             else dict(expected_by_pose_id)
+100:         )
+101:         if not expected_values or any(
+102:             not isinstance(pose_id, str)
+103:             or not pose_id
+104:             or not isinstance(evidence, ExpectedResolvedPoseEvidence)
+105:             for pose_id, evidence in expected_values.items()
+106:         ):
+107:             raise ValueError('expected_by_pose_id is invalid')
+108:         self._expected_by_pose_id = expected_values
+109:         self._state_condition = threading.Condition()
+110:         feedback = config.feedback
+111:         self._buffer = JointStateRingBuffer(
+112:             capacity=feedback.capacity,
+113:             max_sample_distance_ns=feedback.max_sample_distance_ns,
+114:             clock_reset_threshold_ns=feedback.clock_reset_threshold_ns,
+115:         )
+116:         self._latest_sample: TimedJointSample | None = None
+117:         self._settle_detector = JointSettleDetector(config.motion)
+118:         self._settled_stamp_ns: int | None = None
+119:         self._camera = RosExactCameraPairAdapter()
+120:         self._detector = CharucoTargetDetector()
+121: 
+122:         # The executor thread resolves ROS futures and subscription callbacks.
+123:         # Adapter polling therefore only yields the caller thread.
+124:         def poll(timeout: float) -> None:
+125:             time.sleep(min(float(timeout), 0.01))
+126: 
+127:         self._ik = MoveItPositionIKAdapter(
+128:             node, config=config.motion, spin_once=poll
+129:         )
+130:         self._validity = MoveItStateValidityAdapter(
+131:             node, config=config.motion, spin_once=poll
+132:         )
+133:         self._motion = MoveItMotionAdapter(
+134:             node, config=config.motion, spin_once=poll
+135:         )
+136:         self._fk = MoveItForwardKinematicsAdapter(
+137:             node, spin_once=poll
+138:         )
+139:         self._planning_scene_client = node.create_client(
+140:             GetPlanningScene, '/get_planning_scene'
+141:         )
+142: 
+143:         node.create_subscription(
+144:             JointState,
+145:             JOINT_STATE_TOPIC,
+146:             self._on_joint_state,
+147:             qos_profile_sensor_data,
+148:         )
+149:         node.create_subscription(
+150:             Image,
+151:             IMAGE_TOPIC,
+152:             self._camera.on_image,
+153:             qos_profile_sensor_data,
+154:         )
+155:         node.create_subscription(
+156:             CameraInfo,
+157:             CAMERA_INFO_TOPIC,
+158:             self._camera.on_camera_info,
+159:             qos_profile_sensor_data,
+160:         )
+161: 
+162:     def _on_joint_state(self, message: JointState) -> None:
+163:         try:
+164:             sample = timed_joint_sample_from_message(message)
+165:         except ValueError as error:
+166:             self._node.get_logger().warning(
+167:                 f'rejected invalid JointState: {error}'
+168:             )
+169:             return
+170:         with self._state_condition:
+171:             insertion = self._buffer.add(sample)
+172:             if not insertion.accepted:
+173:                 return
+174:             self._latest_sample = sample
+175:             if self._settle_detector.update(sample):
+176:                 self._settled_stamp_ns = sample.stamp_ns
+177:             self._state_condition.notify_all()
+178: 
+179:     def wait_for_startup_state(self) -> ValidatedCurrentState:
+180:         deadline = (
+181:             time.monotonic()
+182:             + self._config.feedback.startup_state_timeout_sec
+183:         )
+184:         last_error: Exception | None = None
+185:         with self._state_condition:
+186:             while True:
+187:                 if self._latest_sample is not None:
+188:                     try:
+189:                         return self._validated_current_state_locked()
+190:                     except Exception as error:
+191:                         last_error = error
+192:                 remaining = deadline - time.monotonic()
+193:                 if remaining <= 0.0:
+194:                     detail = '' if last_error is None else f': {last_error}'
+195:                     raise TimeoutError(
+196:                         'timed out waiting for valid dual-arm feedback'
+197:                         + detail
+198:                     )
+199:                 self._state_condition.wait(timeout=remaining)
+200: 
+201:     def wait_for_planning_scene(self) -> None:
+202:         deadline = (
+203:             time.monotonic()
+204:             + self._config.feedback.startup_planning_scene_timeout_sec
+205:         )
+206:         request = GetPlanningScene.Request()
+207:         request.components.components = (
+208:             PlanningSceneComponents.WORLD_OBJECT_GEOMETRY
+209:         )
+210:         while time.monotonic() < deadline:
+211:             if not self._planning_scene_client.service_is_ready():
+212:                 time.sleep(0.02)
+213:                 continue
+214:             future = self._planning_scene_client.call_async(request)
+215:             while not future.done() and time.monotonic() < deadline:
+216:                 time.sleep(0.01)
+217:             if future.done():
+218:                 response = future.result()
+219:                 if response is not None:
+220:                     present = {
+221:                         item.id
+222:                         for item in response.scene.world.collision_objects
+223:                     }
+224:                     if REQUIRED_COLLISION_OBJECT_IDS <= present:
+225:                         return
+226:             time.sleep(0.02)
+227:         raise TimeoutError(
+228:             'required hand-eye collision objects were not applied'
+229:         )
+230: 
+231:     def _validated_current_state_locked(self) -> ValidatedCurrentState:
+232:         assert self._latest_sample is not None
+233:         return validate_dual_arm_current_state(
+234:             self._latest_sample,
+235:             now_stamp_ns=self._node.get_clock().now().nanoseconds,
+236:             config=self._config.motion,
+237:         )
+238: 
+239:     def _current_state(self) -> ValidatedCurrentState:
+240:         with self._state_condition:
+241:             if self._latest_sample is None:
+242:                 raise RuntimeError('joint feedback is unavailable')
+243:             return self._validated_current_state_locked()
+244: 
+245:     def resolve_position_ik(
+246:         self, request: SinglePoseRequest, timeout_sec: float
+247:     ) -> JointPose:
+248:         result = self._ik.solve_position(
+249:             request.target,
+250:             request.ik_seed,
+251:             current_state=self._current_state(),
+252:         )
+253:         if not result.success:
+254:             raise RuntimeError(f'position IK failed: {result.failure_reason}')
+255:         assert result.joint_pose is not None
+256:         return result.joint_pose
+257: 
+258:     def validate_resolved_pose(
+259:         self,
+260:         request: SinglePoseRequest,
+261:         resolved_pose: JointPose,
+262:         timeout_sec: float,
+263:     ) -> ResolvedPoseValidation:
+264:         try:
+265:             expected = self._expected_by_pose_id[request.pose_id]
+266:         except KeyError as error:
+267:             raise ValueError(
+268:                 f'no resolved-pose evidence for {request.pose_id}'
+269:             ) from error
+270:         expected.validate_match(resolved_pose)
+271:         result = self._validity.validate(
+272:             resolved_pose,
+273:             current_state=self._current_state(),
+274:         )
+275:         if not result.valid:
+276:             raise RuntimeError(
+277:                 f'MoveIt state validity failed: {result.status.value}'
+278:             )
+279:         assert result.validated_goal is not None
+280:         return ResolvedPoseValidation(
+281:             validated_goal=result.validated_goal,
+282:             observed_collision_clearance_m=(
+283:                 expected.observed_collision_clearance_m
+284:             ),
+285:         )
+286: 
+287:     def plan(
+288:         self,
+289:         validation: ResolvedPoseValidation,
+290:         timeout_sec: float,
+291:     ) -> PlannedMotion:
+292:         result = self._motion.plan(
+293:             validation.validated_goal,
+294:             current_state=self._current_state(),
+295:         )
+296:         if not result.success:
+297:             raise RuntimeError(
+298:                 'MoveIt planning failed: '
+299:                 f'{result.status.value}, error={result.moveit_error_code}'
+300:             )
+301:         assert result.planned_motion is not None
+302:         return result.planned_motion
+303: 
+304:     def execute(self, planned_motion: Any, timeout_sec: float) -> None:
+305:         if not isinstance(planned_motion, PlannedMotion):
+306:             raise ValueError('planned motion has an invalid type')
+307:         result = self._motion.execute(
+308:             planned_motion,
+309:             current_state=self._current_state(),
+310:         )
+311:         if not result.success:
+312:             raise RuntimeError(
+313:                 'MoveIt execution failed: '
+314:                 f'{result.status.value}, error={result.moveit_error_code}, '
+315:                 f'cancel_confirmed={result.cancel_confirmed}'
+316:             )
+317: 
+318:     def wait_settled(
+319:         self, resolved_pose: JointPose, timeout_sec: float
+320:     ) -> int:
+321:         deadline = time.monotonic() + timeout_sec
+322:         with self._state_condition:
+323:             self._settled_stamp_ns = None
+324:             self._settle_detector.begin(
+325:                 resolved_pose,
+326:                 action_succeeded=True,
+327:             )
+328:             while self._settled_stamp_ns is None:
+329:                 remaining = deadline - time.monotonic()
+330:                 if remaining <= 0.0:
+331:                     latest = self._latest_sample
+332:                     diagnostic = ''
+333:                     if latest is not None:
+334:                         positions = dict(
+335:                             zip(
+336:                                 latest.joint_names,
+337:                                 latest.positions_rad,
+338:                                 strict=True,
+339:                             )
+340:                         )
+341:                         target = dict(
+342:                             zip(
+343:                                 resolved_pose.joint_names,
+344:                                 resolved_pose.positions_rad,
+345:                                 strict=True,
+346:                             )
+347:                         )
+348:                         max_position_error = max(
+349:                             abs(positions[name] - target[name])
+350:                             for name in target
+351:                         )
+352:                         max_velocity = None
+353:                         if latest.velocities_rad_s is not None:
+354:                             velocities = dict(
+355:                                 zip(
+356:                                     latest.joint_names,
+357:                                     latest.velocities_rad_s,
+358:                                     strict=True,
+359:                                 )
+360:                             )
+361:                             max_velocity = max(
+362:                                 abs(velocities[name]) for name in target
+363:                             )
+364:                         diagnostic = (
+365:                             f'; last_reset='
+366:                             f'{self._settle_detector.last_reset_reason}, '
+367:                             f'max_position_error={max_position_error:g}, '
+368:                             f'max_velocity={max_velocity}'
+369:                         )
+370:                     raise TimeoutError(
+371:                         'left arm did not satisfy the continuous feedback '
+372:                         'settle contract' + diagnostic
+373:                     )
+374:                 self._state_condition.wait(timeout=remaining)
+375:             return self._settled_stamp_ns
+376: 
+377:     def acquire_image(
+378:         self, settled_stamp_ns: int, timeout_sec: float
+379:     ) -> CameraFramePair:
+380:         return self._camera.wait_for_first_compatible_frame(
+381:             settled_stamp_ns=settled_stamp_ns,
+382:             timeout_sec=timeout_sec,
+383:         )
+384: 
+385:     def archive_image(
+386:         self,
+387:         request: SinglePoseRequest,
+388:         pair: CameraFramePair,
+389:         timeout_sec: float,
+390:     ):
+391:         del timeout_sec
+392:         return self._writer.archive_attempt_image(
+393:             pose_id=request.pose_id,
+394:             attempt=request.attempt,
+395:             pair=pair,
+396:         )
+397: 
+398:     @staticmethod
+399:     def _image_array(pair: CameraFramePair) -> np.ndarray:
+400:         image = pair.image
+401:         array = np.frombuffer(image.data, dtype=np.uint8)
+402:         if image.encoding == 'rgb8':
+403:             return array.reshape((image.height, image.width, 3))
+404:         if image.encoding == 'mono8':
+405:             return array.reshape((image.height, image.width))
+406:         raise ValueError(f'unsupported image encoding: {image.encoding}')
+407: 
+408:     def detect_target(
+409:         self, pair: CameraFramePair, timeout_sec: float
+410:     ) -> TargetObservation:
+411:         detection = self._detector.detect(self._image_array(pair))
+412:         if not detection.valid:
+413:             reason = (
+414:                 'unknown'
+415:                 if detection.failure_reason is None
+416:                 else detection.failure_reason.value
+417:             )
+418:             raise RuntimeError(
+419:                 'ChArUco detection failed: '
+420:                 f'{reason}; corner_count={len(detection.corner_ids)}; '
+421:                 f'quadrants={detection.covered_quadrants}'
+422:             )
+423:         camera = pair.camera_info
+424:         pnp = solve_planar_pnp(
+425:             detection,
+426:             camera_matrix=np.asarray(camera.k).reshape((3, 3)),
+427:             distortion_coefficients=camera.d,
+428:             camera_frame=camera.frame_id,
+429:             target_frame='charuco_target',
+430:         )
+431:         if not pnp.valid:
+432:             reason = (
+433:                 'unknown'
+434:                 if pnp.failure_reason is None
+435:                 else pnp.failure_reason.value
+436:             )
+437:             raise RuntimeError(f'planar PnP failed: {reason}')
+438:         return TargetObservation(pair=pair, detection=detection, pnp=pnp)
+439: 
+440:     def _wait_for_interpolation(
+441:         self, image_stamp_ns: int, timeout_sec: float
+442:     ) -> InterpolatedJointState:
+443:         deadline = time.monotonic() + timeout_sec
+444:         with self._state_condition:
+445:             while True:
+446:                 result = self._buffer.interpolate(image_stamp_ns)
+447:                 if result.success:
+448:                     assert result.interpolation is not None
+449:                     return result.interpolation
+450:                 remaining = deadline - time.monotonic()
+451:                 if remaining <= 0.0:
+452:                     assert result.failure is not None
+453:                     raise TimeoutError(
+454:                         'cannot bracket image with joint feedback: '
+455:                         f'{result.failure.value}'
+456:                     )
+457:                 self._state_condition.wait(
+458:                     timeout=min(remaining, 0.05)
+459:                 )
+460: 
+461:     @staticmethod
+462:     def _canonical_interpolation(
+463:         interpolation: InterpolatedJointState,
+464:     ) -> InterpolatedJointState:
+465:         names = DEFAULT_DUAL_ARM_JOINT_CONTRACT.required_joint_names
+466:         source = interpolation.sample
+467:         positions = dict(
+468:             zip(source.joint_names, source.positions_rad, strict=True)
+469:         )
+470:         velocities = None
+471:         if source.velocities_rad_s is not None:
+472:             source_velocities = dict(
+473:                 zip(
+474:                     source.joint_names,
+475:                     source.velocities_rad_s,
+476:                     strict=True,
+477:                 )
+478:             )
+479:             velocities = tuple(source_velocities[name] for name in names)
+480:         return InterpolatedJointState(
+481:             sample=TimedJointSample(
+482:                 stamp_ns=source.stamp_ns,
+483:                 joint_names=names,
+484:                 positions_rad=tuple(positions[name] for name in names),
+485:                 velocities_rad_s=velocities,
+486:             ),
+487:             before_stamp_ns=interpolation.before_stamp_ns,
+488:             after_stamp_ns=interpolation.after_stamp_ns,
+489:             ratio=interpolation.ratio,
+490:         )
+491: 
+492:     def compute_feedback_fk(
+493:         self, observation: TargetObservation, timeout_sec: float
+494:     ) -> FeedbackFkObservation:
+495:         interpolation = self._canonical_interpolation(
+496:             self._wait_for_interpolation(
+497:                 observation.pair.stamp_ns,
+498:                 timeout_sec,
+499:             )
+500:         )
+501:         transform = self._fk.compute(
+502:             interpolation,
+503:             'left_gripper_frame',
+504:             timeout_sec=timeout_sec,
+505:         )
+506:         return FeedbackFkObservation(
+507:             interpolation=interpolation,
+508:             base_T_gripper=transform,
+509:         )
+510: 
+511:     def record_sample(
+512:         self,
+513:         request: SinglePoseRequest,
+514:         resolved_pose: JointPose,
+515:         observation: TargetObservation,
+516:         feedback_fk: FeedbackFkObservation,
+517:         timeout_sec: float,
+518:     ):
+519:         pnp = observation.pnp
+520:         assert pnp.camera_T_target is not None
+521:         assert pnp.selected_candidate_index is not None
+522:         candidate = next(
+523:             candidate
+524:             for candidate in pnp.candidates
+525:             if candidate.index == pnp.selected_candidate_index
+526:         )
+527:         rmse = candidate.refined_reprojection_rmse_px
+528:         if rmse is None or not math.isfinite(rmse):
+529:             raise RuntimeError('selected PnP candidate has no finite RMSE')
+530:         interpolation = feedback_fk.interpolation
+531:         record = CalibrationSampleRecord(
+532:             sample=CalibrationSample(
+533:                 sample_id=request.sample_id,
+534:                 pose_id=request.pose_id,
+535:                 split=request.split,
+536:                 base_T_gripper=feedback_fk.base_T_gripper,
+537:                 camera_T_target=pnp.camera_T_target,
+538:             ),
+539:             calibration_arm='left',
+540:             planning_group='left_arm',
+541:             position_target=request.target,
+542:             ik_seed=request.ik_seed,
+543:             resolved_ik=resolved_pose,
+544:             image_stamp_ns=observation.pair.stamp_ns,
+545:             joint_state_before_stamp_ns=(
+546:                 interpolation.before_stamp_ns
+547:             ),
+548:             joint_state_after_stamp_ns=interpolation.after_stamp_ns,
+549:             joint_interpolation_ratio=interpolation.ratio,
+550:             interpolated_joints=interpolation.sample,
+551:             camera_info=observation.pair.camera_info,
+552:             target_detection=observation.detection,
+553:             pnp_method=pnp.method,
+554:             pnp_reprojection_rmse_px=rmse,
+555:             pnp_ambiguous=pnp.ambiguous,
+556:             pnp_selected_candidate_index=pnp.selected_candidate_index,
+557:             image_path=f'images/{request.sample_id}.png',
+558:         )
+559:         return self._writer.append_sample(record, observation.pair)
+560: 
+561: 
+562: def _run(request_file: str) -> int:
+563:     config = load_single_pose_runtime_config(request_file)
+564:     node = Node(
+565:         'single_pose_handeye_orchestrator',
+566:         parameter_overrides=[
+567:             Parameter('use_sim_time', value=True)
+568:         ],
+569:         automatically_declare_parameters_from_overrides=True,
+570:     )
+571:     writer = DatasetWriter(
+572:         artifact_root=config.artifact_root,
+573:         manifest=config.dataset_manifest,
+574:     )
+575:     journal = JsonlStageJournal(
+576:         writer.run_directory / 'orchestration.jsonl'
+577:     )
+578:     effects = SinglePoseRuntimeEffects(node, config, writer)
+579:     executor = MultiThreadedExecutor(num_threads=4)
+580:     executor.add_node(node)
+581:     executor_thread = threading.Thread(
+582:         target=executor.spin,
+583:         name='single-pose-ros-executor',
+584:         daemon=True,
+585:     )
+586:     executor_thread.start()
+587:     try:
+588:         effects.wait_for_startup_state()
+589:         effects.wait_for_planning_scene()
+590:         result = SinglePoseOrchestrator(effects, journal).run(
+591:             config.request
+592:         )
+593:         node.get_logger().info(
+594:             'Stored single-pose hand-eye sample '
+595:             f'{result.stored_sample.record.sample.sample_id}'
+596:         )
+597:         return 0
+598:     except Exception as error:
+599:         node.get_logger().error(f'single-pose calibration failed: {error}')
+600:         return 1
+601:     finally:
+602:         executor.shutdown(timeout_sec=2.0)
+603:         executor_thread.join(timeout=2.0)
+604:         node.destroy_node()
+605: 
+606: 
+607: def main(args=None) -> None:
+608:     rclpy.init(args=args)
+609:     bootstrap = Node('single_pose_handeye_config')
+610:     bootstrap.declare_parameter('request_file', '')
+611:     request_file = bootstrap.get_parameter(
+612:         'request_file'
+613:     ).get_parameter_value().string_value
+614:     bootstrap.destroy_node()
+615:     try:
+616:         if not request_file:
+617:             raise ValueError('request_file ROS parameter is required')
+618:         exit_code = _run(request_file)
+619:     except Exception as error:
+620:         print(f'single-pose calibration startup failed: {error}')
+621:         exit_code = 2
+622:     finally:
+623:         rclpy.shutdown()
+624:     raise SystemExit(exit_code)
+625: 
+626: 
+627: if __name__ == '__main__':
+628:     main()

@@ -1,0 +1,743 @@
+ros2_ws/src/cleany_manipulation_bt/cleany_manipulation_bt/jetson_operations.py
+Review: 2026-11-01
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 4f1eaf1d92d6196de2367ccc5204ebfd6602d18241cc9dcd7e856676179b41f0
+
+1: """BT operations over the existing commissioned physical collection pipeline.
+2: 
+3: The XML owns order. No automatic target selection, collection loop, controller
+4: activation, fault reset or simulated evidence is used by this adapter.
+5: """
+6: from copy import deepcopy
+7: from contextlib import nullcontext
+8: import math
+9: import threading
+10: import time
+11: 
+12: from cleany_interfaces.action import InspectScene, SelectReachableGrasp, ValidatePick
+13: from cleany_interfaces.srv import (CheckManipulation, GetSceneSnapshot,
+14:                                    ObserveObjectReference, ObserveWristTarget, PlanGrasp)
+15: from cleany_skill_executor.collection_pipeline import CollectionPipeline
+16: from cleany_skill_executor.core.collection import (
+17:     contact_verification_required, grasp_identity_verification_required, temporary_return_mode,
+18: )
+19: from cleany_skill_executor.core.physical_grasp_selection import (
+20:     ARM_JOINT_NAMES, REQUIRED_JOINT_NAMES, InfrastructureError,
+21: )
+22: from cleany_skill_executor.core.hardware_execution import ExecutionCanceled
+23: from cleany_skill_executor.core.target_filter import select_closest_eligible
+24: from cleany_skill_executor.manipulation.models import Error, ObjectState, Placement
+25: from cleany_skill_executor.validate_pick_node import ValidatePickNode
+26: from rclpy.action import ActionClient
+27: 
+28: from .action_tracking import MotionClientPool, TrackedClient, quiescent
+29: from .backend import ExecutionContext, Observation, OperationError
+30: from .joint_feedback import JointFeedback, StationaryWindow
+31: 
+32: 
+33: class JetsonOperations(CollectionPipeline):
+34:     def __init__(self, config: dict, **kwargs):
+35:         self._feedback = JointFeedback(REQUIRED_JOINT_NAMES)
+36:         self._feedback_lock = threading.Lock()
+37:         self.execution_context: ExecutionContext | None = None
+38:         self.current_node = ''
+39:         self.deadline = math.inf
+40:         self._stopping = False
+41:         self.submissions, self.handles, self.tracked_clients = [], [], []
+42:         self._motion_client_pool = MotionClientPool(
+43:             self, lambda action_type, name: ActionClient(self, action_type, name))
+44:         try:
+45:             self._initialize(config, **kwargs)
+46:         except Exception:
+47:             if hasattr(self, '_Node__node'):
+48:                 self.destroy_node()
+49:             raise
+50: 
+51:     def _initialize(self, config: dict, **kwargs) -> None:
+52:         super().__init__(config, **kwargs)
+53:         defaults = {
+54:             'bt_operation_timeout_sec': 180.0, 'bt_selection_timeout_sec': 600.0,
+55:             'bt_stop_timeout_sec': 10.0,
+56:             'bt_verification_timeout_sec': 10.0, 'bt_stop_feedback_max_age_sec': 0.5,
+57:             'bt_stationary_duration_sec': 0.25, 'bt_stationary_samples': 5,
+58:             'bt_stationary_velocity_rad_s': 0.02, 'bt_minimum_confidence': 0.25,
+59:             'bt_maximum_smaller_extent_m': 0.11,
+60:             'bt_arm_return_shortcut_attempts': 8,
+61:             'bt_arm_return_optimization_budget_sec': .5,
+62:             'bt_arm_return_planner_id': 'RRTConnectReturnkConfigDefault',
+63:             'bt_arm_return_planning_trajectory_scaling': 1.0,
+64:             'bt_arm_return_waypoints_file': '',
+65:             'bt_denylist': ['battery', 'knife', 'broken glass'],
+66:         }
+67:         for name, value in defaults.items():
+68:             self.declare_parameter(name, value)
+69:         for name, value in defaults.items():
+70:             actual = self.get_parameter(name).value
+71:             if isinstance(value, (float, int)) and (
+72:                     not math.isfinite(actual) or actual <= 0):
+73:                 raise ValueError(f'{name} must be finite and positive')
+74:         if self.value('bt_minimum_confidence') > 1:
+75:             raise ValueError('bt_minimum_confidence must be at most one')
+76:         if self.value('bt_arm_return_shortcut_attempts') > 32:
+77:             raise ValueError('bt_arm_return_shortcut_attempts must be at most 32')
+78:         if not self.value('bt_arm_return_planner_id').strip():
+79:             raise ValueError('bt_arm_return_planner_id must not be empty')
+80:         if self.value('bt_arm_return_planning_trajectory_scaling') > 1:
+81:             raise ValueError('bt_arm_return_planning_trajectory_scaling must be at most one')
+82:         from .arm_return_motion import load_return_waypoints
+83:         waypoints_file = self.value('bt_arm_return_waypoints_file')
+84:         self.return_waypoints = load_return_waypoints(waypoints_file) if waypoints_file else None
+85:         self._snapshot = self.create_client(GetSceneSnapshot, '/perception/get_scene_snapshot')
+86:         self._inspection = self.track(ActionClient(self, InspectScene, '/perception/inspect_scene'))
+87:         self._selection = self.track(ActionClient(self, SelectReachableGrasp, '/grasp/select_reachable'))
+88:         self._grasp = self.create_client(PlanGrasp, '/grasp/plan')
+89:         self.motion._spin_once = self._spin_guarded
+90:         self.report = {}
+91:         self.before_observation = self.after_observation = self.pregrasp_pose = None
+92: 
+93:     def value(self, name):
+94:         return self.get_parameter(name).value
+95: 
+96:     def track(self, client):
+97:         self.tracked_clients[:] = [tracked for tracked in self.tracked_clients if not tracked.destroyed]
+98:         tracked = TrackedClient(self, client)
+99:         self.tracked_clients.append(tracked)
+100:         return tracked
+101: 
+102:     def create_motion_client(self, action_type, name):
+103:         pool = getattr(self, '_motion_client_pool', None)
+104:         if pool is None:
+105:             pool = self._motion_client_pool = MotionClientPool(
+106:                 self, lambda kind, endpoint: ActionClient(self, kind, endpoint))
+107:         client = pool.acquire(action_type, name)
+108:         self.tracked_clients[:] = [tracked for tracked in self.tracked_clients if not tracked.destroyed]
+109:         self.tracked_clients.append(client)
+110:         return client
+111: 
+112:     def on_state(self, message):
+113:         super().on_state(message)
+114:         with self._feedback_lock:
+115:             self._feedback.update(message.name, message.velocity,
+116:                 message.header.stamp.sec * 10**9 + message.header.stamp.nanosec,
+117:                 time.monotonic(), positions=message.position,
+118:                 maximum_position_interval_sec=float(self.value('bt_stop_feedback_max_age_sec')))
+119: 
+120:     def quiescent(self):
+121:         return quiescent(list(self.submissions), list(self.handles))
+122: 
+123:     def confirm_recovery_stationary(self) -> bool:
+124:         """Observe fresh idle feedback without canceling or commanding hardware."""
+125:         if self.real is None or self.real.fault or self.carrying is not None:
+126:             return False
+127:         if not self.quiescent():
+128:             return False
+129:         from types import SimpleNamespace
+130:         confirmed = self._assess_stationary(SimpleNamespace(stop_confirmed=False), cancel=False)
+131:         return bool(confirmed and not self.real.fault and self.carrying is None and self.quiescent())
+132: 
+133:     def check_execution(self):
+134:         if self._stopping or self.execution_context is None:
+135:             return
+136:         if self.real is not None and self.real.fault:
+137:             raise OperationError(Error.HARDWARE_ERROR, self.real.fault)
+138:         if self.execution_context.abort.is_set():
+139:             raise ExecutionCanceled('Execution halted; awaiting independent stop evidence')
+140:         if time.monotonic() >= self.deadline:
+141:             raise OperationError(Error.TIMEOUT, 'BT operation deadline exceeded')
+142: 
+143:     def _spin_guarded(self, delay):
+144:         self.check_execution()
+145:         time.sleep(min(delay, 0.01))
+146: 
+147:     def defer_stop_assessment(self, error: BaseException) -> bool:
+148:         """Cancel a scene/transport failure with live encoders for StopAndAssess.
+149: 
+150:         Hardware faults and untracked callers retain the independent latched
+151:         stop. A failed cancellation/stationary assessment escalates there too.
+152:         """
+153:         if (not isinstance(error, InfrastructureError) or self.execution_context is None
+154:                 or self._stopping or self.real is None or self.real.fault
+155:                 or not self.real.guard or self.real.guard.get('state') != 'ready'
+156:                 or time.monotonic()-self.real.guard_time > self.real.value(
+157:                     'hardware_guard_max_age_sec')):
+158:             return False
+159:         # Late goal acknowledgements also see this flag in TrackedClient.
+160:         self.execution_context.abort.set()
+161:         for handle, result in list(self.handles):
+162:             if not result.done():
+163:                 try:
+164:                     handle.cancel_goal_async()
+165:                 except Exception as cancel_error:
+166:                     self.get_logger().error(f'Action cancellation request failed: {cancel_error}')
+167:         self.event('stop_assessment_requested', reason=str(error))
+168:         return True
+169: 
+170:     def wait(self, future, timeout, *, monitor=False, cancel_on_timeout=True):
+171:         deadline = time.monotonic() + timeout
+172:         completed = threading.Event()
+173:         future.add_done_callback(lambda _: completed.set())
+174:         while not future.done():
+175:             self.check_execution()
+176:             if getattr(self, 'current_node', '') == 'SelectArmAndPath':
+177:                 self._selection_progress()
+178:             if time.monotonic() >= deadline:
+179:                 # Never cancel the response to a submitted Action goal: its
+180:                 # late acknowledgement still needs tracking and cancellation.
+181:                 if cancel_on_timeout and not any(future is f for f in self.submissions):
+182:                     future.cancel()
+183:                 raise OperationError(Error.TIMEOUT, 'ROS operation deadline exceeded')
+184:             if not self._stopping and (monitor or self.carrying is not None):
+185:                 if monitor and (self.real is None or not self.real.sensor_scene_frozen):
+186:                     self.scene_monitor.check()
+187:                 if self.real is None:
+188:                     self.measured()
+189:                 else:
+190:                     self.real.monitor()
+191:             # Sequential collision RPCs should resume on completion; the
+192:             # bounded wait still checks abort, deadlines and motion every 10 ms.
+193:             completed.wait(max(0., min(0.01, deadline-time.monotonic())))
+194:         return future.result()
+195: 
+196:     def execute(self, node: str, context: ExecutionContext) -> Observation:
+197:         self.execution_context, self.current_node = context, node
+198:         started = time.monotonic()
+199:         timeout_parameter = ('bt_selection_timeout_sec' if node == 'SelectArmAndPath'
+200:                              else 'bt_operation_timeout_sec')
+201:         self.deadline = started + self.value(timeout_parameter)
+202:         self._selection_started, self._selection_updated = started, 0.0
+203:         context.progress = ''
+204:         self._stopping = node in ('StopAndAssess', 'StopAfterRecovery')
+205:         operations = {
+206:             'ValidateGoal': self.validate, 'PrepareTarget': self.prepare,
+207:             'ReconstructTarget': self.reconstruct, 'GenerateGrasp': self.generate,
+208:             'SelectArmAndPath': self.select, 'MoveToPregrasp': self.pregrasp,
+209:             'ApproachObject': self.approach, 'GraspObject': self.grasp,
+210:             'ConfirmGrasp': self.confirm_grasp, 'LiftObject': self.lift,
+211:             'ConfirmHeld': self.confirm_held, 'CarryObject': self.carry,
+212:             'CheckPlacementTarget': self.check_placement, 'OpenGripperAtDestination': self.open,
+213:             'ConfirmRelease': self.confirm_release, 'ReturnArm': self.return_arm,
+214:             'VerifyPlacedObject': self.verify, 'StopAndAssess': self.stop,
+215:             'ReleaseInPlace': self.release_in_place, 'ReturnArmAfterCancel': self.return_arm,
+216:             'StopAfterRecovery': self.stop,
+217:         }
+218:         completed = False
+219:         try:
+220:             self.check_execution()
+221:             observation = operations[node](context)
+222:             completed = observation.success
+223:             return observation
+224:         except ExecutionCanceled as error:
+225:             return Observation(False, Error.CANCELED, str(error))
+226:         except OperationError as error:
+227:             return self._failure(context, error.error, str(error))
+228:         except Exception as error:
+229:             if not isinstance(error, (RuntimeError, ValueError)):
+230:                 raise  # Programming failures remain INTERNAL_ERROR/FATAL.
+231:             code = (Error.HARDWARE_ERROR if self.real is not None and self.real.fault else
+232:                 Error.TARGET_UNAVAILABLE if node in (
+233:                 'PrepareTarget', 'ReconstructTarget', 'GenerateGrasp', 'SelectArmAndPath') else
+234:                 Error.GRASP_FAILED if node in ('GraspObject', 'ConfirmGrasp') else
+235:                 Error.GRASP_LOST if node == 'ConfirmHeld' else
+236:                 Error.VERIFICATION_UNAVAILABLE if node in ('ConfirmRelease', 'VerifyPlacedObject') else
+237:                 Error.MOTION_FAILED)
+238:             return self._failure(context, code, str(error))
+239:         finally:
+240:             if self._stopping or (node in ('ConfirmHeld', 'VerifyPlacedObject') and completed):
+241:                 self.stop_wrist_camera()
+242:             elif not completed:
+243:                 # StopAndAssess must be able to cancel motion immediately. Send
+244:                 # camera shutdown now; assess its acknowledgement after stopping.
+245:                 self.request_wrist_camera_stop()
+246: 
+247:     @staticmethod
+248:     def _failure(context, error, message):
+249:         return Observation(False, error, message,
+250:             object_state=(ObjectState.LEFT_GRIPPER if context.release_confirmed else
+251:                           ObjectState.HELD if context.held else None),
+252:             arm_recovered=True if context.arm_recovered else None,
+253:             stop_confirmed=True if context.stop_confirmed else None)
+254: 
+255:     def validate(self, context):
+256:         temporary = temporary_return_mode(self.config)
+257:         if self.config.get('operation_mode', 'full_collection') != 'full_collection' and not temporary:
+258:             raise OperationError(Error.DESTINATION_UNAVAILABLE,
+259:                 'Collection Actions require commissioned full_collection destinations; current profile is hold-only')
+260:         if self.carrying is not None:
+261:             raise OperationError(Error.HARDWARE_ERROR, 'An attached or uncertain payload remains')
+262:         services = (self._snapshot, self._grasp, self.evidence) if grasp_identity_verification_required(
+263:             self.config) else (self._snapshot, self._grasp)
+264:         if not all(c.wait_for_service(timeout_sec=2.0) for c in services):
+265:             raise OperationError(Error.BACKEND_NOT_READY, 'Snapshot, grasp or physical evidence service unavailable')
+266:         if not all(c.wait_for_server(timeout_sec=2.0) for c in (self._inspection, self._selection)):
+267:             raise OperationError(Error.BACKEND_NOT_READY, 'Inspection or motion selection Action unavailable')
+268:         self.scene_monitor.wait()
+269:         self.real.monitor()
+270:         self.scene.restore()
+271:         for client in self.tracked_clients:
+272:             client._close_if_terminal()
+273:             client.reset_completed()
+274:         self.tracked_clients[:] = [client for client in self.tracked_clients if not client.destroyed]
+275:         self.submissions.clear()
+276:         self.handles.clear()
+277:         self.report = {'wrist_checks': 0}
+278:         self.events.clear()
+279:         self.arm_config = None
+280:         self.wrist_reference_id, self.wrist_request = '', None
+281:         self.before_observation = self.after_observation = self.pregrasp_pose = None
+282:         self.pickup_joints = None
+283:         self.pickup_return_pose = self.pickup_arm = None
+284:         self._pickup_departure_paths = self._pickup_departure_arm = None
+285:         self._approach_command_paths = None
+286:         self._approach_command_arm = None
+287:         return Observation(message='Physical control, depth map and evidence ports ready')
+288: 
+289:     def prepare(self, context):
+290:         goal = context.goal
+291:         response = self.call(self._snapshot, GetSceneSnapshot.Request(snapshot_id=goal.snapshot_id))
+292:         if not response.found:
+293:             raise OperationError(Error.STALE_TARGET, response.message)
+294:         array = response.detections
+295:         matches = [d for d in array.detections if d.object_id == goal.object_id]
+296:         if array.snapshot_id != goal.snapshot_id or len(matches) != 1:
+297:             raise OperationError(Error.TARGET_UNAVAILABLE, 'Approved snapshot/object is absent or ambiguous')
+298:         target = matches[0]
+299:         if not target.distance_valid or not math.isfinite(target.distance_m) or target.distance_m <= 0:
+300:             raise OperationError(Error.TARGET_UNAVAILABLE, 'Approved target has no valid sensor depth')
+301:         expected = {'collect_trash': 'trash', 'collect_lost_item': 'lost_item'}[goal.skill_name]
+302:         if (target.sorting_category != expected
+303:                 or not math.isfinite(target.confidence)
+304:                 or not self.value('bt_minimum_confidence') <= target.confidence <= 1):
+305:             raise OperationError(Error.TARGET_UNAVAILABLE, 'Model classification does not match approved skill')
+306:         filtered = select_closest_eligible([target], denylist=tuple(self.value('bt_denylist')),
+307:             maximum_smaller_extent_m=float(self.value('bt_maximum_smaller_extent_m')))
+308:         if filtered.selected_index is None:
+309:             raise OperationError(Error.TARGET_UNAVAILABLE, filtered.decisions[0].detail)
+310:         configured = self.config['label_destinations'].get(target.label,
+311:             self.config['label_destinations'].get('*'))
+312:         if goal.destination_id != configured:
+313:             raise OperationError(Error.DESTINATION_UNAVAILABLE, 'Destination does not match commissioned label policy')
+314:         context.snapshot, context.target = deepcopy(array), deepcopy(target)
+315:         return Observation(message=f'Approved target {goal.snapshot_id}/{goal.object_id}')
+316: 
+317:     def reconstruct(self, context):
+318:         goal = context.goal
+319:         result = self.run_action(self._inspection, InspectScene.Goal(
+320:             snapshot_id=goal.snapshot_id, selected_object_id=goal.object_id),
+321:             self.value('bt_operation_timeout_sec'))
+322:         if (not result.success or result.objects.snapshot_id != goal.snapshot_id
+323:                 or result.objects.header.frame_id != self.config['frame']
+324:                 or len(result.objects.objects) != 1
+325:                 or result.objects.objects[0].object_id != goal.object_id
+326:                 or result.objects.objects[0].label != context.target.label):
+327:             raise OperationError(Error.TARGET_UNAVAILABLE, 'Selected-object reconstruction identity mismatch')
+328:         self._object_radius(result.objects.objects[0])
+329:         context.inspected = result
+330:         pinned = self.call(self.reference, ObserveObjectReference.Request(
+331:             operation=ObserveObjectReference.Request.PIN,
+332:             source_snapshot_id=goal.snapshot_id, source_object_id=goal.object_id))
+333:         if (not pinned.reference_id or pinned.source_snapshot_id != goal.snapshot_id
+334:                 or pinned.source_object_id != goal.object_id):
+335:             raise OperationError(Error.STALE_TARGET, 'Pinned object identity mismatch')
+336:         context.verification_id = pinned.reference_id
+337:         return Observation()
+338: 
+339:     def generate(self, context):
+340:         result = context.inspected
+341:         goal = context.goal
+342:         response = self.call(self._grasp, PlanGrasp.Request(snapshot_id=goal.snapshot_id,
+343:             object_id=goal.object_id, target_cloud=result.target_cloud,
+344:             context_cloud=result.context_cloud, target_object=result.objects.objects[0],
+345:             target_object_header=result.objects.header), self.value('bt_operation_timeout_sec'))
+346:         if not response.candidates or any(c.snapshot_id != goal.snapshot_id or c.object_id != goal.object_id
+347:                                           for c in response.candidates):
+348:             raise OperationError(Error.TARGET_UNAVAILABLE, 'Grasp candidates absent or bound to another object')
+349:         context.grasps = response
+350:         return Observation()
+351: 
+352:     def select(self, context):
+353:         center = context.inspected.objects.objects[0].obb_pose.position
+354:         arms = [arm for arm in (('left', 'right') if center.y >= 0 else ('right', 'left'))
+355:                 if arm in self.config['arms']]
+356:         for arm in arms:
+357:             self._selection_detail = f'arm={arm}: waiting for candidate IK and path selection'
+358:             self._selection_progress(force=True)
+359:             selected = self.run_action(self._selection, SelectReachableGrasp.Goal(
+360:                 candidates=context.grasps.candidates, required_arm=arm),
+361:                 self.value('bt_selection_timeout_sec'), allow_aborted=True,
+362:                 feedback_callback=self._selection_feedback)
+363:             if selected.success:
+364:                 break
+365:         else:
+366:             raise OperationError(Error.TARGET_UNAVAILABLE, 'No reachable commissioned arm')
+367:         if (selected.selected_arm != arm or selected.selected_candidate.snapshot_id != context.goal.snapshot_id
+368:                 or selected.selected_candidate.object_id != context.goal.object_id):
+369:             raise OperationError(Error.STALE_TARGET, 'Motion selector changed approved object or arm')
+370:         result = ValidatePick.Result(success=True, reference_id=context.verification_id,
+371:             selected_object=context.inspected.objects.objects[0],
+372:             selected_detection=context.target, detections=context.snapshot,
+373:             candidates=context.grasps.candidates)
+374:         ValidatePickNode._copy_selection_result(result, selected)
+375:         context.selected = result
+376:         self.before_execution(result)
+377:         if self.destination != context.goal.destination_id:
+378:             raise OperationError(Error.DESTINATION_UNAVAILABLE, 'Selected-arm destination mismatch')
+379:         self.before_observation = self.after_observation = None
+380:         if self.head_reobservation_required():
+381:             self.before_observation = self.observe(result.reference_id, self.get_clock().now().nanoseconds)
+382:             self._check_object_envelope(result, self.before_observation)
+383:         else:
+384:             self.report.update(target_motion_assumed_stationary=True,
+385:                                head_reobservation_performed=False)
+386:             self.event('stationary_target_assumed', snapshot_id=context.goal.snapshot_id,
+387:                        object_id=context.goal.object_id, frame=self.config['frame'])
+388:         if self.wrist_observation_required():
+389:             self.start_wrist_camera(arm)
+390:         return Observation(selected_arm=arm)
+391: 
+392:     def _selection_feedback(self, message) -> None:
+393:         update = message.feedback
+394:         self._selection_detail = (
+395:             f'arm={update.arm} candidate={update.candidate_index} '
+396:             f'stage={update.stage}: {update.message}')
+397:         self._selection_progress(force=True)
+398: 
+399:     def _selection_progress(self, *, force: bool = False) -> None:
+400:         now = time.monotonic()
+401:         if not force and now - self._selection_updated < 2.0:
+402:             return
+403:         self._selection_updated = now
+404:         self.execution_context.progress = (
+405:             f'SelectArmAndPath {self._selection_detail}; '
+406:             f'elapsed={now - self._selection_started:.1f}s')
+407: 
+408:     @staticmethod
+409:     def _object_radius(obj) -> float:
+410:         center, extent = obj.obb_pose.position, obj.obb_size
+411:         extents = (extent.x, extent.y, extent.z)
+412:         radius = math.hypot(*extents) / 2
+413:         if (not all(math.isfinite(v) for v in (center.x, center.y, center.z, *extents, radius))
+414:                 or any(v < 0 for v in extents) or radius <= 0):
+415:             raise OperationError(Error.TARGET_UNAVAILABLE, 'Approved object geometry is invalid')
+416:         return radius
+417: 
+418:     def observe(self, reference_id, after):
+419:         response = super().observe(reference_id, after)
+420:         goal = self.execution_context.goal
+421:         stamp = response.header.stamp.sec * 10**9 + response.header.stamp.nanosec
+422:         if (response.reference_id != reference_id or response.source_snapshot_id != goal.snapshot_id
+423:                 or response.source_object_id != goal.object_id
+424:                 or not after < stamp <= self.get_clock().now().nanoseconds):
+425:             raise OperationError(Error.STALE_TARGET, 'Reference observation is stale or belongs to another target')
+426:         return response
+427: 
+428:     def _check_object_envelope(self, selected, observation):
+429:         center = selected.selected_object.obb_pose.position
+430:         radius = self._object_radius(selected.selected_object)
+431:         observed = observation.observed_center
+432:         tolerance = float(self.get_parameter('maximum_target_translation_m').value)
+433:         if (observation.header.frame_id != self.config['frame']
+434:                 or not all(math.isfinite(v) for v in (observed.x, observed.y, observed.z, tolerance))
+435:                 or tolerance < 0):
+436:             raise OperationError(Error.STALE_TARGET, 'Fresh target geometry, frame or tolerance is invalid')
+437:         approved_xyz = (center.x, center.y, center.z)
+438:         observed_xyz = (observed.x, observed.y, observed.z)
+439:         displacement = math.dist(approved_xyz, observed_xyz)
+440:         allowed = radius + tolerance
+441:         if displacement > allowed:
+442:             approved = ','.join(f'{value:.6f}' for value in approved_xyz)
+443:             fresh = ','.join(f'{value:.6f}' for value in observed_xyz)
+444:             raise OperationError(Error.STALE_TARGET,
+445:                 'Fresh target is outside the approved object geometry: '
+446:                 f'distance={displacement:.6f}m allowed={allowed:.6f}m '
+447:                 f'object_radius={radius:.6f}m margin={tolerance:.6f}m '
+448:                 f'approved_center=({approved}) observed_center=({fresh}) '
+449:                 f'frame={observation.header.frame_id}')
+450: 
+451:     def pregrasp(self, context):
+452:         selected = context.selected
+453:         self.before_observation = self.after_observation = None
+454:         if self.head_reobservation_required():
+455:             # An expensive grasp/IK calculation cannot authorize a stale target.
+456:             self.before_observation = self.observe(selected.reference_id, self.get_clock().now().nanoseconds)
+457:             self._check_object_envelope(selected, self.before_observation)
+458:         arrival = self.execute_pregrasp(selected)
+459:         self.report['pregrasp_executed'] = self.config.get('pregrasp_motion_enabled', True)
+460:         if self.head_reobservation_required():
+461:             self.after_observation = self.observe_arrival(selected, self.before_observation, arrival, self.report)
+462:             self._check_object_envelope(selected, self.after_observation)
+463:             before, after = self.before_observation.observed_center, self.after_observation.observed_center
+464:             self.validate_target_translation(selected, self.before_observation, self.after_observation,
+465:                 math.dist((before.x, before.y, before.z), (after.x, after.y, after.z)), self.report)
+466:         if self.wrist_observation_required():
+467:             observed = self.after_observation
+468:             request = ObserveWristTarget.Request(operation=ObserveWristTarget.Request.HANDOFF,
+469:                 arm=selected.selected_arm, source_snapshot_id=context.goal.snapshot_id,
+470:                 source_object_id=context.goal.object_id, label=context.target.label,
+471:                 detector_label=context.target.detector_label,
+472:                 source_confidence=float(context.target.confidence), after_stamp_ns=arrival)
+473:             request.expected_pose.header = deepcopy(observed.header)
+474:             request.expected_pose.pose.position = deepcopy(observed.observed_center)
+475:             request.expected_pose.pose.orientation.w = 1.0
+476:             request.size = deepcopy(observed.observed_extent)
+477:             response = self.call(self.wrist, request)
+478:             if (not response.reference_id or response.source_snapshot_id != context.goal.snapshot_id
+479:                     or response.source_object_id != context.goal.object_id):
+480:                 raise OperationError(Error.STALE_TARGET, 'Wrist handoff identity mismatch')
+481:             request.reference_id = response.reference_id
+482:             request.operation = request.CHECK
+483:             request.after_stamp_ns = response.header.stamp.sec * 10**9 + response.header.stamp.nanosec
+484:             self.wrist_request, self.wrist_reference_id = request, response.reference_id
+485:         return Observation()
+486: 
+487:     def approach(self, context):
+488:         selected = context.selected
+489:         object_id = 'physical_payload_' + context.goal.execution_id
+490:         if self.config.get('approach_execution_replanning_enabled', False):
+491:             def prepare_pregrasp(reselected):
+492:                 context.selected = reselected
+493:                 self.pregrasp(context)
+494:             selected, self.pregrasp_pose = self.approach_with_candidate_reselection(
+495:                 selected, self.report, object_id=object_id, prepare_pregrasp=prepare_pregrasp)
+496:             context.selected = selected
+497:         else:
+498:             self.scene.begin(selected.selected_candidate, object_id)
+499:             self.scene.allow_contacts_for(selected.selected_arm)
+500:             self.pregrasp_pose = self.pose(selected.selected_arm)
+501:             with self.record_approach_commands(selected.selected_arm):
+502:                 if self.config.get('visual_servo_enabled', False):
+503:                     self.visual_approach(selected, self.before_observation, self.after_observation, self.report)
+504:                 else:
+505:                     self.approach_target(selected, self.report)
+506:         if not self.config.get('pregrasp_motion_enabled', True):
+507:             self.pregrasp_pose = self.pose(selected.selected_arm)
+508:         if temporary_return_mode(self.config):
+509:             self.capture_pickup(selected.selected_arm)
+510:         return Observation()
+511: 
+512:     def grasp(self, context):
+513:         context.gripper_engaged = True
+514:         self.grasp_after_ns = self.get_clock().now().nanoseconds
+515:         if not contact_verification_required(self.config):
+516:             self.jaw(context.selected.selected_arm, self.arm_config.closed, 'close_assumed',
+517:                      check_collisions=self.config.get('grasp_collision_check_enabled', True))
+518:             self.report.update(grasp_assumed=True, grasp_verified=False, contact_verification='SKIPPED')
+519:             self.event('grasp_assumed_without_evidence')
+520:         else:
+521:             self.close_until_contact(context.selected, self.report)
+522:         return Observation()
+523: 
+524:     def confirm_grasp(self, context):
+525:         if contact_verification_required(self.config):
+526:             self.real.wait_for_contact(context.selected.selected_arm, self.grasp_after_ns)
+527:             if grasp_identity_verification_required(self.config):
+528:                 self.confirm_wrist_target(self.report, 0)
+529:                 self.verify_evidence(context.selected, CheckManipulation.Request.GRASP,
+530:                                      self.grasp_after_ns)
+531:         context.held = True
+532:         self.attach(context.selected, 'physical_payload_' + context.goal.execution_id)
+533:         return Observation(object_state=ObjectState.HELD)
+534: 
+535:     def lift(self, context):
+536:         arm = context.selected.selected_arm
+537:         lift_collisions = self.config.get('lift_collision_check_enabled', True)
+538:         self.report['lift_collision_checks_enabled'] = lift_collisions
+539:         if not lift_collisions:
+540:             self.event('lift_collision_checks_disabled', arm=arm)
+541:         with self.record_pickup_departure(arm):
+542:             if self.config.get('pregrasp_motion_enabled', True):
+543:                 self.retreat_to_pregrasp(arm, self.pregrasp_pose, self.report,
+544:                                         check_collisions=lift_collisions)
+545:             bottom = self.pose(arm)
+546:             top = deepcopy(bottom)
+547:             if (self.config.get('lift_height_correction_enabled', False)
+548:                     and self.config.get('pregrasp_motion_enabled', True)):
+549:                 top.position.z = max(top.position.z, self.pregrasp_pose.position.z)
+550:             top.position.z += self.config['lift_height_m']
+551:             self.lift_after_ns = self.get_clock().now().nanoseconds
+552:             self.linear(arm, top, 'lift', check_collisions=lift_collisions)
+553:             if self.config.get('lift_height_correction_enabled', False):
+554:                 self.correct_height_endpoint(arm, top, 'lift', self.report,
+555:                                              check_collisions=lift_collisions)
+556:             height = self.pose(arm).position.z - bottom.position.z
+557:             self.report['lift_height_from_fk_m'] = height
+558:         return Observation()
+559: 
+560:     def confirm_held(self, context):
+561:         if self.wrist_observation_required():
+562:             self.confirm_held_target(context.selected, self.pose(context.selected.selected_arm), self.report)
+563:         if contact_verification_required(self.config):
+564:             if grasp_identity_verification_required(self.config):
+565:                 self.verify_evidence(context.selected, CheckManipulation.Request.LIFT, self.lift_after_ns)
+566:                 self.report.update(grasp_verified=True,
+567:                                    grasp_evidence='motor_contact_and_fresh_wrist_identity_after_lift')
+568:             else:
+569:                 self.real.wait_for_contact(context.selected.selected_arm, self.lift_after_ns)
+570:                 self.report.update(grasp_verified=False, grasp_identity_verified=False,
+571:                                    grasp_evidence='motor_contact_only_after_lift')
+572:         return Observation(object_state=ObjectState.HELD)
+573: 
+574:     def carry(self, context):
+575:         if temporary_return_mode(self.config):
+576:             self.report.update(self.return_to_pickup(context.selected.selected_arm, self.pregrasp_pose))
+577:             return Observation(message='Payload reached the configured pickup release position')
+578:         else:
+579:             self.move_joint_pose(context.selected.selected_arm, self.arm_config.bins[context.goal.destination_id], 'transport')
+580:         return Observation()
+581: 
+582:     def check_placement(self, context):
+583:         if temporary_return_mode(self.config):
+584:             try:
+585:                 self.check_pickup_arrival(context.selected.selected_arm)
+586:             except ValueError as error:
+587:                 raise OperationError(Error.DESTINATION_UNAVAILABLE, str(error)) from error
+588:             return Observation()
+589:         self.real.monitor()
+590:         measured = self.measured()
+591:         actual = dict(zip(measured.name, measured.position))
+592:         target = self.arm_config.bins[context.goal.destination_id]
+593:         tolerance = self.real.value('hardware_arrival_tolerance_rad')
+594:         if any(abs(actual[n] - q) > tolerance for n, q in zip(ARM_JOINT_NAMES[context.selected.selected_arm], target)):
+595:             raise OperationError(Error.DESTINATION_UNAVAILABLE, 'Measured arm is outside commissioned release pose')
+596:         return Observation()
+597: 
+598:     def open(self, context):
+599:         context.release_stamp_ns = self.get_clock().now().nanoseconds
+600:         self.releasing = True
+601:         self.jaw(context.selected.selected_arm, self.arm_config.opened, 'release',
+602:                  check_collisions=self.config.get('gripper_opening_collision_check_enabled', True))
+603:         return Observation()
+604: 
+605:     def _outcome(self, context, stage, after):
+606:         selected = context.selected
+607:         request = CheckManipulation.Request(stage=stage, arm=selected.selected_arm,
+608:             reference_id=selected.reference_id, wrist_reference_id=self.wrist_reference_id,
+609:             source_snapshot_id=context.goal.snapshot_id, source_object_id=context.goal.object_id,
+610:             destination_id=context.goal.destination_id, after_stamp_ns=after)
+611:         from cleany_skill_executor.core.collection import check_evidence
+612:         deadline = time.monotonic() + self.value('bt_verification_timeout_sec')
+613:         while time.monotonic() < deadline:
+614:             response = self.wait(self.evidence.call_async(request), deadline-time.monotonic())
+615:             if response is not None and response.success:
+616:                 try:
+617:                     check_evidence(response, request, self.get_clock().now().nanoseconds,
+618:                                    self.config['evidence_max_age_sec'])
+619:                 except RuntimeError:
+620:                     pass  # Fresh negative evidence is not a positive outcome.
+621:                 else:
+622:                     return response
+623:             self._spin_guarded(0.01)
+624:         raise OperationError(Error.VERIFICATION_TIMEOUT, 'Independent object/destination outcome not confirmed')
+625: 
+626:     def confirm_release(self, context):
+627:         if temporary_return_mode(self.config):
+628:             self.report.update(release_verified=False, placement_verified=False, placement_state='ASSUMED')
+629:             self.event('release_assumed_at_pickup', destination_id=context.goal.destination_id)
+630:         else:
+631:             self._outcome(context, CheckManipulation.Request.RELEASE, context.release_stamp_ns)
+632:         context.release_confirmed = True
+633:         if self.carrying is not None:
+634:             self.carrying['release_confirmed'] = True
+635:             self.detach()
+636:         self.scene.restore()
+637:         self.release_grasp_scene_freeze()
+638:         return Observation(object_state=ObjectState.LEFT_GRIPPER)
+639: 
+640:     def return_arm(self, context):
+641:         arm = context.selected.selected_arm
+642:         retreat = temporary_return_mode(self.config) and context.release_confirmed
+643:         prepare = getattr(self.real, 'return_preparation', None)
+644:         with prepare(arm) if retreat and prepare is not None else nullcontext():
+645:             if retreat:
+646:                 self.pickup_release_retreat(arm, self.pregrasp_pose)
+647:             self.move_arm_return(arm, self.arm_config.home,
+648:                                  self.arm_config.closed, planned_event='return_planned')
+649:         context.arm_recovered = True
+650:         return Observation(arm_recovered=True)
+651: 
+652:     def move_arm_return(self, arm, home, gripper_closed, *, planned_event='manual_return_planned'):
+653:         from .arm_return_motion import move_arm_return
+654:         return move_arm_return(self, arm, home, gripper_closed, planned_event=planned_event)
+655: 
+656:     def verify(self, context):
+657:         placement = Placement.ASSUMED if temporary_return_mode(self.config) else Placement.CONFIRMED
+658:         if placement == Placement.CONFIRMED:
+659:             self._outcome(context, CheckManipulation.Request.PLACEMENT, self.get_clock().now().nanoseconds)
+660:         confirmed = self._assess_stationary(context, cancel=False)
+661:         if not confirmed:
+662:             return Observation(False, Error.STOP_UNCONFIRMED, 'Final physical stop was not observed',
+663:                                placement_state=placement, stop_confirmed=False)
+664:         self._clear_references(context)
+665:         return Observation(placement_state=placement, stop_confirmed=True)
+666: 
+667:     def release_in_place(self, context):
+668:         if not context.gripper_engaged or context.release_confirmed:
+669:             return Observation(object_state=ObjectState.LEFT_GRIPPER if context.release_confirmed else None)
+670:         self.open(context)
+671:         self.confirm_release(context)
+672:         return Observation(object_state=ObjectState.LEFT_GRIPPER)
+673: 
+674:     def _clear_references(self, context):
+675:         if self.wrist_request is not None:
+676:             request = deepcopy(self.wrist_request)
+677:             request.operation = request.CLEAR
+678:             self.call(self.wrist, request)
+679:             self.wrist_request, self.wrist_reference_id = None, ''
+680:         if context.verification_id:
+681:             self.call(self.reference, ObserveObjectReference.Request(
+682:                 operation=ObserveObjectReference.Request.CLEAR, reference_id=context.verification_id))
+683:             context.verification_id = ''
+684: 
+685:     def _assess_stationary(self, context, *, cancel):
+686:         started = time.monotonic()
+687:         barrier = self.get_clock().now().nanoseconds
+688:         window = StationaryWindow(barrier_ns=barrier, started_at=started,
+689:             max_age_sec=float(self.value('bt_stop_feedback_max_age_sec')),
+690:             maximum_velocity=float(self.value('bt_stationary_velocity_rad_s')),
+691:             required_samples=int(self.value('bt_stationary_samples')),
+692:             minimum_duration_sec=float(self.value('bt_stationary_duration_sec')))
+693:         canceled = set()
+694:         while time.monotonic() - started < self.value('bt_stop_timeout_sec'):
+695:             if cancel:
+696:                 for handle, result in list(self.handles):
+697:                     if not result.done() and id(handle) not in canceled:
+698:                         try:
+699:                             handle.cancel_goal_async()
+700:                         except Exception as error:
+701:                             self.get_logger().error(f'Could not request Action cancellation: {error}')
+702:                             self.real.fail_stop()
+703:                             return False
+704:                         canceled.add(id(handle))
+705:             with self._feedback_lock:
+706:                 confirmed = window.observe(self._feedback, now=time.monotonic(),
+707:                     clock_ns=self.get_clock().now().nanoseconds, terminal=self.quiescent())
+708:             if confirmed:
+709:                 context.stop_confirmed = True
+710:                 return True
+711:             time.sleep(0.01)
+712:         if cancel:
+713:             self.real.fail_stop()
+714:         return False
+715: 
+716:     def stop(self, context):
+717:         context.abort.set()
+718:         confirmed = self._assess_stationary(context, cancel=True)
+719:         if confirmed and self.carrying is None:
+720:             self.scene.restore()
+721:             self.release_grasp_scene_freeze()
+722:             if not context.gripper_engaged or context.release_confirmed:
+723:                 self._clear_references(context)
+724:         return Observation(confirmed, Error.NONE if confirmed else Error.STOP_UNCONFIRMED,
+725:             'Fresh joints and terminal Actions confirmed stop' if confirmed else 'Physical stop unconfirmed',
+726:             stop_confirmed=confirmed)
+727: 
+728:     def destroy_node(self):
+729:         pool = getattr(self, '_motion_client_pool', None)
+730:         if pool is not None:
+731:             pool.close()
+732:         if hasattr(self, 'scene_monitor'):
+733:             self.scene_monitor.close()
+734:         for client in self.tracked_clients:
+735:             if not client.destroyed:
+736:                 client.client.destroy()
+737:                 client.destroyed = True
+738:         return super().destroy_node()

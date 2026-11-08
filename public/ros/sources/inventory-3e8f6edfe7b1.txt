@@ -1,0 +1,30 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/physical_moveit_adapter.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: bd0630aea38ad923243ab26553021df95ab2b2dbbf495d285e4e7bfcc7eea863
+
+147:     ) -> None:
+148:         self._node = node
+149:         self._config = config
+150:         self._ik_client = ik_client or node.create_client(GetPositionIK, '/compute_ik')
+151:         self._fk_client = fk_client
+152:         if self._fk_client is None and hasattr(node, 'create_client'):
+153:             self._fk_client = node.create_client(GetPositionFK, '/compute_fk')
+154:         self._validity_client = validity_client or node.create_client(
+155:             GetStateValidity, '/check_state_validity'
+156:         )
+157:         self._plan_client = plan_client or ActionClient(node, MoveGroup, '/move_action')
+158:         self._cartesian_client = cartesian_client
+159:         self._monotonic = monotonic
+160:         self._spin_once = spin_once or self._default_spin
+161:         self._current_state: JointState | None = None
+162:         self._gripper_positions: dict[str, float] = {}
+1018:         if start.names != names or goal.names != names:
+1019:             raise InfrastructureError('Cartesian approach joint mapping mismatch')
+1020:         if self._cartesian_client is None:
+1021:             self._cartesian_client = self._node.create_client(GetCartesianPath, '/compute_cartesian_path')
+1022:         request = GetCartesianPath.Request()
+1023:         request.header.frame_id = self._config.base_frame
+1024:         request.group_name, request.link_name = f'{arm}_grasp_arm', f'{arm}_grasp_tcp'
+1025:         request.start_state = self._merged_state(start)
+1026:         target = Pose()

@@ -1,0 +1,14 @@
+ros2_ws/src/cleany_moveit_capabilities/src/state_validity_batch.cpp
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 374b5a4004a9013ac9955b5e3d1fe105d935c0849a3ae4e4e02a5bfbfd61b4b5
+
+112:         throw std::runtime_error("Collision detector mismatch; refusing planning services");
+113:       }
+114:     }
+115:     service_ = node->create_service<BatchValidity>("check_state_validity_batch",
+116:         [this, node](const std::shared_ptr<BatchValidity::Request> request,
+117:                      const std::shared_ptr<BatchValidity::Response> response) {
+118:           try
+119:           {
+120:             planning_scene_monitor::LockedPlanningSceneRO scene(context_->planning_scene_monitor_);

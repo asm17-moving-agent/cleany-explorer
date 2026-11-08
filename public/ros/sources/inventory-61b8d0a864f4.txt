@@ -1,0 +1,238 @@
+ros2_ws/src/cleany_perception/cleany_perception/depth_scene_node.py
+Review: 2026-11-02
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 41ac3d13e220976c64f29289e51e280acf45bed4850d5d82ca9af1cb052d1236
+
+1: """Publish sensor-only scene clouds for RViz and MoveIt."""
+2: from __future__ import annotations
+3: 
+4: import math
+5: import time
+6: from collections import OrderedDict
+7: 
+8: import rclpy
+9: from rclpy.executors import ExternalShutdownException
+10: from rclpy.node import Node
+11: from rclpy.qos import qos_profile_sensor_data
+12: from sensor_msgs.msg import CameraInfo, Image, PointCloud2
+13: from std_srvs.srv import SetBool
+14: 
+15: from cleany_perception.depth_scene_cloud import depth_scene_cloud
+16: 
+17: 
+18: class DepthSceneNode(Node):
+19:     """Publish sensor depth as a scene cloud for visualization and mapping.
+20: 
+21:     Subscriptions:
+22:         /camera/depth/image_rect_raw (sensor_msgs/msg/Image): Captured depth.
+23:         /camera/depth/camera_info (sensor_msgs/msg/CameraInfo): Projection intrinsics.
+24: 
+25:     Publishers:
+26:         /perception/scene_cloud (sensor_msgs/msg/PointCloud2): Nonempty measured
+27:             cloud in the capture frame, with the original stamp.
+28: 
+29:     QoS:
+30:         Inputs use best-effort depth 1; output uses reliable depth 1.
+31: 
+32:     Notes:
+33:         Topic names are configurable defaults. Repeated, stale, invalid or empty
+34:         samples are skipped. No cloud is computed without an output subscriber.
+35:     """
+36:     def __init__(self) -> None:
+37:         super().__init__('depth_scene_node')
+38:         defaults = {
+39:             'depth_image_topic': '/camera/depth/image_raw',
+40:             'depth_info_topic': '/camera/depth/camera_info',
+41:             'cloud_topic': '/perception/scene_cloud',
+42:             'updates_service': '/perception/scene_cloud_updates_enabled',
+43:             'minimum_depth_m': 0.1,
+44:             'maximum_depth_m': 2.0,
+45:             'pixel_stride': 2,
+46:             'publish_rate_hz': 2.0,
+47:             'maximum_depth_age_sec': 1.0,
+48:             'diagnostic_interval_sec': 5.0,
+49:             'depth_16u_scale_m': 0.001,
+50:             'workspace_roi_pixels': [-1.0, -1.0, -1.0, -1.0],
+51:         }
+52:         for name, value in defaults.items():
+53:             self.declare_parameter(name, value)
+54:         rate = float(self.get_parameter('publish_rate_hz').value)
+55:         if not math.isfinite(rate) or rate <= 0:
+56:             raise ValueError('publish_rate_hz must be positive and finite')
+57:         interval = float(self.get_parameter('diagnostic_interval_sec').value)
+58:         if not math.isfinite(interval) or interval <= 0:
+59:             raise ValueError('diagnostic_interval_sec must be positive and finite')
+60:         self._depth: Image | None = None
+61:         self._info: CameraInfo | None = None
+62:         self._depths = OrderedDict()
+63:         self._infos = OrderedDict()
+64:         self._published_stamp: tuple[int, int] | None = None
+65:         self._updates_enabled = True
+66:         self._created_wall_sec = time.monotonic()
+67:         self._last_publication_wall_sec: float | None = None
+68:         self._last_diagnostic_wall_sec: float | None = None
+69:         self._input_counts = {'depth': 0, 'info': 0}
+70:         # This is a live sensor stream, not a reliable command channel.  A
+71:         # reliable publisher can block indefinitely while MoveIt temporarily
+72:         # holds its planning-scene/octomap lock during a query.  Keeping the
+73:         # newest best-effort cloud lets the 2 Hz producer continue and lets the
+74:         # freshness guard reject any genuinely stale map.
+75:         self._publisher = self.create_publisher(
+76:             PointCloud2,
+77:             str(self.get_parameter('cloud_topic').value),
+78:             qos_profile_sensor_data,
+79:         )
+80:         self.create_subscription(
+81:             Image, str(self.get_parameter('depth_image_topic').value),
+82:             self._on_depth, qos_profile_sensor_data,
+83:         )
+84:         self.create_subscription(
+85:             CameraInfo, str(self.get_parameter('depth_info_topic').value),
+86:             self._on_info, qos_profile_sensor_data,
+87:         )
+88:         self.create_service(
+89:             SetBool,
+90:             str(self.get_parameter('updates_service').value),
+91:             self._set_updates_enabled,
+92:         )
+93:         self.create_timer(1.0 / rate, self._publish)
+94: 
+95:     def _set_updates_enabled(self, request, response):
+96:         """Pause/resume only the cloud feeding MoveIt's OctoMap updater."""
+97:         self._updates_enabled = bool(request.data)
+98:         response.success = True
+99:         response.message = (
+100:             'Scene cloud updates enabled'
+101:             if self._updates_enabled
+102:             else 'Scene cloud updates frozen'
+103:         )
+104:         self.get_logger().info(response.message)
+105:         return response
+106: 
+107:     def _on_depth(self, message: Image) -> None:
+108:         self._input_counts['depth'] += 1
+109:         self._insert(self._depths, message)
+110: 
+111:     def _on_info(self, message: CameraInfo) -> None:
+112:         self._input_counts['info'] += 1
+113:         self._insert(self._infos, message)
+114: 
+115:     @staticmethod
+116:     def _insert(cache, message):
+117:         cache[(message.header.stamp.sec, message.header.stamp.nanosec)] = message
+118:         while len(cache) > 12:
+119:             cache.popitem(last=False)
+120: 
+121:     def _report_stall(self, reason: str) -> None:
+122:         """Explain missing output without relaxing capture or matching checks."""
+123:         created = getattr(self, '_created_wall_sec', None)
+124:         if created is None:
+125:             return
+126:         now = time.monotonic()
+127:         last_publication = self._last_publication_wall_sec
+128:         gap = now - (created if last_publication is None else last_publication)
+129:         interval = float(self.get_parameter('diagnostic_interval_sec').value)
+130:         previous = self._last_diagnostic_wall_sec
+131:         if gap < interval or (previous is not None and now - previous < interval):
+132:             return
+133:         now_ns = self.get_clock().now().nanoseconds
+134: 
+135:         def age(cache) -> str:
+136:             if not cache:
+137:                 return 'not_received'
+138:             sec, nanosec = max(cache)
+139:             return f'{(now_ns - sec * 1_000_000_000 - nanosec) / 1e9:.3f}'
+140: 
+141:         common = self._depths.keys() & self._infos.keys()
+142:         text = (
+143:             f'Scene cloud stalled: reason={reason} output_gap_sec={gap:.3f} '
+144:             f'subscribers={self._publisher.get_subscription_count()} '
+145:             f'depth_received={self._input_counts["depth"]} '
+146:             f'info_received={self._input_counts["info"]} '
+147:             f'depth_cache={len(self._depths)} info_cache={len(self._infos)} '
+148:             f'matching_stamps={len(common)} depth_age_sec={age(self._depths)} '
+149:             f'info_age_sec={age(self._infos)} pair_age_sec={age(common)}'
+150:         )
+151:         logger = self.get_logger()
+152:         if reason in ('updates_paused', 'no_cloud_subscriber'):
+153:             logger.info(text)
+154:         else:
+155:             logger.warning(text)
+156:         self._last_diagnostic_wall_sec = now
+157: 
+158:     def _publish(self) -> None:
+159:         if not self._updates_enabled:
+160:             DepthSceneNode._report_stall(self, 'updates_paused')
+161:             return
+162:         if not self._publisher.get_subscription_count():
+163:             DepthSceneNode._report_stall(self, 'no_cloud_subscriber')
+164:             return
+165:         keys = self._depths.keys() & self._infos.keys()
+166:         if not keys:
+167:             reason = ('missing_depth' if not self._depths else
+168:                       'missing_camera_info' if not self._infos else
+169:                       'unmatched_timestamps')
+170:             DepthSceneNode._report_stall(self, reason)
+171:             return
+172:         key = max(keys)
+173:         self._depth, self._info = self._depths[key], self._infos[key]
+174:         stamp = self._depth.header.stamp
+175:         key = (stamp.sec, stamp.nanosec)
+176:         age = (self.get_clock().now().nanoseconds
+177:                - stamp.sec * 1_000_000_000 - stamp.nanosec) / 1e9
+178:         maximum_age = float(self.get_parameter('maximum_depth_age_sec').value)
+179:         if key == self._published_stamp:
+180:             DepthSceneNode._report_stall(self, 'no_new_matching_frame')
+181:             return
+182:         if not 0 <= age <= maximum_age:
+183:             DepthSceneNode._report_stall(self, 'future_depth' if age < 0 else 'stale_depth')
+184:             return
+185:         try:
+186:             cloud = depth_scene_cloud(
+187:                 self._depth, self._info,
+188:                 float(self.get_parameter('minimum_depth_m').value),
+189:                 float(self.get_parameter('maximum_depth_m').value),
+190:                 int(self.get_parameter('pixel_stride').value),
+191:                 float(self.get_parameter('depth_16u_scale_m').value),
+192:                 workspace_roi_pixels=(
+193:                     ()
+194:                     if list(self.get_parameter('workspace_roi_pixels').value)
+195:                     == [-1.0] * 4
+196:                     else tuple(
+197:                         self.get_parameter('workspace_roi_pixels').value
+198:                     )
+199:                 ),
+200:             )
+201:         except ValueError as error:
+202:             self.get_logger().warning(
+203:                 f'Scene cloud rejected: {error}', throttle_duration_sec=5
+204:             )
+205:             DepthSceneNode._report_stall(self, 'invalid_depth_or_calibration')
+206:             return
+207:         if not cloud.width:
+208:             DepthSceneNode._report_stall(self, 'no_valid_depth_points')
+209:             return
+210:         self._publisher.publish(cloud)
+211:         self._published_stamp = key
+212:         self._last_publication_wall_sec = time.monotonic()
+213:         if getattr(self, '_last_diagnostic_wall_sec', None) is not None:
+214:             self.get_logger().info(
+215:                 f'Scene cloud recovered: points={cloud.width} capture_age_sec={age:.3f}'
+216:             )
+217:             self._last_diagnostic_wall_sec = None
+218: 
+219: 
+220: def main(args: list[str] | None = None) -> None:
+221:     rclpy.init(args=args)
+222:     node = DepthSceneNode()
+223:     try:
+224:         rclpy.spin(node)
+225:     except (KeyboardInterrupt, ExternalShutdownException):
+226:         pass
+227:     except RuntimeError:
+228:         if rclpy.ok():
+229:             raise
+230:     finally:
+231:         node.destroy_node()
+232:         if rclpy.ok():
+233:             rclpy.shutdown()

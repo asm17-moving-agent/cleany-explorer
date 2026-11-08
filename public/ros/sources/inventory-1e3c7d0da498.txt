@@ -1,0 +1,23 @@
+ros2_ws/src/cleany_manipulation_bt/cleany_manipulation_bt/arm_return_server.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: ffb1af74878211acbe5232258f1fe6e96ebc3d0df62816dc7aef5a65e082e096
+
+15:         self.handle = self.result = None
+16:         self.abort = threading.Event()
+17:         self.shutting_down = False
+18:         self._action = ActionServer(node, ReturnArm, 'manipulation/return_arm',
+19:             goal_callback=self._goal, handle_accepted_callback=self._accepted,
+20:             execute_callback=self._execute, cancel_callback=self._cancel, callback_group=group)
+21: 
+22:     def _goal(self, request):
+23:         core = self.node.core
+105:     def drain(self, executor, timeout: float) -> bool:
+106:         deadline = time.monotonic() + timeout
+107:         receipt = None
+108:         client = self.node.create_client(ReturnArm.Impl.GetResultService,
+109:                                         'manipulation/return_arm/_action/get_result')
+110:         try:
+111:             while self.node.context.ok() and time.monotonic() < deadline:
+112:                 with self.node.core.lock:
+113:                     if receipt is None and self.handle is not None:

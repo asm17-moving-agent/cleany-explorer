@@ -1,0 +1,14 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/state_validity_batch.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: cd0a848b7ee3eb9081f8b1a4560050a99020a53e7f74482c5775387f44209fed
+
+14:         self.batch_size = batch_size
+15:         self.client = client
+16:         if client is None and hasattr(node, 'create_client'):
+17:             self.client = node.create_client(CheckStateValidityBatch, '/check_state_validity_batch')
+18: 
+19:     def check(self, states: Sequence[RobotState], call: Callable, *, group_name: str = ''
+20:               ) -> CheckStateValidityBatch.Response | None:
+21:         if self.client is None or not self.client.service_is_ready():
+22:             return None

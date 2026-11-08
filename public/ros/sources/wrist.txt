@@ -1,0 +1,60 @@
+ros2_ws/src/cleany_robot_interface/cleany_robot_interface/wrist_rgb_camera.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 370465887b06826d5dfea0eab3a410b39a07f4d86e5f34040ff9b8a9055dcede
+
+38:     if not math.isfinite(rate) or not 0 < rate <= 30:
+39:         raise ValueError('Wrist publish rate must be in (0, 30] Hz')
+40:     return {**config, **camera}, intrinsic
+41: 
+42: 
+43: class WristRgbCamera(Node):
+44:     def __init__(self, **kwargs):
+45:         super().__init__('wrist_rgb_camera', **kwargs)
+46:         self.declare_parameter('repository_root', '')
+47:         self.declare_parameter('config_file', '')
+48:         self.declare_parameter('start_enabled', False)
+49:         self.declare_parameter('preview_rate_hz', 5.0)
+50:         self.declare_parameter('preview_jpeg_quality', 75)
+51:         self.config, intrinsic = load_camera_profile(
+52:             Path(self.get_parameter('config_file').value),
+53:             Path(self.get_parameter('repository_root').value))
+54:         width, height = self.config['width'], self.config['height']
+55:         self.preview_rate = float(self.get_parameter('preview_rate_hz').value)
+56:         self.preview_quality = self.get_parameter('preview_jpeg_quality').value
+57:         if not math.isfinite(self.preview_rate) or not 0 < self.preview_rate <= 30:
+58:             raise ValueError('Preview rate must be in (0, 30] Hz')
+59:         self.preview_rate = min(self.preview_rate, self.config['publish_rate_hz'])
+60:         if type(self.preview_quality) is not int or not 1 <= self.preview_quality <= 100:
+61:             raise ValueError('Preview JPEG quality must be an integer in [1, 100]')
+62:         self.next_preview_at = 0.0
+63:         matrix = np.asarray(intrinsic['K'], dtype=float).reshape(3, 3)
+64:         distortion = np.asarray(intrinsic['D'], dtype=float).ravel()
+65:         if (not np.isfinite(matrix).all() or not np.isfinite(distortion).all()
+66:                 or matrix[0, 0] <= 0 or matrix[1, 1] <= 0):
+67:             raise ValueError('Invalid wrist camera intrinsics')
+68:         self.maps = cv2.initUndistortRectifyMap(
+69:             matrix, distortion, None, matrix, (width, height), cv2.CV_32FC1)
+70:         self.info = CameraInfo(width=width, height=height, distortion_model='plumb_bob',
+71:             d=[0.] * 5, k=matrix.ravel().tolist(), r=np.eye(3).ravel().tolist(),
+72:             p=np.column_stack((matrix, np.zeros(3))).ravel().tolist())
+73:         topic = '/' + self.config['arm'] + '_wrist_camera'
+74:         self.images = self.create_publisher(Image, topic + '/image_raw', qos_profile_sensor_data)
+75:         self.infos = self.create_publisher(CameraInfo, topic + '/camera_info', qos_profile_sensor_data)
+76:         self.previews = self.create_publisher(
+77:             CompressedImage, topic + '/preview/compressed', qos_profile_sensor_data)
+78:         self.camera = None
+79:         self.enabled_state = self.create_publisher(Bool, topic + '/enabled', QoSProfile(
+80:             depth=1, reliability=ReliabilityPolicy.RELIABLE,
+81:             durability=DurabilityPolicy.TRANSIENT_LOCAL))
+82:         self.state_timer = self.create_timer(1.0, self.publish_enabled)
+83:         self.publish_enabled()
+84:         self.enable_service = self.create_service(SetBool, topic + '/set_enabled', self.set_enabled)
+85:         self.timer = self.create_timer(1. / self.config['publish_rate_hz'], self.publish_frame)
+86:         if self.get_parameter('start_enabled').value:
+87:             self.open_camera()
+88: 
+89:     def open_camera(self) -> None:
+90:         if self.camera is not None:
+91:             return
+92:         camera = cv2.VideoCapture(self.config['camera_device'], cv2.CAP_V4L2)

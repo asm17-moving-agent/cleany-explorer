@@ -1,0 +1,25 @@
+ros2_ws/src/cleany_perception/cleany_perception/observation_runtime.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 8884f244bb6ff2dca8e12e9dcae99bfd7986d9a8441ed023960b110519269880
+
+24: 
+25: 
+26: def declare_observation_parameters(node) -> None:
+27:     node.declare_parameter('enable_reference_observation', False)
+28:     node.declare_parameter('reference_ttl_seconds', 120.0)
+29:     node.declare_parameter('reference_minimum_detection_iou', 0.2)
+30:     config = ReferenceObservationConfig()
+31:     for field in fields(config):
+32:         node.declare_parameter('reference_' + field.name, getattr(config, field.name))
+33: 
+34: 
+51:                 field.name: get('reference_' + field.name)
+52:                 for field in fields(ReferenceObservationConfig())}),
+53:         )
+54:         self.service = node.create_service(
+55:             ObserveObjectReference, 'perception/observe_object_reference', self.execute,
+56:             callback_group=node._action_callback_group)
+57: 
+58:     def execute(self, request, response):
+59:         with self.node._busy_lock:

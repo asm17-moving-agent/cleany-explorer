@@ -1,0 +1,16 @@
+ros2_ws/src/cleany_mujoco_observer/src/scheduled_cameras.cpp
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 05ce9fc87ea5aa6735ea05e036558b93b5f6ce8f9ffa9b40d96d8f25ba4d83da
+
+78:       if (c.id<0) throw std::invalid_argument("missing camera: "+name);
+79:       c.frame=i==0 ? "head_camera_rgb_optical_frame" : c.key+"_wrist_rgb_optical_frame";
+80:       const auto prefix=i==0 ? std::string("/camera") : "/"+c.key+"_wrist_camera";
+81:       c.rgb=node->create_publisher<sensor_msgs::msg::Image>(prefix+(i==0 ? "/color/image_raw" : "/image_raw"), rclcpp::SensorDataQoS());
+82:       c.info=node->create_publisher<sensor_msgs::msg::CameraInfo>(prefix+(i==0 ? "/color/camera_info" : "/camera_info"), rclcpp::SensorDataQoS());
+83:       if (i==0) c.depth=node->create_publisher<sensor_msgs::msg::Image>("/camera/aligned_depth_to_color/image_raw", rclcpp::SensorDataQoS());
+84:       c.rgb_message.width=640; c.rgb_message.height=480;
+85:       c.rgb_message.encoding="rgb8"; c.rgb_message.step=640*3;
+86:       c.rgb_message.header.frame_id=c.frame;
+87:       c.rgb_message.data.resize(640*480*3);
+88:       c.info_message.width=640; c.info_message.height=480;

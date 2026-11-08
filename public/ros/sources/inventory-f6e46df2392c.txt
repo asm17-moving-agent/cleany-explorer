@@ -1,0 +1,14 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/curobo_adapter.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 999f2cd5c3a2384928b0792b8f861766b067b2b3bf5d233a0dc2d182e60df99d
+
+44:         self._gpu_config = gpu_config
+45:         self._cancel_event = threading.Event()
+46:         self._deadline = math.inf
+47:         self._scene_client = scene_client or node.create_client(
+48:             GetPlanningScene, "/get_planning_scene"
+49:         )
+50:         if engine is None:
+51:             from pathlib import Path
+52:             from ament_index_python.packages import get_package_share_directory

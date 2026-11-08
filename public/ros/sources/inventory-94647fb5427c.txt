@@ -1,0 +1,30 @@
+ros2_ws/src/cleany_manipulation_bt/cleany_manipulation_bt/ros_operations.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: dab8d28be54465868a16c69897594d0075c9cb4500d282c9ac29e1b3c0657ca1
+
+69:         self.deadline = math.inf
+70:         self._clock_value = 0
+71:         self._clock_progress_wall = time.monotonic()
+72:         self.declare_parameter('sorting_release_clearance_m', 0.06)
+73:         self.declare_parameter('sorting_release_maximum_clearance_m', 0.21)
+74:         self.declare_parameter('sorting_release_edge_margin_m', 0.005)
+75:         self.declare_parameter('bt_feedback_max_age_sec', 2.0)
+76:         self.declare_parameter('bt_operation_timeout_sec', 180.0)
+77:         self.declare_parameter('bt_verification_timeout_sec', 10.0)
+78:         self.declare_parameter('bt_stop_timeout_sec', 10.0)
+79:         self.declare_parameter('bt_stop_feedback_max_age_sec', 0.5)
+80:         self.declare_parameter('bt_stationary_duration_sec', 0.25)
+81:         self.declare_parameter('bt_supported_trash_labels', list(TRASH_LABELS))
+82:         self.declare_parameter('bt_supported_lost_item_labels', list(LOST_ITEM_LABELS))
+83:         self._target_label_key = label_key
+84:         self._tracking_session_id = ''
+85:         self._approved_tracking = None
+86:         self._placement_registration = self.create_client(RegisterPlacementTarget, '/sorting/register_placement_target')
+87:         self._snapshot = self.create_client(GetSceneSnapshot, '/perception/get_scene_snapshot')
+88:         self._controllers = self.create_client(ListControllers, '/controller_manager/list_controllers')
+89:         self.submissions: list[Any] = []
+90:         self.handles: list[tuple[Any, Any]] = []
+91:         for name in ('_inspection', '_selection', '_move_group', '_execute_trajectory'):
+92:             setattr(self, name, TrackedClient(self, getattr(self, name)))
+93:         self._grippers = {arm: TrackedClient(self, client) for arm, client in self._grippers.items()}

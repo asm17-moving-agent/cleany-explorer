@@ -1,0 +1,23 @@
+ros2_ws/src/cleany_display/cleany_display/node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 3c36a9b181a60b32b85efc66bea273c13999342583d5024c88d5ef880b8debb3
+
+48:     """
+49: 
+50:     def __init__(self, config: dict, store: StateStore) -> None:
+51:         super().__init__('cleany_display')
+52:         self.config, self.store = config, store
+53:         self.state = DisplayState(config)
+54:         self.available_sources: set[str] = set()
+55:         self.next_graph_check = 0.0
+56:         durable = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+63:             if not topic:
+64:                 continue
+65:             qos = durable if source in ('mission', 'result', 'manipulation') else qos_profile_sensor_data
+66:             self.owned_subscriptions.append(self.create_subscription(
+67:                 types[source], topic, lambda msg, key=source: self.receive(key, msg), qos))
+68:         self.create_timer(0.2, self.update)
+69: 
+70:     def receive(self, source: str, msg: object) -> None:
+71:         now = time.monotonic()

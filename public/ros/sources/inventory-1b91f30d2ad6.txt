@@ -1,0 +1,87 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/pregrasp_sim_ready.py
+Review: 2026-11-02
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 680e05eb0cb4e5038e3713f5cc8c0907596f878fda7d58dd71e06be2cb3a562e
+
+1: """Wait for measured simulation inputs before starting the planning runtime."""
+2: import math
+3: import time
+4: 
+5: import rclpy
+6: from rclpy.node import Node
+7: from rclpy.qos import qos_profile_sensor_data
+8: from rclpy.time import Time
+9: from sensor_msgs.msg import CameraInfo, JointState
+10: from controller_manager_msgs.srv import ListControllers
+11: from tf2_ros import Buffer, TransformListener
+12: 
+13: from cleany_skill_executor.core.physical_grasp_selection import REQUIRED_JOINT_NAMES
+14: 
+15: 
+16: class SimulationInputsReady(Node):
+17:     def __init__(self):
+18:         super().__init__('pregrasp_sim_inputs_ready')
+19:         self.declare_parameter('startup_timeout_sec', 60.)
+20:         self.joints, self.infos = None, {}
+21:         self.last_reason = 'Waiting for simulation input'
+22:         self.tf = Buffer(node=self)
+23:         self.listener = TransformListener(self.tf, self)
+24:         self.controllers = self.create_client(ListControllers, '/controller_manager/list_controllers')
+25:         self.create_subscription(JointState, '/joint_states', self.on_joints, 10)
+26:         for topic in ('/camera/color/camera_info', '/camera/depth/camera_info',
+27:                       '/left_wrist_camera/camera_info', '/right_wrist_camera/camera_info'):
+28:             self.create_subscription(CameraInfo, topic,
+29:                 lambda msg, key=topic: self.infos.__setitem__(key, msg), qos_profile_sensor_data)
+30: 
+31:     def on_joints(self, message):
+32:         self.joints = message
+33: 
+34:     def inputs_ready(self):
+35:         joints = self.joints
+36:         if (joints is None or len(self.infos) != 4
+37:                 or len(joints.name) != len(joints.position)
+38:                 or not set(REQUIRED_JOINT_NAMES) <= set(joints.name)
+39:                 or not all(math.isfinite(q) for q in joints.position)):
+40:             self.last_reason = 'Missing camera info or complete measured joints'
+41:             return False
+42:         now = self.get_clock().now().nanoseconds
+43:         for message in (joints, *self.infos.values()):
+44:             stamp = Time.from_msg(message.header.stamp)
+45:             if stamp.nanoseconds <= 0 or not 0 <= now-stamp.nanoseconds <= 500_000_000:
+46:                 self.last_reason = f'Stale/future input: {message.header.frame_id}'
+47:                 return False
+48:             if isinstance(message, CameraInfo) and not self.tf.can_transform(
+49:                     'base_link', message.header.frame_id, stamp):
+50:                 self.last_reason = f'Missing capture-time TF: base_link <- {message.header.frame_id}'
+51:                 return False
+52:         self.last_reason = 'Waiting for paired head camera info and active controllers'
+53:         return (self.infos['/camera/color/camera_info'].header.stamp
+54:                 == self.infos['/camera/depth/camera_info'].header.stamp)
+55: 
+56: 
+57: def main(args=None):
+58:     rclpy.init(args=args)
+59:     node = SimulationInputsReady()
+60:     deadline = time.monotonic()+float(node.get_parameter('startup_timeout_sec').value)
+61:     pending, ready = None, False
+62:     try:
+63:         while rclpy.ok() and time.monotonic() < deadline:
+64:             rclpy.spin_once(node, timeout_sec=.02)
+65:             if not node.inputs_ready():
+66:                 continue
+67:             if pending is None and node.controllers.service_is_ready():
+68:                 pending = node.controllers.call_async(ListControllers.Request())
+69:             if pending is not None and pending.done():
+70:                 response = pending.result()
+71:                 active = {c.name for c in response.controller if c.state == 'active'} if response else set()
+72:                 if {f'{arm}_{part}_controller' for arm in ('left', 'right')
+73:                         for part in ('arm', 'gripper')} <= active:
+74:                     ready = True
+75:                     break
+76:                 pending = None
+77:         node.get_logger().info('Simulation inputs and controllers ready' if ready
+78:                                else f'Simulation inputs timed out: {node.last_reason}')
+79:     finally:
+80:         node.destroy_node()
+81:         rclpy.try_shutdown()
+82:     raise SystemExit(0 if ready else 1)

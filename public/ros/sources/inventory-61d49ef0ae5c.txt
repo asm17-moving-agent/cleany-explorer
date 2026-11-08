@@ -1,0 +1,23 @@
+ros2_ws/src/cleany_mujoco_observer/src/sorting_observer.cpp
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 6d81bf28a128c456c16f0aaff671754331231c7f4237b3452bf3762cff737252
+
+48:         names_.emplace_back(name);
+49:       }
+50:     }
+51:     publisher_ = node->create_publisher<visualization_msgs::msg::MarkerArray>(
+52:       "/simulation/sorting_ground_truth", 10);
+53:     bool publish_contacts = false;
+54:     // The loader passes a sub-node. Node's templated getters prepend its
+55:     // namespace; these parameters belong to the shared root parameter store.
+56:     const auto parameters = node->get_node_parameters_interface();
+70:     }
+71:     maximum_contacts_ = static_cast<std::size_t>(maximum_contacts);
+72:     if (publish_contacts) {
+73:       contact_publisher_ = node->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+74:         "/simulation/contact_diagnostics", 10);
+75:       RCLCPP_INFO(node->get_logger(), "Read-only contact diagnostics enabled (max=%d)",
+76:         maximum_contacts);
+77:     }
+78:     return !bodies_.empty();

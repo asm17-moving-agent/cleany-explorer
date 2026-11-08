@@ -1,0 +1,763 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/validate_pick_node.py
+Review: 2026-11-01
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: f5dd63d59515d17efc7038450d22f93bf70ea1755d6877f5c58449fef1582c49
+
+1: """Plan-only detector -> YOLOE-seg -> AnyGrasp -> MoveIt coordinator."""
+2: 
+3: from __future__ import annotations
+4: 
+5: from array import array as byte_array
+6: from copy import deepcopy
+7: import json
+8: import math
+9: from pathlib import Path
+10: import threading
+11: import time
+12: from typing import Any
+13: 
+14: import rclpy
+15: from action_msgs.msg import GoalStatus
+16: from cleany_interfaces.action import (
+17:     InspectScene,
+18:     SelectReachableGrasp,
+19:     ValidatePick,
+20: )
+21: from cleany_interfaces.msg import GraspCandidate
+22: from cleany_interfaces.srv import PlanGrasp, ObserveObjectReference
+23: from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
+24: from rclpy.callback_groups import ReentrantCallbackGroup
+25: from rclpy.executors import MultiThreadedExecutor
+26: from rclpy.node import Node
+27: from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+28: from sensor_msgs.msg import Image, JointState
+29: from trajectory_msgs.msg import JointTrajectory
+30: 
+31: from cleany_skill_executor.sensor_scene import SensorSceneMonitor
+32: from cleany_skill_executor.core.target_filter import (
+33:     DEFAULT_DENYLIST,
+34:     select_closest_eligible,
+35: )
+36: from cleany_skill_executor.validation_evidence import write_validation_evidence
+37: from cleany_skill_executor.validation_evidence import write_target_attempt_evidence
+38: from cleany_skill_executor.validation_evidence import (
+39:     filter_overlay,
+40:     image_message_to_pil,
+41: )
+42: 
+43: 
+44: class _StageFailure(RuntimeError):
+45:     def __init__(self, code: int, message: str) -> None:
+46:         super().__init__(message)
+47:         self.code = code
+48: 
+49: 
+50: class _ObjectFailure(_StageFailure):
+51:     """Only a typed object-local failure allows trying another target."""
+52: 
+53: 
+54: class ValidatePickNode(Node):
+55:     def __init__(self, **kwargs) -> None:
+56:         super().__init__('validate_pick_server', **kwargs)
+57:         defaults = {
+58:             'action_name': 'grasp/validate_pick',
+59:             'inspection_action_name': 'perception/inspect_scene',
+60:             'grasp_service_name': 'grasp/plan',
+61:             'selection_action_name': 'grasp/select_reachable',
+62:             'required_arm': '',
+63:             'denylist': list(DEFAULT_DENYLIST),
+64:             'maximum_smaller_extent_m': 0.095,
+65:             'workspace_roi_pixels': [-1.0, -1.0, -1.0, -1.0],
+66:             'server_wait_timeout_sec': 10.0,
+67:             'inspection_timeout_sec': 45.0,
+68:             'grasp_timeout_sec': 45.0,
+69:             'selection_timeout_sec': 120.0,
+70:             'action_timeout_sec': 240.0,
+71:             'perception_debug_topic': 'perception/debug_image_latched',
+72:             'grasp_debug_topic': 'grasp/debug_image',
+73:             'validation_debug_topic': 'grasp/validate_pick_debug',
+74:             'evidence_output_directory': '',
+75:             'pin_object_reference': False,
+76:             'reference_cleanup_timeout_sec': 5.0,
+77:         }
+78:         for name, value in defaults.items():
+79:             self.declare_parameter(name, value)
+80:         cleanup_timeout = float(self.get_parameter('reference_cleanup_timeout_sec').value)
+81:         if not math.isfinite(cleanup_timeout) or cleanup_timeout <= 0:
+82:             raise ValueError('reference_cleanup_timeout_sec must be positive and finite')
+83:         required_arm = str(self.get_parameter('required_arm').value)
+84:         if required_arm not in ('', 'left', 'right'):
+85:             raise ValueError('required_arm must be empty, left, or right')
+86:         self._sensor_scene = SensorSceneMonitor(self)
+87:         callback_group = ReentrantCallbackGroup()
+88:         self._inspection = ActionClient(
+89:             self,
+90:             InspectScene,
+91:             str(self.get_parameter('inspection_action_name').value),
+92:             callback_group=callback_group,
+93:         )
+94:         self._grasp = self.create_client(
+95:             PlanGrasp,
+96:             str(self.get_parameter('grasp_service_name').value),
+97:             callback_group=callback_group,
+98:         )
+99:         self._selection = ActionClient(
+100:             self,
+101:             SelectReachableGrasp,
+102:             str(self.get_parameter('selection_action_name').value),
+103:             callback_group=callback_group,
+104:         )
+105:         self._reference = self.create_client(ObserveObjectReference,
+106:             '/perception/observe_object_reference', callback_group=callback_group)
+107:         latched = QoSProfile(
+108:             depth=1,
+109:             reliability=ReliabilityPolicy.RELIABLE,
+110:             durability=DurabilityPolicy.TRANSIENT_LOCAL,
+111:         )
+112:         self._debug_lock = threading.Lock()
+113:         self._perception_debug: Image | None = None
+114:         self._grasp_debug: Image | None = None
+115:         self.create_subscription(
+116:             Image,
+117:             str(self.get_parameter('perception_debug_topic').value),
+118:             self._on_perception_debug,
+119:             latched,
+120:             callback_group=callback_group,
+121:         )
+122:         self._validation_debug = self.create_publisher(
+123:             Image,
+124:             str(self.get_parameter('validation_debug_topic').value),
+125:             latched,
+126:         )
+127:         self.create_subscription(
+128:             Image,
+129:             str(self.get_parameter('grasp_debug_topic').value),
+130:             self._on_grasp_debug,
+131:             latched,
+132:             callback_group=callback_group,
+133:         )
+134:         self._goal_lock = threading.Lock()
+135:         self._goal_active = False
+136:         self._active_downstream_goal: Any | None = None
+137:         self._server = ActionServer(
+138:             self,
+139:             ValidatePick,
+140:             str(self.get_parameter('action_name').value),
+141:             execute_callback=self._execute,
+142:             goal_callback=self._on_goal,
+143:             cancel_callback=self._on_cancel,
+144:             callback_group=callback_group,
+145:         )
+146: 
+147:     def destroy_node(self) -> None:
+148:         self._server.destroy()
+149:         super().destroy_node()
+150: 
+151:     def _on_perception_debug(self, message: Image) -> None:
+152:         with self._debug_lock:
+153:             self._perception_debug = message
+154: 
+155:     def _on_grasp_debug(self, message: Image) -> None:
+156:         with self._debug_lock:
+157:             self._grasp_debug = message
+158: 
+159:     def _debug_messages(self) -> tuple[Image | None, Image | None]:
+160:         with self._debug_lock:
+161:             return deepcopy(self._perception_debug), deepcopy(self._grasp_debug)
+162: 
+163:     def _on_goal(self, _request) -> GoalResponse:
+164:         with self._goal_lock:
+165:             if self._goal_active:
+166:                 return GoalResponse.REJECT
+167:             self._goal_active = True
+168:         return GoalResponse.ACCEPT
+169: 
+170:     def _on_cancel(self, _goal_handle) -> CancelResponse:
+171:         if self._active_downstream_goal is not None:
+172:             self._active_downstream_goal.cancel_goal_async()
+173:         return CancelResponse.ACCEPT
+174: 
+175:     @staticmethod
+176:     def _feedback(
+177:         goal_handle,
+178:         stage: int,
+179:         message: str,
+180:         *,
+181:         detection_count: int = 0,
+182:         candidate_count: int = 0,
+183:         candidate_index: int = 0,
+184:         arm: str = '',
+185:     ) -> None:
+186:         update = ValidatePick.Feedback()
+187:         update.stage = stage
+188:         update.message = message
+189:         update.detection_count = detection_count
+190:         update.candidate_count = candidate_count
+191:         update.candidate_index = candidate_index
+192:         update.arm = arm
+193:         goal_handle.publish_feedback(update)
+194: 
+195:     def _wait_future(self, future, deadline: float, goal_handle, label: str):
+196:         while not future.done():
+197:             if goal_handle is not None and goal_handle.is_cancel_requested:
+198:                 future.cancel()
+199:                 raise InterruptedError('validate_pick canceled')
+200:             if time.monotonic() >= deadline:
+201:                 future.cancel()
+202:                 raise RuntimeError(f'{label} timed out')
+203:             time.sleep(0.01)
+204:         if goal_handle is not None and goal_handle.is_cancel_requested:
+205:             raise InterruptedError('validate_pick canceled')
+206:         if time.monotonic() >= deadline:
+207:             raise RuntimeError(f'{label} timed out')
+208:         try:
+209:             value = future.result()
+210:         except Exception as error:
+211:             raise RuntimeError(f'{label} failed: {error}') from error
+212:         if value is None:
+213:             raise RuntimeError(f'{label} returned no result')
+214:         return value
+215: 
+216:     def _run_action(
+217:         self,
+218:         client,
+219:         request,
+220:         timeout_sec: float,
+221:         goal_handle,
+222:         overall_deadline: float,
+223:         label: str,
+224:         feedback_callback=None,
+225:     ):
+226:         self._check_request(goal_handle, overall_deadline)
+227:         wait_timeout = min(float(self.get_parameter('server_wait_timeout_sec').value),
+228:                            overall_deadline - time.monotonic())
+229:         if not client.wait_for_server(timeout_sec=wait_timeout):
+230:             raise RuntimeError(f'{label} server unavailable')
+231:         self._check_request(goal_handle, overall_deadline)
+232:         deadline = min(overall_deadline, time.monotonic() + timeout_sec)
+233:         sent = client.send_goal_async(request, feedback_callback=feedback_callback)
+234:         downstream = self._wait_future(sent, deadline, goal_handle, f'{label} goal')
+235:         if not downstream.accepted:
+236:             raise RuntimeError(f'{label} goal rejected')
+237:         self._active_downstream_goal = downstream
+238:         try:
+239:             wrapped = self._wait_future(
+240:                 downstream.get_result_async(), deadline, goal_handle, label
+241:             )
+242:         except (InterruptedError, RuntimeError):
+243:             downstream.cancel_goal_async()
+244:             raise
+245:         finally:
+246:             self._active_downstream_goal = None
+247:         if wrapped.status == GoalStatus.STATUS_CANCELED:
+248:             raise InterruptedError(f'{label} canceled')
+249:         # Aborted actions carry typed failures (e.g. no reachable grasp).
+250:         # Keep those codes so the coordinator can distinguish object failures
+251:         # from service, state, TF, and planning-scene failures.
+252:         if (wrapped.status == GoalStatus.STATUS_ABORTED
+253:                 and not wrapped.result.success
+254:                 and getattr(wrapped.result, 'error_code', 0) != 0):
+255:             return wrapped.result
+256:         if wrapped.status != GoalStatus.STATUS_SUCCEEDED:
+257:             detail = str(getattr(wrapped.result, 'message', '')).strip()
+258:             suffix = f': {detail}' if detail else ''
+259:             raise RuntimeError(
+260:                 f'{label} ended with status {wrapped.status}{suffix}'
+261:             )
+262:         return wrapped.result
+263: 
+264:     def _run_grasp_service(
+265:         self,
+266:         request,
+267:         timeout_sec: float,
+268:         goal_handle,
+269:         overall_deadline: float,
+270:     ):
+271:         self._check_request(goal_handle, overall_deadline)
+272:         wait_timeout = min(float(self.get_parameter('server_wait_timeout_sec').value),
+273:                            overall_deadline - time.monotonic())
+274:         if not self._grasp.wait_for_service(timeout_sec=wait_timeout):
+275:             raise RuntimeError('grasp planning service unavailable')
+276:         self._check_request(goal_handle, overall_deadline)
+277:         deadline = min(overall_deadline, time.monotonic() + timeout_sec)
+278:         return self._wait_future(
+279:             self._grasp.call_async(request),
+280:             deadline,
+281:             goal_handle,
+282:             'grasp planning',
+283:         )
+284: 
+285:     @staticmethod
+286:     def _check_request(goal_handle: Any, deadline: float) -> None:
+287:         if goal_handle.is_cancel_requested:
+288:             raise InterruptedError('validate_pick canceled')
+289:         if time.monotonic() >= deadline:
+290:             raise RuntimeError('Validation deadline exceeded')
+291: 
+292:     def _wait_sensor_scene(self, goal_handle: Any, deadline: float) -> None:
+293:         try:
+294:             self._check_request(goal_handle, deadline)
+295:             self._sensor_scene.wait(canceled=lambda: (
+296:                 goal_handle.is_cancel_requested or time.monotonic() >= deadline))
+297:             self._check_request(goal_handle, deadline)
+298:         except InterruptedError:
+299:             if goal_handle.is_cancel_requested:
+300:                 raise
+301:             raise _StageFailure(ValidatePick.Result.ERROR_MOVEIT, 'Sensor scene deadline exceeded')
+302:         except RuntimeError as error:
+303:             raise _StageFailure(ValidatePick.Result.ERROR_MOVEIT, str(error)) from error
+304: 
+305:     def _clear_reference(self, result: ValidatePick.Result) -> None:
+306:         """Await cleanup before moving to a different target, even after cancellation."""
+307:         if not result.reference_id:
+308:             return
+309:         response = self._wait_future(
+310:             self._reference.call_async(ObserveObjectReference.Request(
+311:                 operation=ObserveObjectReference.Request.CLEAR,
+312:                 reference_id=result.reference_id)),
+313:             time.monotonic() + float(self.get_parameter('reference_cleanup_timeout_sec').value),
+314:             None, 'clear reference',
+315:         )
+316:         if not response.success:
+317:             raise RuntimeError(f'Reference cleanup failed: {response.message}')
+318:         result.reference_id = ''
+319: 
+320:     def _validate_object(self, goal_handle, phase1, selected_detection, result,
+321:                          overall_deadline, latencies, decisions, phase1_debug):
+322:         result.selected_detection = deepcopy(selected_detection)
+323:         self._publish_filter_debug(
+324:             phase1_debug,
+325:             phase1.detections,
+326:             decisions,
+327:             int(selected_detection.object_id),
+328:         )
+329: 
+330:         self._feedback(
+331:             goal_handle,
+332:             ValidatePick.Feedback.STAGE_SEGMENTING,
+333:             f'Segmenting selected object {selected_detection.object_id}: '
+334:             f'{selected_detection.label}',
+335:             detection_count=len(phase1.detections.detections),
+336:         )
+337:         selection_goal = InspectScene.Goal()
+338:         selection_goal.snapshot_id = phase1.detections.snapshot_id
+339:         selection_goal.selected_object_id = selected_detection.object_id
+340:         started = time.monotonic()
+341:         try:
+342:             phase2 = self._run_action(
+343:                 self._inspection,
+344:                 selection_goal,
+345:                 float(self.get_parameter('inspection_timeout_sec').value),
+346:                 goal_handle,
+347:                 overall_deadline,
+348:                 'selected-object inspection',
+349:             )
+350:         except RuntimeError as error:
+351:             raise _StageFailure(result.ERROR_PERCEPTION, str(error)) from error
+352:         finally:
+353:             latencies.append(('segment_reconstruct', time.monotonic() - started))
+354:         if not phase2.success:
+355:             failure = (_ObjectFailure if phase2.error_code in (
+356:                 phase2.ERROR_MASK, phase2.ERROR_DEPTH, phase2.ERROR_PLANE,
+357:             ) else _StageFailure)
+358:             raise failure(result.ERROR_PERCEPTION, phase2.message)
+359:         if (len(phase2.objects.objects) != 1
+360:                 or phase2.objects.objects[0].object_id != selected_detection.object_id):
+361:             raise _StageFailure(result.ERROR_PERCEPTION, 'Selected-object identity/count mismatch')
+362:         result.selected_object = deepcopy(phase2.objects.objects[0])
+363:         phase2_debug, _ = self._debug_messages()
+364:         if self.get_parameter('pin_object_reference').value:
+365:             if not self._reference.wait_for_service(timeout_sec=5.):
+366:                 raise _StageFailure(result.ERROR_PERCEPTION, 'YOLOE-seg reference service unavailable')
+367:             pin = ObserveObjectReference.Request(operation=ObserveObjectReference.Request.PIN,
+368:                 source_snapshot_id=phase1.detections.snapshot_id,
+369:                 source_object_id=selected_detection.object_id)
+370:             pinned = self._wait_future(self._reference.call_async(pin),
+371:                 min(overall_deadline, time.monotonic()+10.), goal_handle, 'pin reference')
+372:             if pinned is None or not pinned.success:
+373:                 raise _StageFailure(result.ERROR_PERCEPTION,
+374:                     'Could not pin YOLOE-seg reference' if pinned is None else pinned.message)
+375:             result.reference_id = pinned.reference_id
+376:             if (not pinned.reference_id or pinned.source_snapshot_id != phase1.detections.snapshot_id
+377:                     or pinned.source_object_id != selected_detection.object_id):
+378:                 raise _StageFailure(result.ERROR_PERCEPTION, 'Pinned reference identity mismatch')
+379: 
+380:         self._feedback(
+381:             goal_handle,
+382:             ValidatePick.Feedback.STAGE_GRASP_PLANNING,
+383:             'Running AnyGrasp',
+384:             detection_count=len(phase1.detections.detections),
+385:         )
+386:         request = PlanGrasp.Request()
+387:         request.snapshot_id = phase1.detections.snapshot_id
+388:         request.object_id = selected_detection.object_id
+389:         request.target_cloud = phase2.target_cloud
+390:         request.context_cloud = phase2.context_cloud
+391:         request.target_object = phase2.objects.objects[0]
+392:         request.target_object_header = phase2.objects.header
+393:         started = time.monotonic()
+394:         try:
+395:             grasp = self._run_grasp_service(
+396:                 request,
+397:                 float(self.get_parameter('grasp_timeout_sec').value),
+398:                 goal_handle,
+399:                 overall_deadline,
+400:             )
+401:         except RuntimeError as error:
+402:             raise _StageFailure(result.ERROR_GRASP_PLANNING, str(error)) from error
+403:         finally:
+404:             latencies.append(('anygrasp', time.monotonic() - started))
+405:         result.candidates = list(grasp.candidates)
+406:         if not grasp.success:
+407:             failure = (_ObjectFailure if grasp.error_code == grasp.ERROR_NO_GRASP_CANDIDATE
+408:                        else _StageFailure)
+409:             raise failure(result.ERROR_GRASP_PLANNING, grasp.message)
+410:         if not grasp.candidates:
+411:             raise _ObjectFailure(result.ERROR_GRASP_PLANNING, 'No grasp candidates returned')
+412: 
+413:         self._feedback(
+414:             goal_handle,
+415:             ValidatePick.Feedback.STAGE_MOVEIT,
+416:             'Validating candidates with the configured motion backend (plan-only)',
+417:             detection_count=len(phase1.detections.detections),
+418:             candidate_count=len(grasp.candidates),
+419:         )
+420:         moveit_goal = SelectReachableGrasp.Goal()
+421:         moveit_goal.candidates = list(grasp.candidates)
+422:         moveit_goal.required_arm = str(
+423:             self.get_parameter('required_arm').value
+424:         )
+425: 
+426:         def moveit_feedback(message) -> None:
+427:             feedback = message.feedback
+428:             self._feedback(
+429:                 goal_handle,
+430:                 ValidatePick.Feedback.STAGE_MOVEIT,
+431:                 feedback.message,
+432:                 detection_count=len(phase1.detections.detections),
+433:                 candidate_count=len(grasp.candidates),
+434:                 candidate_index=feedback.candidate_index,
+435:                 arm=feedback.arm,
+436:             )
+437: 
+438:         started = time.monotonic()
+439:         try:
+440:             selected = self._run_action(
+441:                 self._selection,
+442:                 moveit_goal,
+443:                 float(self.get_parameter('selection_timeout_sec').value),
+444:                 goal_handle,
+445:                 overall_deadline,
+446:                 'MoveIt grasp validation',
+447:                 feedback_callback=moveit_feedback,
+448:             )
+449:         except RuntimeError as error:
+450:             raise _StageFailure(result.ERROR_MOVEIT, str(error)) from error
+451:         finally:
+452:             latencies.append(('moveit_total', time.monotonic() - started))
+453:         latencies.extend(zip(selected.latency_stages, selected.latency_seconds, strict=True))
+454:         if not selected.success:
+455:             failure = (_ObjectFailure if selected.error_code == selected.ERROR_NO_REACHABLE_GRASP
+456:                        else _StageFailure)
+457:             raise failure(result.ERROR_MOVEIT, selected.message)
+458:         self._copy_selection_result(result, selected)
+459:         return phase2, phase2_debug, selected
+460: 
+461:     def _execute(self, goal_handle):
+462:         result = ValidatePick.Result()
+463:         result.selected_candidate_index = -1
+464:         overall_deadline = time.monotonic() + float(
+465:             self.get_parameter('action_timeout_sec').value
+466:         )
+467:         latencies: list[tuple[str, float]] = []
+468:         decisions = ()
+469:         phase1_debug = None
+470:         phase2_debug = None
+471:         attempts: list[dict[str, Any]] = []
+472:         snapshot_id = ""
+473:         terminal = 'abort'
+474:         try:
+475:             self._wait_sensor_scene(goal_handle, overall_deadline)
+476:             self._feedback(
+477:                 goal_handle,
+478:                 ValidatePick.Feedback.STAGE_DETECTING,
+479:                 'Capturing RGB-D and running object detection',
+480:             )
+481:             started = time.monotonic()
+482:             inspection_goal = InspectScene.Goal()
+483:             inspection_goal.query = goal_handle.request.query
+484:             try:
+485:                 phase1 = self._run_action(
+486:                     self._inspection,
+487:                     inspection_goal,
+488:                     float(self.get_parameter('inspection_timeout_sec').value),
+489:                     goal_handle,
+490:                     overall_deadline,
+491:                     'inspection detection',
+492:                 )
+493:             except RuntimeError as error:
+494:                 raise _StageFailure(result.ERROR_PERCEPTION, str(error)) from error
+495:             latencies.append(('detect', time.monotonic() - started))
+496:             if not phase1.success:
+497:                 raise _StageFailure(result.ERROR_PERCEPTION, phase1.message)
+498:             result.detections = phase1.detections
+499:             snapshot_id = phase1.detections.snapshot_id
+500:             phase1_debug, _ = self._debug_messages()
+501: 
+502:             self._feedback(
+503:                 goal_handle,
+504:                 ValidatePick.Feedback.STAGE_FILTERING,
+505:                 'Applying denylist, depth, and expected-size screening',
+506:                 detection_count=len(phase1.detections.detections),
+507:             )
+508:             started = time.monotonic()
+509:             filtered = select_closest_eligible(
+510:                 phase1.detections.detections,
+511:                 denylist=tuple(self.get_parameter('denylist').value),
+512:                 workspace_roi_pixels=(
+513:                     () if list(self.get_parameter('workspace_roi_pixels').value) == [-1.0]*4
+514:                     else tuple(self.get_parameter('workspace_roi_pixels').value)
+515:                 ),
+516:                 maximum_smaller_extent_m=float(
+517:                     self.get_parameter('maximum_smaller_extent_m').value
+518:                 ),
+519:             )
+520:             latencies.append(('filter', time.monotonic() - started))
+521:             decisions = filtered.decisions
+522:             attempts = [dict(object_id=item.object_id, label=item.label,
+523:                 status='not_checked' if item.eligible else 'excluded',
+524:                 detail='Not attempted in this request' if item.eligible else item.detail,
+525:                 error_code=0, elapsed_sec=0.0, latency_seconds={}, candidate_count=0)
+526:                 for item in decisions]
+527:             if filtered.selected_index is None:
+528:                 summary = '; '.join(
+529:                     f'{item.object_id}:{item.detail}' for item in decisions
+530:                 )
+531:                 raise _StageFailure(
+532:                     result.ERROR_NO_ELIGIBLE_TARGET,
+533:                     f'No eligible target before YOLOE-seg: {summary}',
+534:                 )
+535:             last_failure = None
+536:             for index in filtered.eligible_indices:
+537:                 if goal_handle.is_cancel_requested:
+538:                     raise InterruptedError('validate_pick canceled')
+539:                 if time.monotonic() >= overall_deadline:
+540:                     raise _StageFailure(result.ERROR_INTERNAL, 'Validation deadline exceeded')
+541:                 selected_detection = phase1.detections.detections[index]
+542:                 record = attempts[index]
+543:                 record.update(status='checking', detail='Planning this object')
+544:                 result = ValidatePick.Result()
+545:                 result.selected_candidate_index = -1
+546:                 result.detections = phase1.detections
+547:                 object_latencies = []
+548:                 started_object = time.monotonic()
+549:                 try:
+550:                     # Recheck world freshness before each object's planning attempt.
+551:                     self._wait_sensor_scene(goal_handle, overall_deadline)
+552:                     phase2, phase2_debug, selected = self._validate_object(
+553:                         goal_handle, phase1, selected_detection, result,
+554:                         overall_deadline, object_latencies, decisions, phase1_debug,
+555:                     )
+556:                 except _ObjectFailure as error:
+557:                     last_failure = error
+558:                     record.update(status='plan_failed', detail=str(error), error_code=error.code)
+559:                     # A failed clear stops the request; do not silently leak a pinned target.
+560:                     try:
+561:                         self._clear_reference(result)
+562:                     except RuntimeError as cleanup_error:
+563:                         record.update(status='interrupted', detail=str(cleanup_error),
+564:                                       error_code=result.ERROR_PERCEPTION)
+565:                         raise _StageFailure(result.ERROR_PERCEPTION, str(cleanup_error)) from cleanup_error
+566:                     self.get_logger().info(
+567:                         f'Object {selected_detection.object_id} skipped: {error}')
+568:                     self._feedback(goal_handle, ValidatePick.Feedback.STAGE_FILTERING,
+569:                         f'Object {selected_detection.object_id}: {error}; trying next object',
+570:                         detection_count=len(phase1.detections.detections))
+571:                     latencies.extend((f'object_{selected_detection.object_id}/{name}', seconds)
+572:                                      for name, seconds in object_latencies)
+573:                     continue
+574:                 except Exception as error:
+575:                     record.update(status='interrupted', detail=str(error), error_code=(
+576:                         error.code if isinstance(error, _StageFailure) else
+577:                         result.ERROR_CANCELED if isinstance(error, InterruptedError) else result.ERROR_INTERNAL))
+578:                     latencies.extend((f'object_{selected_detection.object_id}/{name}', seconds)
+579:                                      for name, seconds in object_latencies)
+580:                     raise
+581:                 else:
+582:                     record.update(status='selected', detail='Validated grasp and motion paths')
+583:                     latencies.extend(object_latencies)
+584:                     break
+585:                 finally:
+586:                     record['elapsed_sec'] = time.monotonic() - started_object
+587:                     record['latency_seconds'] = dict(object_latencies)
+588:                     record['candidate_count'] = len(result.candidates)
+589:             else:
+590:                 assert last_failure is not None
+591:                 raise _StageFailure(last_failure.code,
+592:                     'No validated grasp for any eligible object: ' + '; '.join(
+593:                         f"{item['object_id']}:{item['detail']}" for item in attempts
+594:                         if item['status'] == 'plan_failed'))
+595:             result.latency_stages = [name for name, _ in latencies]
+596:             result.latency_seconds = [seconds for _, seconds in latencies]
+597: 
+598:             evidence_root = str(
+599:                 self.get_parameter('evidence_output_directory').value
+600:             ).strip()
+601:             if evidence_root:
+602:                 self._feedback(
+603:                     goal_handle,
+604:                     ValidatePick.Feedback.STAGE_RECORDING,
+605:                     'Writing JSON and 3x3 evidence',
+606:                     detection_count=len(phase1.detections.detections),
+607:                     candidate_count=len(result.candidates),
+608:                 )
+609:                 _, grasp_debug = self._debug_messages()
+610:                 try:
+611:                     json_path, grid_path = write_validation_evidence(
+612:                         Path(evidence_root),
+613:                         snapshot_id=phase1.detections.snapshot_id,
+614:                         query=goal_handle.request.query,
+615:                         detections=phase1.detections.detections,
+616:                         decisions=decisions,
+617:                         selected_detection=selected_detection,
+618:                         selected_object=phase2.objects.objects[0],
+619:                         candidates=result.candidates,
+620:                         selection=selected,
+621:                         latencies=latencies,
+622:                         phase1_debug=phase1_debug,
+623:                         phase2_debug=phase2_debug,
+624:                         grasp_debug=grasp_debug,
+625:                         target_attempts=attempts,
+626:                     )
+627:                     result.evidence_json_path = json_path
+628:                     result.evidence_grid_path = grid_path
+629:                 except Exception as error:
+630:                     self.get_logger().error(f'Failed to write evidence: {error}')
+631:             result.success = True
+632:             result.error_code = result.ERROR_NONE
+633:             result.message = (
+634:                 f'Validated AnyGrasp candidate {result.selected_candidate_index} '
+635:                 f'with {result.selected_arm} arm (plan-only)'
+636:             )
+637:             terminal = 'succeed'
+638:         except InterruptedError as error:
+639:             self._set_failure(result, result.ERROR_CANCELED, str(error))
+640:             terminal = 'canceled'
+641:         except _StageFailure as error:
+642:             self._set_failure(result, error.code, str(error))
+643:         except Exception as error:
+644:             self._set_failure(
+645:                 result, result.ERROR_INTERNAL, f'Unexpected validation error: {error}'
+646:             )
+647:         finally:
+648:             self._active_downstream_goal = None
+649:             if terminal != 'succeed' and result.reference_id:
+650:                 try:
+651:                     self._clear_reference(result)
+652:                 except RuntimeError as error:
+653:                     self.get_logger().error(str(error))
+654:                     self._set_failure(result, result.ERROR_PERCEPTION,
+655:                         f'{result.message}; reference cleanup failed: {error}')
+656:                     terminal = 'abort'
+657:             result.latency_stages = [name for name, _ in latencies]
+658:             result.latency_seconds = [seconds for _, seconds in latencies]
+659:             for record in attempts:
+660:                 if record['status'] == 'not_checked':
+661:                     record['detail'] = (f'Object {result.selected_detection.object_id} selected first'
+662:                         if result.success else f'Request stopped: {result.message}')
+663:             self.get_logger().info('Target attempts: ' + json.dumps(attempts, ensure_ascii=False))
+664:             evidence_root = str(self.get_parameter('evidence_output_directory').value).strip()
+665:             if evidence_root and snapshot_id:
+666:                 try:
+667:                     attempts_path = write_target_attempt_evidence(Path(evidence_root),
+668:                         snapshot_id=snapshot_id, attempts=attempts,
+669:                         success=result.success, error_code=result.error_code, message=result.message)
+670:                     if not result.evidence_json_path:
+671:                         result.evidence_json_path = attempts_path
+672:                 except Exception as error:
+673:                     self.get_logger().error(f'Failed to write target attempts: {error}')
+674:             with self._goal_lock:
+675:                 self._goal_active = False
+676:         if terminal == 'succeed':
+677:             goal_handle.succeed()
+678:         elif terminal == 'canceled':
+679:             goal_handle.canceled()
+680:         else:
+681:             goal_handle.abort()
+682:         return result
+683: 
+684:     @staticmethod
+685:     def _copy_selection_result(result, selected) -> None:
+686:         fields = (
+687:             'selected_candidate_index', 'selected_arm', 'selected_candidate',
+688:             'pregrasp_joint_state', 'grasp_joint_state',
+689:             'planning_start_state', 'pregrasp_trajectory', 'grasp_trajectory',
+690:             'fk_pregrasp_pose', 'fk_grasp_pose',
+691:             'pregrasp_position_error_m', 'grasp_position_error_m',
+692:             'pregrasp_approach_error_degrees',
+693:             'pregrasp_closing_error_degrees',
+694:             'grasp_approach_error_degrees', 'grasp_closing_error_degrees',
+695:             'trajectory_max_approach_error_degrees',
+696:             'trajectory_max_closing_error_degrees',
+697:             'gripper_joint_position', 'planner_id',
+698:         )
+699:         for field in fields:
+700:             setattr(result, field, deepcopy(getattr(selected, field)))
+701: 
+702:     def _publish_filter_debug(
+703:         self,
+704:         base_message: Image | None,
+705:         detections,
+706:         decisions,
+707:         selected_object_id: int,
+708:     ) -> None:
+709:         rendered = filter_overlay(
+710:             image_message_to_pil(base_message),
+711:             detections.detections,
+712:             decisions,
+713:             selected_object_id,
+714:         )
+715:         array = rendered.convert('RGB')
+716:         message = Image()
+717:         message.header = detections.header
+718:         message.height = array.height
+719:         message.width = array.width
+720:         message.encoding = 'rgb8'
+721:         message.is_bigendian = False
+722:         message.step = array.width * 3
+723:         message.data = byte_array('B', array.tobytes())
+724:         self._validation_debug.publish(message)
+725: 
+726:     @staticmethod
+727:     def _set_failure(result, code: int, message: str) -> None:
+728:         result.success = False
+729:         result.error_code = code
+730:         result.message = message
+731:         result.selected_candidate_index = -1
+732:         result.selected_arm = ''
+733:         result.selected_candidate = GraspCandidate()
+734:         result.pregrasp_joint_state = JointState()
+735:         result.grasp_joint_state = JointState()
+736:         result.planning_start_state = JointState()
+737:         result.pregrasp_trajectory = JointTrajectory()
+738:         result.grasp_trajectory = JointTrajectory()
+739: 
+740: 
+741: def main(args=None) -> None:
+742:     rclpy.init(args=args)
+743:     node = ValidatePickNode()
+744:     executor = MultiThreadedExecutor(num_threads=4)
+745:     executor.add_node(node)
+746:     try:
+747:         executor.spin()
+748:     except KeyboardInterrupt:
+749:         pass
+750:     finally:
+751:         executor.shutdown()
+752:         node.destroy_node()
+753:         if rclpy.ok():
+754:             rclpy.shutdown()
+755: 
+756: 
+757: if __name__ == '__main__':
+758:     main()

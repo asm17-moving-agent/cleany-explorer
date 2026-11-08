@@ -1,0 +1,47 @@
+ros2_ws/src/cleany_navigation/cleany_navigation/obstacle_memory_node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 11818ebcd45a6cd14409a798a3ca85d72445b78b9e20b3b565b327f072d7f386
+
+58:         checked; configured persistence writes snapshots to output_directory.
+59:     """
+60:     def __init__(self):
+61:         super().__init__('obstacle_memory')
+62:         for name, value in [('map_topic', 'map'), ('scan_topic', 'scan'),
+63:                             ('depth_topic', 'camera/head/depth/points'), ('output_directory', ''),
+64:                             ('restore_path', ''), ('map_frame', 'map'), ('floor_z', 0.0), ('min_height', 0.05),
+65:                             ('max_height', 2.0), ('z_resolution', 0.10), ('update_period', 0.5),
+66:                             ('save_period', 5.0), ('mark_range', 4.0), ('clear_range', 5.0),
+67:                             ('scan_stride', 2), ('max_depth_rays', 1200), ('publish_3d', False),
+68:                             ('mark_all_depth_points', False), ('source_timeout_s', .8),
+69:                             ('shared_voxel_costmap', False), ('base_frame', 'base_link'), ('near_radius', 3.0), ('local_radius', 4.0),
+70:                             ('far_update_period', 1.0), ('world_publish_period', 1.0),
+71:                             ('expiry_period', 1.0), ('memory_ttl_s', 300.0),
+72:                             ('projection_min_z', -100.0), ('projection_max_z', 100.0)]:
+73:             self.declare_parameter(name, value)
+74:         self.values = {name: self.get_parameter(name).value for name in (
+75:             'output_directory', 'restore_path', 'floor_z', 'min_height', 'max_height', 'z_resolution',
+76:             'update_period', 'save_period', 'mark_range', 'clear_range', 'scan_stride', 'max_depth_rays',
+77:             'publish_3d', 'mark_all_depth_points', 'source_timeout_s', 'base_frame',
+110:         self.buffer = Buffer()
+111:         self.listener = TransformListener(self.buffer, self)
+112:         durable = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+113:         self.voxel_publisher = self.create_publisher(PointCloud2, 'obstacle_memory/voxels', durable)
+114:         self.local_publisher = self.create_publisher(PointCloud2, 'obstacle_memory/local_voxels', durable)
+115:         self.voxel_status = self.create_publisher(String, 'obstacle_memory/voxel_status', durable)
+116:         self.grid_publishers = {key: self.create_publisher(OccupancyGrid, 'obstacle_memory/'+key, durable)
+117:                            for key in ('grid', 'lidar', 'depth', 'navigation_grid')}
+118:         self.create_subscription(OccupancyGrid, self.get_parameter('map_topic').value, self.on_map, durable)
+119:         self.create_subscription(LaserScan, self.get_parameter('scan_topic').value,
+120:                                  lambda m: self.latest.update(lidar=m), qos_profile_sensor_data)
+121:         self.create_subscription(PointCloud2, self.get_parameter('depth_topic').value,
+122:                                  lambda m: self.latest.update(depth=m), qos_profile_sensor_data)
+123:         self.create_timer(self.values['update_period'], self.update)
+124:         self.create_timer(self.values['save_period'], self.save)
+125:         self.create_service(Trigger, 'obstacle_memory/save', self.save_service)
+126:         self.create_service(SetBool, 'obstacle_memory/set_enabled', self.set_enabled)
+127: 
+128:     def set_enabled(self, request, response):
+129:         if request.data and self.map_fault:
+130:             response.success = False
+131:             response.message = self.map_fault

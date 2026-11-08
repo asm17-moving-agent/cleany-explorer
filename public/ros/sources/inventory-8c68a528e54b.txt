@@ -1,0 +1,226 @@
+ros2_ws/src/cleany_navigation/cleany_navigation/reactive_guard_node.py
+Review: 2026-11-02
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 7f48373625848c6f78bf5fc7dd3c90a05f8421f321d1cba15d4754511ceadea9
+
+1: """Final command owner using direct LiDAR/depth and a steady-clock watchdog."""
+2: from __future__ import annotations
+3: 
+4: import json
+5: from pathlib import Path
+6: import time
+7: 
+8: import numpy as np
+9: import rclpy
+10: from ament_index_python.packages import get_package_share_directory
+11: from geometry_msgs.msg import Twist
+12: from nav_msgs.msg import Odometry
+13: from rclpy.clock import Clock, ClockType
+14: from rclpy.node import Node
+15: from rclpy.qos import qos_profile_sensor_data
+16: from rclpy.time import Time
+17: from sensor_msgs.msg import JointState, LaserScan, PointCloud2
+18: from std_msgs.msg import String
+19: from tf2_ros import Buffer, TransformListener, TransformException
+20: 
+21: from cleany_navigation.body_geometry import load_body_boxes
+22: from cleany_navigation.point_cloud import cloud_xyz
+23: from cleany_navigation.reactive_guard import InputWatchdog, PlanarBrakingGuard
+24: from cleany_navigation.transforms import stamp, transform
+25: from cleany_navigation.voxel_guard import GuardConfig
+26: from cleany_navigation.voxel_guard_node import localization_jumped, pose_matrix, twist_vector
+27: 
+28: 
+29: class ReactiveGuardNode(Node):
+30:     """Gate planar velocity using fresh sensor observations and braking bounds.
+31: 
+32:     Subscriptions:
+33:         safety_2d/cmd_vel (geometry_msgs/msg/Twist): Upstream limited command.
+34:         nav2/cmd_vel (geometry_msgs/msg/Twist): Original requested command.
+35:         odom (nav_msgs/msg/Odometry): Measured planar motion.
+36:         scan (sensor_msgs/msg/LaserScan) and camera/head/depth/points
+37:             (sensor_msgs/msg/PointCloud2): Obstacle observations.
+38:         joint_states (sensor_msgs/msg/JointState): Pan feedback when required.
+39: 
+40:     Publishers:
+41:         cmd_vel (geometry_msgs/msg/Twist): Accepted or stopped command.
+42:         reactive_guard/state (std_msgs/msg/String): JSON decision and input health.
+43: 
+44:     TF:
+45:         Reads sensor transforms and map/odom continuity; default base frame is base_link.
+46: 
+47:     QoS:
+48:         Sensor, joint and odometry inputs use sensor_data; velocity endpoints
+49:         use reliable depth 1.
+50: 
+51:     Notes:
+52:         Input/output topics and frames are configurable defaults. An explicit
+53:         body profile and distinct command topics are required. Missing or stale
+54:         evidence produces a stop through the steady-clock watchdog.
+55:     """
+56:     def __init__(self) -> None:
+57:         super().__init__('reactive_guard')
+58:         defaults = dict(profile='', allow_simulation_limits=False,
+59:             command_topic='safety_2d/cmd_vel', raw_command_topic='nav2/cmd_vel', output_topic='cmd_vel',
+60:             scan_topic='scan', depth_topic='camera/head/depth/points', odom_topic='odom',
+61:             base_frame='base_link', odom_frame='odom', map_frame='map', depth_frame='head_camera_depth_frame',
+62:             require_pan_feedback=True, pan_joint='head_pan_joint', joint_states_topic='joint_states',
+63:             min_height=-.33, max_height=1.62, source_timeout_s=.5, command_timeout_s=.5,
+64:             update_period_s=.05, processing_budget_s=.15, localization_jump_m=.25,
+65:             localization_jump_rad=.3, **vars(GuardConfig()))
+66:         for key, value in defaults.items():
+67:             self.declare_parameter(key, value)
+68:         self.p = p = {key: self.get_parameter(key).value for key in defaults}
+69:         for key in ('source_timeout_s', 'command_timeout_s', 'update_period_s', 'processing_budget_s',
+70:                     'localization_jump_m', 'localization_jump_rad'):
+71:             if not np.isfinite(p[key]) or p[key] <= 0:
+72:                 raise ValueError('Invalid timing or localization bound')
+73:         if (len({p['command_topic'], p['raw_command_topic'], p['output_topic']}) != 3
+74:                 or not p['profile'] or not np.isfinite([p['min_height'], p['max_height']]).all()
+75:                 or p['min_height'] >= p['max_height']):
+76:             raise ValueError('Distinct command topics, body profile and height interval required')
+77:         boxes = load_body_boxes(Path(get_package_share_directory('cleany_description')), Path(p['profile']),
+78:                                 allow_simulation_limits=p['allow_simulation_limits'])
+79:         corners = np.concatenate([b.corners() for b in boxes])
+80:         self.guard = PlanarBrakingGuard(corners[:, :2].min(axis=0), corners[:, :2].max(axis=0),
+81:                                        GuardConfig(**{k: p[k] for k in vars(GuardConfig())}))
+82:         self.watchdog = InputWatchdog(p['source_timeout_s'], p['command_timeout_s'])
+83:         self.command = self.raw = self.odom = None
+84:         self.command_wall = self.raw_wall = -np.inf
+85:         self.pending = {}
+86:         self.observations = {}
+87:         self.previous_map_odom = None
+88:         self.buffer = Buffer()
+89:         self.listener = TransformListener(self.buffer, self)
+90:         self.output = self.create_publisher(Twist, p['output_topic'], 1)
+91:         self.state = self.create_publisher(String, 'reactive_guard/state', 10)
+92:         self.create_subscription(Twist, p['command_topic'], self.on_command, 1)
+93:         self.create_subscription(Twist, p['raw_command_topic'], self.on_raw, 1)
+94:         self.create_subscription(Odometry, p['odom_topic'], self.on_odom, qos_profile_sensor_data)
+95:         self.create_subscription(LaserScan, p['scan_topic'], lambda m: self.on_sensor('scan', m), qos_profile_sensor_data)
+96:         self.create_subscription(PointCloud2, p['depth_topic'], lambda m: self.on_sensor('depth', m), qos_profile_sensor_data)
+97:         if p['require_pan_feedback']:
+98:             self.create_subscription(JointState, p['joint_states_topic'], self.on_joint, qos_profile_sensor_data)
+99:         self.create_timer(p['update_period_s'], self.update, clock=Clock(clock_type=ClockType.STEADY_TIME))
+100: 
+101:     def on_command(self, msg: Twist) -> None:
+102:         self.command, self.command_wall = msg, time.monotonic()
+103: 
+104:     def on_raw(self, msg: Twist) -> None:
+105:         self.raw, self.raw_wall = msg, time.monotonic()
+106: 
+107:     def on_odom(self, msg: Odometry) -> None:
+108:         self.odom = msg
+109:         self.watchdog.sources['odom'] = (stamp(msg.header.stamp), time.monotonic())
+110: 
+111:     def on_joint(self, msg: JointState) -> None:
+112:         if self.p['pan_joint'] not in msg.name:
+113:             return
+114:         i = msg.name.index(self.p['pan_joint'])
+115:         valid = i < len(msg.position) and i < len(msg.velocity) and np.isfinite([msg.position[i], msg.velocity[i]]).all()
+116:         self.watchdog.sources['joint'] = (stamp(msg.header.stamp) if valid else -np.inf, time.monotonic())
+117: 
+118:     def on_sensor(self, name: str, msg) -> None:
+119:         received = time.monotonic()
+120:         try:
+121:             if not msg.header.frame_id:
+122:                 raise ValueError('Missing sensor frame')
+123:             if name == 'depth':
+124:                 points = cloud_xyz(msg)
+125:                 if msg.header.frame_id != self.p['depth_frame'] or not len(points) or not np.isfinite(points).all():
+126:                     raise ValueError('Invalid depth cloud')
+127:             else:
+128:                 ranges = np.asarray(msg.ranges)
+129:                 if (not len(ranges) or not np.isfinite([msg.angle_min, msg.angle_increment, msg.range_min, msg.range_max]).all()
+130:                         or msg.range_min < 0 or msg.range_min >= msg.range_max or msg.angle_increment == 0):
+131:                     raise ValueError('Invalid scan geometry')
+132:                 valid = np.isfinite(ranges) & (ranges >= msg.range_min) & (ranges <= msg.range_max)
+133:                 if not (valid | np.isposinf(ranges)).any():
+134:                     raise ValueError('No valid scan rays')
+135:                 angles = msg.angle_min+np.flatnonzero(valid)*msg.angle_increment
+136:                 points = np.column_stack((ranges[valid]*np.cos(angles), ranges[valid]*np.sin(angles), np.zeros(valid.sum())))
+137:             self.pending[name] = (msg.header, received, points)
+138:         except (ValueError, TypeError):
+139:             self.pending.pop(name, None)
+140:             self.observations.pop(name, None)
+141:             self.watchdog.sources.pop(name, None)
+142: 
+143:     def observations_in_base(self, now: float) -> tuple[np.ndarray, float]:
+144:         # Nonblocking TF retry. Retain the previous exactly transformed sample
+145:         # only within the unchanged freshness bound; never use latest camera TF
+146:         # for an older depth image while the pan is moving.
+147:         for name, (header, received, points) in list(self.pending.items()):
+148:             try:
+149:                 tf = self.buffer.lookup_transform(self.p['odom_frame'], header.frame_id, Time.from_msg(header.stamp))
+150:                 self.observations[name] = transform(points, tf.transform)
+151:                 self.watchdog.sources[name] = (stamp(header.stamp), received)
+152:                 del self.pending[name]
+153:             except TransformException:
+154:                 pass
+155:         pose_msg = self.buffer.lookup_transform(self.p['odom_frame'], self.p['base_frame'], Time())
+156:         pose_age = now-stamp(pose_msg.header.stamp)
+157:         if not 0 <= pose_age <= self.p['source_timeout_s']:
+158:             raise ValueError('STALE_BASE_TF')
+159:         pose = pose_matrix(pose_msg.transform)
+160:         if np.linalg.norm(pose[:2, 2]) > .05:
+161:             raise ValueError('NON_PLANAR_BASE')
+162:         map_odom = pose_matrix(self.buffer.lookup_transform(self.p['map_frame'], self.p['odom_frame'], Time()).transform)
+163:         if localization_jumped(self.previous_map_odom, map_odom, self.p['localization_jump_m'], self.p['localization_jump_rad']):
+164:             self.watchdog.fault = 'LOCALIZATION_JUMP_RESTART_REQUIRED'
+165:         self.previous_map_odom = map_odom
+166:         points = np.concatenate([self.observations.get(k, np.empty((0, 3))) for k in ('scan', 'depth')])
+167:         points = (points-pose[:3, 3])@pose[:3, :3]
+168:         points = points[(points[:, 2] >= self.p['min_height']) & (points[:, 2] <= self.p['max_height'])]
+169:         return points[:, :2], pose_age
+170: 
+171:     def update(self) -> None:
+172:         start = time.monotonic()
+173:         now = self.get_clock().now().nanoseconds/1e9
+174:         output = np.zeros(3)
+175:         requested = np.zeros(3)
+176:         measured = np.zeros(3)
+177:         reason, source_age = 'MISSING_INPUT', None
+178:         try:
+179:             # Clock faults must latch even while TF or sensors are unavailable.
+180:             self.watchdog.tick(now, start)
+181:             points, pose_age = self.observations_in_base(now)
+182:             required = ('scan', 'depth', 'odom')+ (('joint',) if self.p['require_pan_feedback'] else ())
+183:             source_age = max(pose_age, self.watchdog.check(now, start, self.command_wall, self.raw_wall, required))
+184:             if self.command is None or self.raw is None or self.odom is None:
+185:                 raise ValueError('MISSING_COMMAND_OR_ODOM')
+186:             if self.odom.child_frame_id != self.p['base_frame']:
+187:                 raise ValueError('INVALID_ODOM_FRAME')
+188:             requested, raw, measured = twist_vector(self.command), twist_vector(self.raw), twist_vector(self.odom.twist.twist)
+189:             # A raw stop cannot be resurrected by a delayed monitor sample.
+190:             if not np.any(raw):
+191:                 requested = np.zeros(3)
+192:             output, reason = self.guard.evaluate(points, requested, measured, source_age)
+193:             if not np.any(requested) and reason == 'PASS':
+194:                 reason = 'STOP_COMMAND'
+195:             if time.monotonic()-start > self.p['processing_budget_s']:
+196:                 raise ValueError('PROCESSING_TIMEOUT')
+197:         except (ValueError, TransformException) as exc:
+198:             output, reason = np.zeros(3), str(exc)
+199:         out = Twist()
+200:         out.linear.x, out.linear.y, out.angular.z = map(float, output)
+201:         self.output.publish(out)
+202:         self.state.publish(String(data=json.dumps(dict(mode='direct_sensor_planar_guard', sim_s=now,
+203:             decision=reason, requested=requested.tolist(), output=output.tolist(),
+204:             measured=measured.tolist(),
+205:             source_age_s=source_age, processing_s=time.monotonic()-start,
+206:             observation_scope='observed_surfaces_only; blind space is not certified free'))))
+207: 
+208: 
+209: def main(args: list[str] | None = None) -> None:
+210:     rclpy.init(args=args)
+211:     node = ReactiveGuardNode()
+212:     try:
+213:         rclpy.spin(node)
+214:     except KeyboardInterrupt:
+215:         pass
+216:     finally:
+217:         if rclpy.ok():
+218:             node.output.publish(Twist())
+219:         node.destroy_node()
+220:         if rclpy.ok():
+221:             rclpy.shutdown()

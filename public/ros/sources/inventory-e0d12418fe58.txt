@@ -1,0 +1,33 @@
+ros2_ws/src/cleany_mission_manager/cleany_mission_manager/node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 6f523ebde09edd8cac733260eed2da745898bd70d2eef2a0ac0d8344884cf7f9
+
+74:         assumes its producer has already stopped hardware; it is not a stop actuator.
+75:     """
+76:     def __init__(self, **kwargs) -> None:
+77:         super().__init__("mission_runtime", **kwargs)
+78:         defaults = {
+79:             "targets_file": "", "journal_path": "~/.local/state/cleany/missions.db",
+80:             "navigation_backend": "nav2", "post_mission": "return_home",
+81:             "tick_hz": 10.0, "navigation_timeout": 180.0, "cleaning_timeout": 180.0,
+82:             "operation_timeout": 30.0, "cancel_timeout": 5.0,
+145:             )}),
+146:         )
+147:         qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+148:         self.status_pub = self.create_publisher(MissionStatus, "mission/status", qos)
+149:         self.result_pub = self.create_publisher(MissionResult, "mission/result", qos)
+150:         self.create_service(OfferMission, "mission/offer", self._offer)
+151:         self.create_service(CancelMission, "mission/cancel", self._cancel)
+152:         self.create_service(GetRuntimeSnapshot, "mission/snapshot", self._snapshot)
+153:         self.create_service(Trigger, "mission/reset_error", self._reset)
+154:         # Notification only: the backend producing this signal owns physical stop first.
+155:         self.create_subscription(String, "robot/safety_fault", self._fault, 10)
+156:         self.create_subscription(String, "robot/safety_released", self._released, 10)
+157:         self.debug_pub = self.create_publisher(RuntimeDebugSnapshot, "mission/debug_snapshot", qos)
+158:         self.event_pub = self.create_publisher(RuntimeEvent, "mission/runtime_events",
+159:             QoSProfile(depth=2048, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+160:         self.last_debug_at = 0.0
+161:         self.last_debug_event = 0
+162:         self.last_sequence = -1
+163:         self.last_result = ""

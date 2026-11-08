@@ -1,0 +1,14 @@
+ros2_ws/src/cleany_dev_monitor/cleany_dev_monitor/slam_reader.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: d24c893d8c438739ea35caf5e1299f2db9e190a5c3d4aa2e4e024d046adf4cc8
+
+219:         if self.client is None:
+220:             try:
+221:                 self.service_type = get_service("cartographer_ros_msgs/srv/SubmapQuery")
+222:                 self.client = self.node.create_client(
+223:                     self.service_type, self.config["slam_submap_query_service"]
+224:                 )
+225:             except (ImportError, AttributeError, ValueError) as exc:
+226:                 self.status("type_missing", str(exc))
+227:                 return

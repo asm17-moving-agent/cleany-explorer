@@ -1,0 +1,310 @@
+ros2_ws/src/cleany_perception/cleany_perception/wrist_service.py
+Review: 2026-11-01
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 853e16a461dc0193b0c430148a35986542eebc8a8f523b8d2db52c18a4112764
+
+1: """Selected wrist RGB observation with exact image/info pairing.
+2: 
+3: YOLOE-seg redetects the projected instance at handoff and check.
+4: Wrist RGB observations do not produce depth or measured 3D poses.
+5: """
+6: from collections import OrderedDict
+7: from copy import deepcopy
+8: from pathlib import Path
+9: import threading
+10: import time
+11: from uuid import uuid4
+12: 
+13: import numpy as np
+14: from PIL import Image as PilImage
+15: from sensor_msgs.msg import Image, CameraInfo
+16: from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+17: from rclpy.qos import qos_profile_sensor_data
+18: from cleany_interfaces.srv import ObserveWristTarget
+19: from cleany_interfaces.msg import WristTrackingStatus
+20: from cleany_perception.adapters.tf2_transform import rotation_matrix_from_quaternion
+21: from cleany_perception.core.wrist_observation import (
+22:     WristObservationConfig, project_box, bbox_iou, verify_mask,
+23: )
+24: from cleany_perception.core.ports import DetectorPort
+25: from cleany_perception.byte_buffer import numpy_byte_array
+26: 
+27: 
+28: class WristTargetNotDetected(ValueError):
+29:     """A valid captured frame contains no associated target detection."""
+30: 
+31: 
+32: class WristService:
+33:     def __init__(self, node, detector: DetectorPort, *,
+34:                  check_detector: DetectorPort | None = None,
+35:                  mouse_check_detector: DetectorPort | None = None,
+36:                  right_detector: DetectorPort | None = None,
+37:                  right_check_detector: DetectorPort | None = None,
+38:                  failure_image_directory: str = '',
+39:                  config: WristObservationConfig = WristObservationConfig()):
+40:         self.node, self.detector = node, detector
+41:         self.check_detector = check_detector or detector
+42:         self.mouse_check_detector = mouse_check_detector or self.check_detector
+43:         self.right_detector = right_detector or detector
+44:         self.right_check_detector = right_check_detector or self.check_detector
+45:         self.failure_image_directory = Path(failure_image_directory).expanduser() if failure_image_directory else None
+46:         self.config = config
+47:         self.lock = threading.Condition()
+48:         self.images = {arm: OrderedDict() for arm in ('left', 'right')}
+49:         self.infos = {arm: OrderedDict() for arm in ('left', 'right')}
+50:         self.reference = None
+51:         self.status_publisher = node.create_publisher(
+52:             WristTrackingStatus, '/perception/wrist_tracking_status', 10)
+53:         self.subscriptions = []
+54:         for arm in self.images:
+55:             for message, suffix, cache in ((Image, 'image_raw', self.images), (CameraInfo, 'camera_info', self.infos)):
+56:                 self.subscriptions.append(node.create_subscription(
+57:                     message, f'/{arm}_wrist_camera/{suffix}',
+58:                     lambda msg, a=arm, c=cache: self.receive(c[a], msg), qos_profile_sensor_data,
+59:                     callback_group=MutuallyExclusiveCallbackGroup()))
+60:         self.service = node.create_service(ObserveWristTarget, '/perception/observe_wrist_target',
+61:             self.execute, callback_group=node._action_callback_group)
+62: 
+63:     def receive(self, cache, message):
+64:         key = message.header.stamp.sec*10**9 + message.header.stamp.nanosec
+65:         if key <= 0:
+66:             return
+67:         with self.lock:
+68:             ref = self.reference
+69:             if ref is not None and cache is not self.images[ref['arm']] and cache is not self.infos[ref['arm']]:
+70:                 return
+71:             cache[key] = message
+72:             while len(cache) > 4:
+73:                 cache.popitem(last=False)
+74:             self.lock.notify_all()
+75: 
+76:     def capture(self, arm, after):
+77:         deadline = time.monotonic()+self.config.capture_timeout_seconds
+78:         with self.lock:
+79:             while time.monotonic() < deadline:
+80:                 keys = self.images[arm].keys() & self.infos[arm].keys()
+81:                 for stamp in sorted(keys, reverse=True):
+82:                     age = (self.node.get_clock().now().nanoseconds-stamp)/1e9
+83:                     if stamp > after and 0 <= age <= self.config.maximum_frame_age_seconds:
+84:                         return self.images[arm][stamp], self.infos[arm][stamp], stamp
+85:                 self.lock.wait(timeout=0.05)
+86:         raise ValueError('No fresh synchronized wrist RGB/CameraInfo')
+87: 
+88:     def close(self, *, wait: bool = False):
+89:         with self.lock:
+90:             self.reference = None
+91: 
+92:     @staticmethod
+93:     def _rgb(msg, info, arm):
+94:         expected_frame = f'{arm}_wrist_rgb_optical_frame'
+95:         if (msg.header.frame_id != expected_frame or info.header != msg.header
+96:                 or (info.width, info.height) != (msg.width,msg.height)
+97:                 or msg.encoding not in ('rgb8','bgr8') or msg.step < msg.width*3
+98:                 or len(msg.data) != msg.step*msg.height
+99:                 or any(not np.isfinite(d) or abs(d)>1e-9 for d in info.d)
+100:                 or not np.isfinite(info.k).all() or info.k[0] <= 0 or info.k[4] <= 0):
+101:             raise ValueError('Invalid rectified wrist RGB contract')
+102:         rgb = np.frombuffer(msg.data,np.uint8).reshape(msg.height,msg.step)[:, :msg.width*3]
+103:         rgb = rgb.reshape(msg.height,msg.width,3)
+104:         return np.array(rgb if msg.encoding=='rgb8' else rgb[...,::-1],copy=True)
+105: 
+106:     @staticmethod
+107:     def _debug_image(msg: Image, rgb: np.ndarray) -> Image:
+108:         """Preserve Image metadata without copying the overwritten source pixels."""
+109:         debug = Image(header=deepcopy(msg.header), height=msg.height, width=msg.width,
+110:                       encoding='rgb8', is_bigendian=msg.is_bigendian, step=msg.width*3)
+111:         debug.data = numpy_byte_array(rgb)
+112:         return debug
+113: 
+114:     def _reference_expired(self, ref):
+115:         return time.monotonic()-ref.get('last_valid_at',ref['created']) > self.config.reference_ttl_seconds
+116: 
+117:     def _yoloe_mask(self, rgb, box, label, detector=None, fallback_detector=None):
+118:         active_detector = detector or self.detector
+119:         detections = active_detector.detect(rgb, '')
+120:         expected_label = label.casefold().strip()
+121:         def associated(items):
+122:             if any(not np.isfinite(d.confidence) or not 0 <= d.confidence <= 1 for d in items):
+123:                 raise ValueError('Invalid wrist detection confidence')
+124:             return [d for d in items
+125:                     if f' {d.label.casefold().strip()} ' in f' {expected_label} '
+126:                     and self.config.minimum_detection_confidence <= d.confidence <= 1
+127:                     and bbox_iou(d.bbox, box) >= self.config.minimum_detection_iou]
+128: 
+129:         candidates = associated(detections)
+130:         if not candidates and fallback_detector is not None and fallback_detector is not active_detector:
+131:             fallback_detections = fallback_detector.detect(rgb, '')
+132:             candidates = associated(fallback_detections)
+133:             if candidates:
+134:                 self.node.get_logger().info(
+135:                     f'WRIST YOLOE fallback associated {label} with projected box')
+136:             else:
+137:                 detections = tuple(detections) + tuple(fallback_detections)
+138:         if not candidates:
+139:             if self.failure_image_directory is not None:
+140:                 self.failure_image_directory.mkdir(parents=True, exist_ok=True)
+141:                 PilImage.fromarray(rgb).save(
+142:                     self.failure_image_directory / f'wrist_missing_{time.time_ns()}.png')
+143:             matching_labels = [d for d in detections
+144:                                if f' {d.label.casefold().strip()} ' in f' {expected_label} ']
+145:             strongest = max(
+146:                 ((d.confidence, bbox_iou(d.bbox, box)) for d in matching_labels),
+147:                 default=None)
+148:             raise WristTargetNotDetected(
+149:                 f'Wrist YOLOE needs one projected {label}; found 0 '
+150:                 f'(class_detections={len(matching_labels)}, '
+151:                 f'best_confidence_iou={strongest})'
+152:             )
+153:         candidates.sort(key=lambda detection: detection.confidence, reverse=True)
+154:         mask = candidates[0].segmentation_mask
+155:         if mask is None or np.shape(mask) != rgb.shape[:2] or np.asarray(mask).dtype != np.bool_:
+156:             raise ValueError('Wrist YOLOE instance mask is missing or mismatched')
+157:         for candidate in candidates[1:]:
+158:             other_mask = candidate.segmentation_mask
+159:             if (other_mask is None or np.shape(other_mask) != rgb.shape[:2]
+160:                     or np.asarray(other_mask).dtype != np.bool_
+161:                     or bbox_iou(candidate.bbox, candidates[0].bbox) < 0.8):
+162:                 raise ValueError(f'Wrist YOLOE needs one projected {label}; found {len(candidates)}')
+163:             union = np.count_nonzero(mask | other_mask)
+164:             if not union or np.count_nonzero(mask & other_mask) / union < 0.8:
+165:                 raise ValueError(f'Wrist YOLOE needs one projected {label}; found {len(candidates)}')
+166:         return mask
+167: 
+168: 
+169:     def execute(self, request, response):
+170:         with self.node._busy_lock:
+171:             if self.node._busy:
+172:                 response.status = response.ERROR
+173:                 response.message = 'Perception busy'
+174:                 return response
+175:             self.node._busy = True
+176:         try:
+177:             self.process(request, response)
+178:             response.success = True
+179:             response.status = response.OK
+180:         except WristTargetNotDetected as error:
+181:             response.success = False
+182:             response.status = response.NOT_DETECTED
+183:             response.message = str(error)
+184:         except Exception as error:
+185:             response.success = False
+186:             response.status = response.ERROR
+187:             response.message = str(error)
+188:         finally:
+189:             try:
+190:                 status = WristTrackingStatus()
+191:                 status.header = deepcopy(response.header)
+192:                 status.arm = request.arm
+193:                 status.reference_id = response.reference_id or request.reference_id
+194:                 status.source_snapshot_id = request.source_snapshot_id
+195:                 status.source_object_id = request.source_object_id
+196:                 status.valid = status.visible = bool(
+197:                     response.success and request.operation != request.CLEAR)
+198:                 status.image_pixels = response.mask.width * response.mask.height
+199:                 status.mask_pixels = int(np.count_nonzero(
+200:                     np.frombuffer(bytes(response.mask.data), dtype=np.uint8)))
+201:                 status.reason = response.message
+202:                 self.status_publisher.publish(status)
+203:             finally:
+204:                 with self.node._busy_lock:
+205:                     self.node._busy = False
+206:         return response
+207: 
+208:     def process(self, req, out):
+209:         detector_label = req.detector_label or req.label
+210:         if req.arm not in self.images or req.operation not in (req.HANDOFF, req.CHECK, req.CLEAR):
+211:             raise ValueError('Invalid wrist operation or arm')
+212:         if req.operation != req.HANDOFF:
+213:             ref = self.reference
+214:             if (ref is None or ref['id'] != req.reference_id or ref['arm'] != req.arm
+215:                     or ref['source'] != req.source_snapshot_id or ref['object'] != req.source_object_id):
+216:                 raise ValueError('Wrist reference identity mismatch')
+217:             if req.operation == req.CLEAR:
+218:                 out.header.stamp = self.node.get_clock().now().to_msg()
+219:                 out.reference_id = ref['id']
+220:                 out.source_snapshot_id = ref['source']
+221:                 out.source_object_id = ref['object']
+222:                 out.message = 'Wrist reference cleared'
+223:                 self.close()
+224:                 return
+225:             if self._reference_expired(ref):
+226:                 raise ValueError('Wrist reference expired')
+227:             if req.label != ref['label'] or detector_label != ref['detector_label']:
+228:                 raise ValueError('Wrist reference semantic type or detector class changed')
+229:         else:
+230:             # Failed replacement must not leave a usable old reference.
+231:             self.close()
+232:             if (not req.source_snapshot_id or not req.source_object_id or not req.label
+233:                     or not np.isfinite(req.source_confidence)
+234:                     or not self.config.minimum_detection_confidence <= req.source_confidence <= 1):
+235:                 raise ValueError('Invalid head observation provenance')
+236:             prior_stamp = req.expected_pose.header.stamp
+237:             prior_ns = prior_stamp.sec*10**9 + prior_stamp.nanosec
+238:             prior_age = (self.node.get_clock().now().nanoseconds-prior_ns)/1e9
+239:             if prior_ns <= 0 or not 0 <= prior_age <= self.config.maximum_head_prior_age_seconds:
+240:                 raise ValueError('Missing, stale or future head observation timestamp')
+241:         if req.expected_pose.header.frame_id != 'base_link':
+242:             raise ValueError('Expected object pose must be in base_link')
+243:         msg, info, stamp = self.capture(req.arm, req.after_stamp_ns)
+244:         rgb = self._rgb(msg, info, req.arm)
+245:         expected_frame = f'{req.arm}_wrist_rgb_optical_frame'
+246:         # Show the active sensor even if association/inference subsequently fails.
+247:         if (getattr(self.node, '_debug_republish_count', 1) > 0
+248:                 and hasattr(self.node, '_publish_debug_image')):
+249:             self.node._publish_debug_image(self._debug_image(msg, rgb))
+250:         pose = req.expected_pose.pose
+251:         q = pose.orientation
+252:         rotation = rotation_matrix_from_quaternion(q.x,q.y,q.z,q.w)
+253:         transform = self.node._transformer.lookup(expected_frame,'base_link',stamp)
+254:         box = project_box((pose.position.x,pose.position.y,pose.position.z),rotation,
+255:             (req.size.x,req.size.y,req.size.z),transform,np.array(info.k).reshape(3,3),
+256:             msg.width,msg.height,self.config)
+257:         # A missing target still carries the validated observation's provenance.
+258:         # Consumers can retry after this capture without inventing a detection.
+259:         out.source_snapshot_id = req.source_snapshot_id
+260:         out.source_object_id = req.source_object_id
+261:         out.header = deepcopy(msg.header)
+262:         if req.operation == req.HANDOFF:
+263:             mask = self._yoloe_mask(rgb, box, detector_label,
+264:                 detector=self.right_detector if req.arm == 'right' else self.detector,
+265:                 fallback_detector=self.detector if req.arm == 'right' else None)
+266:         else:
+267:             if (tuple(info.k) != ref['k'] or rgb.shape != ref['shape']
+268:                     or stamp <= ref['stamp']):
+269:                 raise ValueError('Wrist calibration/shape/timestamp changed')
+270:             out.reference_id = ref['id']
+271:             ref['stamp'] = stamp  # Consume failed checks too; retries need a new frame.
+272:             mask = self._yoloe_mask(
+273:                 rgb, box, detector_label,
+274:                 detector=(self.right_check_detector if req.arm == 'right'
+275:                           else self.mouse_check_detector
+276:                           if 'computer mouse' in detector_label.casefold()
+277:                           else self.check_detector),
+278:                 fallback_detector=self.check_detector if req.arm == 'right' else None)
+279:         if np.shape(mask) != (msg.height, msg.width):
+280:             raise ValueError('Wrist mask shape differs from captured image')
+281:         verify_mask(mask,box,self.config)
+282:         if req.operation == req.HANDOFF:
+283:             with self.lock:
+284:                 self.reference = dict(id=uuid4().hex,arm=req.arm,source=req.source_snapshot_id,
+285:                     label=req.label, detector_label=detector_label,
+286:                     object=req.source_object_id,created=time.monotonic(),stamp=stamp,
+287:                     shape=rgb.shape,
+288:                     k=tuple(info.k))
+289:                 other = 'right' if req.arm == 'left' else 'left'
+290:                 self.images[other].clear()
+291:                 self.infos[other].clear()
+292:         out.reference_id = self.reference['id']
+293:         out.source_snapshot_id=req.source_snapshot_id; out.source_object_id=req.source_object_id
+294:         out.header=deepcopy(msg.header)
+295:         out.mask.header=deepcopy(msg.header); out.mask.width=msg.width; out.mask.height=msg.height
+296:         out.mask.encoding='mono8'; out.mask.step=msg.width
+297:         out.mask.data=numpy_byte_array(np.asarray(mask,dtype=np.uint8)*255)
+298:         out.message = 'Wrist YOLOE-seg target consistency passed; no fresh depth or measured 3D pose'
+299:         if getattr(self.node, '_debug_republish_count', 1) > 0:
+300:             overlay=rgb.copy(); overlay[mask]=(overlay[mask]*0.5+np.array((0,255,0))*0.5).astype(np.uint8)
+301:             debug=self._debug_image(msg, overlay)
+302:             if hasattr(self.node, '_publish_debug_image'):
+303:                 self.node._publish_debug_image(debug)
+304:             else:
+305:                 self.node._debug_publisher.publish(debug)

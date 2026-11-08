@@ -1,0 +1,29 @@
+ros2_ws/src/cleany_base_driver/cleany_base_driver/imu_node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 957fc59e0e6da7db34f3530f31168cea34afb824f187363158578ca412ff8d0b
+
+21:     """Relay MCU-calibrated gyro without starting or repeating calibration."""
+22: 
+23:     def __init__(self, parameter_overrides=None) -> None:
+24:         super().__init__('cleany_imu', parameter_overrides=parameter_overrides or [])
+25:         defaults = {
+26:             'frame_id': 'imu_link',
+27:             'expected_device_mac': '',
+28:             'max_transport_delay_s': 0.1,
+29:             'max_clock_jump_s': 0.05,
+49:         self.started_at = time.monotonic()
+50:         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
+51:                          durability=DurabilityPolicy.VOLATILE)
+52:         self.raw = self.create_publisher(Imu, 'imu/data_raw', qos)
+53:         self.corrected = self.create_publisher(Imu, 'imu/data', qos)
+54:         status_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+55:                                 durability=DurabilityPolicy.TRANSIENT_LOCAL)
+56:         self.status = self.create_publisher(DiagnosticArray, 'imu/status', status_qos)
+57:         self.diags = self.create_publisher(DiagnosticArray, 'diagnostics', 10)
+58:         self.create_subscription(ImuState, 'base/imu_state', self.on_state, qos)
+59:         self.received = self.rejected = 0
+60:         self.last_sample: ImuState | None = None
+61:         self.last_receipt: float | None = None
+62:         self.last_error = self.last_rejection = ''
+63:         self._last_status_key = None

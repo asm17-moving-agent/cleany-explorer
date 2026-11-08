@@ -1,0 +1,15 @@
+ros2_ws/src/cleany_robot_interface/cleany_robot_interface/motor_telemetry.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 973b23c442a4e64649d620fecc7d187b6641b3f1632350a964ab92373390bd0c
+
+28: 
+29: class MotorTelemetryRecorder(Node):
+30:     def __init__(self):
+31:         super().__init__('motor_telemetry_recorder')
+32:         self.subscription = self.create_subscription(
+33:             DynamicJointState, '/joint_state_broadcaster/dynamic_joint_states',
+34:             self.record, qos_profile_sensor_data)
+35: 
+36:     def record(self, message: DynamicJointState) -> None:
+37:         # Runs outside the motor control thread. No logging/serial reads are

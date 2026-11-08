@@ -1,0 +1,16 @@
+ros2_ws/src/cleany_mission_manager/cleany_mission_manager/adapters/manipulation.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 433c3ab4e4f84ce7119842058d0f19d9f1f3508ffe1b222ea8f4e94f0760754b
+
+59: class ROSManipulationTransport:
+60:     def __init__(self, node, action_name: str, query_name: str) -> None:
+61:         action_name = node.resolve_topic_name(action_name)
+62:         self.client = ActionClient(node, ExecuteManipulationSkill, action_name)
+63:         self.cancel_client = node.create_client(CancelGoal, action_name + "/_action/cancel_goal")
+64:         self.query_client = node.create_client(GetManipulationExecution, query_name)
+65:         self.active_execution_id: str | None = None
+66:         self.feedback: dict = {}
+67: 
+68:     def _finished(self, execution_id: str) -> None:
+69:         if self.active_execution_id == execution_id:

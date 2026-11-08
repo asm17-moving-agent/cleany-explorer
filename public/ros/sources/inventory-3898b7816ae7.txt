@@ -1,0 +1,36 @@
+ros2_ws/src/cleany_navigation/cleany_navigation/depth_clearance_node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 6ed82e8ed0a05829f59d433a44371219c57410eaa1f25fd688a6d84f4203a28a
+
+45:         tf_wait_timeout_s. Self-filtering requires an explicit body profile.
+46:     """
+47:     def __init__(self) -> None:
+48:         super().__init__('depth_clearance')
+49:         for name, default in [('input_topic', 'camera/head/depth/image_raw'),
+50:                               ('output_topic', 'camera/head/depth/points'),
+51:                               ('obstacle_topic', 'camera/head/depth/obstacle_points'),
+52:                               ('tf_wait_timeout_s', .15), ('marking_min_z', -.33), ('marking_max_z', 1.62),
+53:                               ('camera_info_topic', 'camera/head/depth/camera_info'),
+54:                               ('camera_frame', 'head_camera_depth_frame'),
+55:                               ('optical_frame', 'head_camera_depth_optical_frame'),
+56:                               ('self_filter_profile', ''), ('self_filter_margin_m', .001), ('allow_simulation_limits', False), ('base_frame', 'base_link'), ('pixel_stride', 4), ('positive_infinity_is_free', False),
+57:                               ('clearing_distance', 5.0), ('marking_max_range', 4.0), ('sensor_far_clip', 10.0)]:
+58:             self.declare_parameter(name, default)
+59:         obstacle_height_mask(np.empty((0, 3)), self.get_parameter('marking_min_z').value, self.get_parameter('marking_max_z').value)
+60:         self.stride = self.get_parameter('pixel_stride').value
+61:         self.clearing_distance = self.get_parameter('clearing_distance').value
+62:         if self.stride < 1 or not (self.get_parameter('marking_max_range').value < self.clearing_distance < self.get_parameter('sensor_far_clip').value):
+79:         if not np.isfinite(self.tf_wait_timeout) or self.tf_wait_timeout <= 0:
+80:             raise ValueError('tf_wait_timeout_s must be positive')
+81:         self.create_timer(.01, self.retry_depth, clock=Clock(clock_type=ClockType.STEADY_TIME))
+82:         self.create_subscription(CameraInfo, self.get_parameter('camera_info_topic').value, self.on_info, qos_profile_sensor_data)
+83:         self.create_subscription(Image, self.get_parameter('input_topic').value, self.on_depth,
+84:                                  QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
+85:         self.obstacles = self.create_publisher(PointCloud2, self.get_parameter('obstacle_topic').value, qos_profile_sensor_data)
+86:         self.publisher = self.create_publisher(PointCloud2, self.get_parameter('output_topic').value, qos_profile_sensor_data)
+87: 
+88:     def on_info(self, msg: CameraInfo) -> None:
+89:         self.camera = msg
+90: 
+91:     def on_depth(self, msg: Image) -> None:

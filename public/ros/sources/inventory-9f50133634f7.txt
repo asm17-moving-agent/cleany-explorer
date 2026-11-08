@@ -1,0 +1,113 @@
+ros2_ws/src/cleany_manipulation_bt/cleany_manipulation_bt/arm_return_client.py
+Review: 2026-11-01
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: afa2acdbff40326f5e4698ce2a75ec88ad68b9d2bf6e1a1b494943d3254c2083
+
+1: """Explicit operator command to open grippers and return to saved defaults."""
+2: import argparse
+3: import json
+4: import math
+5: import signal
+6: import sys
+7: import threading
+8: import time
+9: 
+10: import rclpy
+11: from action_msgs.msg import GoalStatus
+12: from rclpy.action import ActionClient
+13: from rclpy.signals import SignalHandlerOptions
+14: from cleany_interfaces.action import ReturnArm
+15: 
+16: from .arm_return_recovery import (RESTART_EXECUTOR, SOFTWARE_STOP, check_driver_stop,
+17:                                   probe_control)
+18: 
+19: 
+20: def main(args=None) -> int:
+21:     parser = argparse.ArgumentParser(description=__doc__)
+22:     parser.add_argument('--arm', choices=('both', 'left', 'right'), default='both')
+23:     parser.add_argument('--namespace', default='/')
+24:     parser.add_argument('--timeout', type=float, default=240.)
+25:     parser.add_argument('--check-control', action='store_true',
+26:                         help='Only inspect live control status; send no action')
+27:     parser.add_argument('--control-log', default='',
+28:                         help='Active control launch stdout, required for software-stop recovery')
+29:     parser.add_argument('--control-timeout', type=float, default=5.)
+30:     options, ros_args = parser.parse_known_args(args)
+31:     if not math.isfinite(options.timeout) or options.timeout <= 0:
+32:         parser.error('--timeout must be finite and positive')
+33:     if not math.isfinite(options.control_timeout) or options.control_timeout <= 0:
+34:         parser.error('--control-timeout must be finite and positive')
+35:     interrupted = threading.Event()
+36:     previous = {sig: signal.signal(sig, lambda *_: interrupted.set())
+37:                 for sig in (signal.SIGINT, signal.SIGTERM)}
+38:     node = client = handle = submitted = None
+39:     finished = False
+40: 
+41:     def wait(future, timeout, *, interruptible=True):
+42:         deadline = time.monotonic() + timeout
+43:         while rclpy.ok() and not future.done() and time.monotonic() < deadline:
+44:             if interruptible and interrupted.is_set():
+45:                 raise InterruptedError('Arm return interrupted; requesting cancellation')
+46:             rclpy.spin_once(node, timeout_sec=.05)
+47:         if not future.done():
+48:             raise TimeoutError('Arm return response timed out')
+49:         return future.result()
+50: 
+51:     try:
+52:         rclpy.init(args=ros_args, signal_handler_options=SignalHandlerOptions.NO)
+53:         node = rclpy.create_node('arm_return_client')
+54:         if options.check_control:
+55:             readiness = probe_control(node, options.namespace, options.control_timeout,
+56:                                       interrupted.is_set)
+57:             if readiness.code == SOFTWARE_STOP:
+58:                 readiness = check_driver_stop(options.control_log)
+59:             if interrupted.is_set():
+60:                 raise InterruptedError('Arm return preparation cancelled')
+61:             print(readiness.message, flush=True)
+62:             return readiness.code
+63:         client = ActionClient(node, ReturnArm, options.namespace.rstrip('/') + '/manipulation/return_arm')
+64:         if not client.wait_for_server(timeout_sec=10.):
+65:             raise RuntimeError('팔 복귀 서버가 없습니다. make manipulation-start로 실행기를 준비하세요.')
+66:         print(f'그리퍼 열기 → 팔 복귀와 그리퍼 닫기: {options.arm}', flush=True)
+67:         submitted = client.send_goal_async(ReturnArm.Goal(arm=options.arm),
+68:             feedback_callback=lambda msg: print(msg.feedback.stage, flush=True))
+69:         handle = wait(submitted, 10.)
+70:         if not handle.accepted:
+71:             raise RuntimeError('복귀 요청 거절: 진행 중 작업/복구 확인 또는 기본 자세 설정을 확인하세요.')
+72:         response = wait(handle.get_result_async(), options.timeout)
+73:         finished = True
+74:         result = response.result
+75:         print(json.dumps({'success': result.success, 'stop_confirmed': result.stop_confirmed,
+76:                           'message': result.message}, ensure_ascii=False), flush=True)
+77:         if (result.recovery_required and not interrupted.is_set()
+78:                 and response.status == GoalStatus.STATUS_ABORTED):
+79:             return RESTART_EXECUTOR
+80:         return 0 if result.success and result.stop_confirmed else 1
+81:     except Exception as error:
+82:         print(str(error), file=sys.stderr)
+83:         return 1
+84:     finally:
+85:         try:
+86:             if submitted is not None and not finished:
+87:                 # Preserve DDS for late acceptance, cancellation and stop Result.
+88:                 if handle is None:
+89:                     handle = wait(submitted, 15., interruptible=False)
+90:                 if handle.accepted:
+91:                     wait(handle.cancel_goal_async(), 5., interruptible=False)
+92:                     stopped = wait(handle.get_result_async(), 25., interruptible=False).result
+93:                     print(f'취소 후 정지 확인: {stopped.stop_confirmed}', file=sys.stderr)
+94:         except Exception as error:
+95:             print(f'복귀 취소/정지 확인 실패: {error}', file=sys.stderr)
+96:         finally:
+97:             if client is not None:
+98:                 client.destroy()
+99:             if node is not None:
+100:                 node.destroy_node()
+101:             if rclpy.ok():
+102:                 rclpy.shutdown()
+103:             for sig, handler in previous.items():
+104:                 signal.signal(sig, handler)
+105: 
+106: 
+107: if __name__ == '__main__':
+108:     raise SystemExit(main())

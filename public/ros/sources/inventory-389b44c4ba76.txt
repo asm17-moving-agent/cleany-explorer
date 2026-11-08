@@ -1,0 +1,66 @@
+ros2_ws/src/cleany_perception/launch/learned_rgbd.launch.py
+Review: 2026-11-02
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 659cf255924c71c8beb103e0e3c233844d673b39e383484e2931bada7916ea51
+
+1: """YOLOE-seg + Gemini on any aligned RGB-D / TF provider."""
+2: from pathlib import Path
+3: 
+4: from ament_index_python.packages import get_package_share_directory
+5: from launch import LaunchDescription
+6: from launch.actions import DeclareLaunchArgument
+7: from launch.substitutions import EnvironmentVariable, LaunchConfiguration
+8: from launch_ros.actions import Node
+9: from launch_ros.parameter_descriptions import ParameterValue
+10: 
+11: 
+12: def generate_launch_description() -> LaunchDescription:
+13:     share = Path(get_package_share_directory('cleany_perception'))
+14:     profile_path = share / 'config' / 'yoloe_seg_gemini.yaml'
+15:     return LaunchDescription([
+16:         DeclareLaunchArgument('use_sim_time', default_value='false'),
+17:         DeclareLaunchArgument('device', default_value='auto'),
+18:         DeclareLaunchArgument('enable_wrist_observation', default_value='false',
+19:                              choices=['true', 'false']),
+20:         DeclareLaunchArgument('model_profile', default_value=str(profile_path)),
+21:         DeclareLaunchArgument(
+22:             'model_directory', default_value=EnvironmentVariable(
+23:                 'CLEANY_MODEL_DIR',
+24:                 default_value=str(Path.home() / 'models'),
+25:             ),
+26:         ),
+27:         DeclareLaunchArgument(
+28:             'color_image_topic', default_value='/camera/color/image_raw'
+29:         ),
+30:         DeclareLaunchArgument(
+31:             'color_info_topic', default_value='/camera/color/camera_info'
+32:         ),
+33:         DeclareLaunchArgument(
+34:             'depth_image_topic',
+35:             default_value='/camera/aligned_depth_to_color/image_raw',
+36:         ),
+37:         DeclareLaunchArgument(
+38:             'depth_info_topic',
+39:             default_value=LaunchConfiguration('color_info_topic'),
+40:         ),
+41:         Node(
+42:             package='cleany_perception', executable='inspection_node',
+43:             parameters=[
+44:                 str(share / 'config' / 'inspect_scene.yaml'),
+45:                 LaunchConfiguration('model_profile'),
+46:                 {
+47:                     'use_sim_time': ParameterValue(
+48:                         LaunchConfiguration('use_sim_time'), value_type=bool),
+49:                     'model_directory': LaunchConfiguration('model_directory'),
+50:                     'yoloe_device': LaunchConfiguration('device'),
+51:                     'enable_wrist_observation': ParameterValue(
+52:                         LaunchConfiguration('enable_wrist_observation'), value_type=bool),
+53:                     **{name: LaunchConfiguration(name) for name in (
+54:                         'color_image_topic', 'color_info_topic',
+55:                         'depth_image_topic', 'depth_info_topic',
+56:                     )},
+57:                 },
+58:             ],
+59:             output='screen',
+60:         ),
+61:     ])

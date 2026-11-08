@@ -1,0 +1,96 @@
+ros2_ws/src/cleany_robot_interface/launch/real_control.launch.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 2afb44725b1cc86ff0924fdcbc4d0e3b635aa116b94ca4a871e966164644e40f
+
+1: """Feetech hardware and standard controllers; READ-only unless explicitly enabled."""
+2: from pathlib import Path
+3: import time
+4: import xml.etree.ElementTree as ET
+5: 
+6: from ament_index_python.packages import get_package_share_directory
+7: from launch import LaunchDescription
+8: from launch.actions import DeclareLaunchArgument, EmitEvent, IncludeLaunchDescription, OpaqueFunction, RegisterEventHandler
+9: from launch.event_handlers import OnProcessExit
+10: from launch.events import Shutdown
+11: from launch.launch_description_sources import PythonLaunchDescriptionSource
+12: from launch.substitutions import LaunchConfiguration
+13: from launch_ros.actions import Node
+14: 
+15: from cleany_robot_interface.control_profile import (
+16:     prepare_control_profile,
+17:     resolve_moveit_trajectory_execution,
+18: )
+19: 
+20: 
+21: def setup(context):
+22:     value = lambda key: LaunchConfiguration(key).perform(context)
+23:     read_only = value('read_only') == 'true'
+24:     allow_trajectory_execution = resolve_moveit_trajectory_execution(
+25:         read_only, value('allow_trajectory_execution')
+26:     )
+27:     output = Path(value('output_root')).expanduser() / str(time.time_ns())
+28:     profile = prepare_control_profile(Path(value('profile_file')).resolve(),
+29:                                       Path(value('repository_root')).resolve(), output,
+30:                                       Path(value('control_file')).resolve(), read_only)
+31:     command_count = len(ET.parse(profile.model).findall('ros2_control/joint/command_interface'))
+32:     if command_count != 12 and value('with_moveit') == 'true':
+33:         raise ValueError('A partial commissioning profile requires with_moveit:=false')
+34:     print(f'REAL_CONTROL_RUN_DIR={output}', flush=True)
+35:     model = {'robot_description': profile.model.read_text(), 'use_sim_time': False}
+36:     manager = Node(package='controller_manager', executable='ros2_control_node',
+37:                    parameters=[model, str(profile.controllers)], output='screen')
+38:     state = Node(package='robot_state_publisher', executable='robot_state_publisher',
+39:                  name='real_robot_state_publisher', parameters=[model], output='screen')
+40:     broadcaster = Node(package='controller_manager', executable='spawner',
+41:                        arguments=['joint_state_broadcaster', '--controller-manager-timeout', '30'],
+42:                        output='screen')
+43:     controllers = Node(package='controller_manager', executable='spawner',
+44:                        arguments=[*profile.controller_names, '--controller-manager-timeout', '30',
+45:                                   *(['--inactive'] if read_only else ['--activate-as-group'])], output='screen')
+46: 
+47:     def spawned(event, _context):
+48:         if event.returncode:
+49:             return [EmitEvent(event=Shutdown(reason='Controller spawner failed'))]
+50:         return []
+51: 
+52:     guard = Node(package='cleany_robot_interface', executable='control_state_guard', output='screen',
+53:                  parameters=[{'controller_names': list(profile.controller_names)}])
+54:     actions = [state, manager, guard, broadcaster, controllers]
+55:     if value('with_moveit') == 'true':
+56:         moveit = Path(get_package_share_directory('cleany_moveit_config')) / 'launch/physical_move_group.launch.py'
+57:         actions.append(IncludeLaunchDescription(PythonLaunchDescriptionSource(str(moveit)),
+58:             launch_arguments={'robot_description_file': str(profile.model),
+59:                               'controllers_file': str(profile.moveit_controllers),
+60:                               'joint_limits_file': str(profile.joint_limits),
+61:                               'use_rviz': value('use_rviz'),
+62:                               'include_head_camera': 'true', 'use_sim_time': 'false',
+63:                               'enable_depth_octomap': value('enable_depth_octomap'),
+64:                               'allow_trajectory_execution': str(allow_trajectory_execution).lower()}.items()))
+65:     guards = [RegisterEventHandler(OnProcessExit(target_action=node,
+66:               on_exit=[EmitEvent(event=Shutdown(reason='Robot state/control process exited'))]))
+67:               for node in (manager, state, guard)]
+68:     guards += [RegisterEventHandler(OnProcessExit(target_action=node, on_exit=spawned))
+69:                for node in (broadcaster, controllers)]
+70:     return guards + actions
+71: 
+72: 
+73: def generate_launch_description():
+74:     return LaunchDescription([
+75:         *(DeclareLaunchArgument(key) for key in ('repository_root', 'profile_file', 'control_file')),
+76:         DeclareLaunchArgument('read_only', default_value='true', choices=['true', 'false']),
+77:         DeclareLaunchArgument(
+78:             'allow_trajectory_execution',
+79:             default_value='auto',
+80:             choices=['auto', 'true', 'false'],
+81:             description=(
+82:                 'MoveIt execution permission. Use false with read_only=false when a guarded '
+83:                 'external executor owns FollowJointTrajectory.'
+84:             ),
+85:         ),
+86:         DeclareLaunchArgument('with_moveit', default_value='true', choices=['true', 'false']),
+87:         DeclareLaunchArgument('use_rviz', default_value='false', choices=['true', 'false']),
+88:         DeclareLaunchArgument('enable_depth_octomap', default_value='false', choices=['true', 'false']),
+89:         DeclareLaunchArgument('output_root', default_value='~/.local/share/cleany/real_control'),
+90:         OpaqueFunction(function=setup),
+91:     ])

@@ -1,0 +1,25 @@
+ros2_ws/src/cleany_moveit_config/cleany_moveit_config/apply_collision_scene.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: e9a5fdda3ea911a89d854e124c75ed15ccdbdaf2d0d8d621c6ddc588622d6d51
+
+37:         apply() waits within service_wait_timeout_sec and checks the response.
+38:     """
+39:     def __init__(self) -> None:
+40:         super().__init__('collision_scene_applier')
+41:         self.declare_parameter('scene_config', _default_config_path())
+42:         self.declare_parameter('service_wait_timeout_sec', 60.0)
+43: 
+44:     def apply(self) -> bool:
+45:         config_path = Path(
+46:             self.get_parameter('scene_config').get_parameter_value().string_value
+47:         )
+55:         except CollisionSceneError as error:
+56:             self.get_logger().error(str(error))
+57:             return False
+58:         client = self.create_client(ApplyPlanningScene, spec.apply_service)
+59:         if not client.wait_for_service(timeout_sec=timeout):
+60:             self.get_logger().error(
+61:                 f'timed out waiting for {spec.apply_service}'
+62:             )
+63:             return False

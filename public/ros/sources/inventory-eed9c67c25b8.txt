@@ -1,0 +1,14 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/collision_geometry_cache.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: e7d689e2bd394d5039b5a42250cfd7f9726b88d517eae90306f3e956644cc8d2
+
+33:             return
+34:         if record and getattr(node, '_artifact_directory', None) is not None:
+35:             node._record_pipeline_message('collision_geometry', message)
+36:     return node.create_subscription(ObservedObjectGeometry,
+37:         str(node.get_parameter('collision_geometry_topic').value), receive,
+38:         QoSProfile(depth=16, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+39:         callback_group=callback_group)
+40: 
+41: 

@@ -1,0 +1,20 @@
+ros2_ws/src/cleany_perception/cleany_perception/scene_cloud_receipt_node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 6bde724077e0d2862cc0642b458103918bd3a21acdbfbc0fcb1099b147661891
+
+39:         not that MoveIt has committed the cloud to its planning scene.
+40:     """
+41:     def __init__(self) -> None:
+42:         super().__init__('scene_cloud_receipt')
+43:         self.declare_parameter('filtered_cloud_topic', '/perception/scene_cloud_filtered')
+44:         self.declare_parameter('receipt_topic', '/perception/scene_cloud_receipt')
+45:         self._publisher = self.create_publisher(
+46:             Header, str(self.get_parameter('receipt_topic').value),
+47:             QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
+48:         self.create_subscription(
+49:             PointCloud2, str(self.get_parameter('filtered_cloud_topic').value),
+50:             self._on_cloud, QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
+51: 
+52:     def _on_cloud(self, cloud: PointCloud2) -> None:
+53:         receipt = receipt_for_cloud(cloud)

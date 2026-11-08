@@ -1,0 +1,17 @@
+ros2_ws/src/cleany_dev_monitor/cleany_dev_monitor/operator_ros.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: ec713ebd51cbcd5bb86316bc5cd3bdb780108ca462582ab8b3ed4037c5eea45d
+
+18:     def __init__(self):
+19:         # The monitor and detached command workers coexist in the same DDS graph.
+20:         self.node = Node(f'cleany_dev_monitor_operator_{os.getpid()}_{uuid4().hex[:8]}')
+21:         self.state_client = self.node.create_client(Trigger, '/manipulation/control_state')
+22:         self.cancel_client = self.node.create_client(CancelManipulation, '/manipulation/cancel')
+23:         self.recover_client = self.node.create_client(ConfirmManipulationRecovery, '/manipulation/confirm_recovery')
+24:         self.inspection = ActionClient(self.node, InspectScene, '/perception/inspect_scene')
+25:         self.executor = MultiThreadedExecutor(num_threads=2)
+26:         self.executor.add_node(self.node)
+27:         self.thread = threading.Thread(target=self.executor.spin, daemon=True)
+28:         self.thread.start()
+29: 

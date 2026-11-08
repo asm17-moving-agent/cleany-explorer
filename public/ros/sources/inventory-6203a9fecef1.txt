@@ -1,0 +1,27 @@
+ros2_ws/src/cleany_navigation/cleany_navigation/bt_trace_node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: ccb7480b5b6ac7f3918ca492affeca7b2743e911d20e05f05cc16972eea01e6c
+
+34:         manifest hashes; the trace does not control the navigator.
+35:     """
+36:     def __init__(self):
+37:         super().__init__('nav2_bt_trace')
+38:         for key, value in {'manifest_file': '', 'xml_file': '', 'output_topic': 'navigation/bt_trace',
+39:                            'log_topic': 'behavior_tree_log', 'navigator': 'bt_navigator',
+40:                            'action': 'navigate_to_pose'}.items():
+41:             self.declare_parameter(key, value)
+42:         p = {key: self.get_parameter(key).value for key in
+48:         self.lifecycle_known = False
+49:         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+50:                          durability=DurabilityPolicy.TRANSIENT_LOCAL)
+51:         self.publisher = self.create_publisher(String, p['output_topic'], qos)
+52:         self.create_subscription(BehaviorTreeLog, p['log_topic'], self.logs, 10)
+53:         self.create_subscription(TransitionEvent, p['navigator']+'/transition_event',
+54:                                  self.lifecycle, 10)
+55:         self.create_subscription(GoalStatusArray, p['action']+'/_action/status', self.goals, qos)
+56:         self.create_timer(.25, self.publish, clock=Clock(clock_type=ClockType.STEADY_TIME))
+57:         self.publish()
+58: 
+59:     def lifecycle(self, msg):
+60:         self.lifecycle_known = True

@@ -1,0 +1,48 @@
+ros2_ws/src/cleany_robot_interface/cleany_robot_interface/control_profile.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 5fe4d7ac4b1732c61f27429165473c9544147b32f747b8ba240cafc300f93270
+
+147:     for index, name in enumerate(('head_pan_joint', 'head_tilt_joint')):
+148:         if root.find(f"joint[@name='{name}']") is None:
+149:             raise ValueError('Missing moving head joint')
+150:         element = ET.SubElement(control, 'joint', name=name)
+151:         ET.SubElement(element, 'state_interface', name='position')
+152:         for key, value in {'motor_id': 13+index, 'model': 777,
+153:                            'zero_tick': head_mapping['reference_ticks'][index],
+154:                            'direction': head_mapping['encoder_directions'][index], 'offset_rad': 0}.items():
+155:             param(element, key, value)
+156: 
+157:     manager = {'update_rate': rate,
+158:                'joint_state_broadcaster': {'type': 'joint_state_broadcaster/JointStateBroadcaster'}}
+159:     controllers = {'controller_manager': {'ros__parameters': manager},
+160:                    'joint_state_broadcaster': {'ros__parameters': {'use_local_topics': True}}}
+161:     moveit = {'moveit_controller_manager': 'moveit_simple_controller_manager/MoveItSimpleControllerManager',
+162:               'moveit_simple_controller_manager': {'controller_names': []}}
+163:     for side in ('left', 'right'):
+164:         for group, suffixes in (('arm', ('shoulder_yaw', 'shoulder_pitch', 'elbow_pitch',
+165:                                         'wrist_pitch', 'wrist_roll')), ('gripper', ('gripper',))):
+166:             name = f'{side}_{group}_controller'
+167:             joints = [f'{side}_{suffix}_joint' for suffix in suffixes]
+168:             joints = [j for j in joints if j in selected]
+169:             if not joints:
+170:                 continue
+171:             manager[name] = {'type': 'joint_trajectory_controller/JointTrajectoryController'}
+172:             controllers[name] = {'ros__parameters': {
+173:                 'joints': joints, 'command_interfaces': ['position'], 'state_interfaces': ['position'],
+174:                 'state_publish_rate': float(rate), 'action_monitor_rate': 20.0,
+175:                 'open_loop_control': False, 'allow_partial_joints_goal': False,
+176:                 'allow_nonzero_velocity_at_trajectory_end': False,
+177:                 'constraints': {'goal_time': settings['goal_time'], 'stopped_velocity_tolerance': 0.0,
+178:                                 **{j: {'trajectory': settings['trajectory_tolerance'],
+179:                                        'goal': settings['goal_tolerance']} for j in joints}}}}
+180:             moveit['moveit_simple_controller_manager']['controller_names'].append(name)
+181:             moveit['moveit_simple_controller_manager'][name] = {
+182:                 'type': 'FollowJointTrajectory', 'action_ns': 'follow_joint_trajectory',
+183:                 'default': True, 'joints': joints}
+184:     return ET.tostring(root, encoding='unicode'), controllers, moveit
+185: 
+186: 
+
+217:         'head_commands': False, 'controller_names': moveit['moveit_simple_controller_manager']['controller_names'],
+218:     }, indent=2) + '\n')

@@ -1,0 +1,15 @@
+ros2_ws/src/cleany_perception/cleany_perception/vlm_warmup.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 383e3089e17d0677da112863c34fe5887852a155d343beab5cc8cdaba38bbb3d
+
+9: class VlmWarmupClient:
+10:     def __init__(self, node, service: str, callback_group=None, *, prepare_service: str = '') -> None:
+11:         self._node = node
+12:         self._client = node.create_client(SetBool, service, callback_group=callback_group)
+13:         self._prepare_client = (node.create_client(SetBool, prepare_service, callback_group=callback_group)
+14:                                 if prepare_service else None)
+15:         self._prepared = False
+16:         self._failed_start = False
+17:         self._lock = threading.RLock()
+18:         self._pending = False

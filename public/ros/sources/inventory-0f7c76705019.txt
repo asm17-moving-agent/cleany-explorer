@@ -1,0 +1,431 @@
+ros2_ws/src/cleany_mujoco_sim/cleany_mujoco_sim/sim_node.py
+Review: 2026-11-02
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: faa6bf2aa8b832cea94cf0275d4c8129e4e88765fa9985d23501e902dee27fa0
+
+1: from __future__ import annotations
+2: 
+3: import time
+4: from collections.abc import Iterable
+5: from pathlib import Path
+6: 
+7: import mujoco
+8: import rclpy
+9: from geometry_msgs.msg import Twist
+10: from nav_msgs.msg import Odometry
+11: from rclpy.node import Node
+12: from rclpy.parameter import Parameter
+13: from sensor_msgs.msg import JointState, LaserScan
+14: from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
+15: 
+16: from cleany_mujoco_sim.base_command import (
+17:     ChassisCommand,
+18:     CommandLimits,
+19:     are_finite_values,
+20:     bounded_command,
+21:     stopped_command,
+22: )
+23: from cleany_mujoco_sim.extensions import (
+24:     MujocoSimulationContext,
+25:     StepObserver,
+26: )
+27: from cleany_mujoco_sim.mecanum_kinematics import (
+28:     MecanumGeometry,
+29:     WheelSpeedLimit,
+30:     limited_wheel_speeds,
+31:     stopped_wheel_speeds,
+32:     wheel_speeds_from_chassis,
+33: )
+34: from cleany_mujoco_sim.mujoco_drive import MujocoMecanumDrive
+35: from cleany_mujoco_sim.scene_loader import default_scene_path, load_model
+36: from cleany_mujoco_sim.state import (
+37:     apply_joint_cmd,
+38:     initialize_joint_positions,
+39:     joint_state_msg,
+40:     laser_scan_msg,
+41:     odometry_msg,
+42:     scan_sample_count,
+43:     static_site_transform_msg,
+44:     steps_per_tick,
+45:     transform_msg,
+46: )
+47: from cleany_mujoco_sim.wheel_speed_controller import (
+48:     PidGains,
+49:     VelocityControllerConfig,
+50: )
+51: 
+52: 
+53: class MujocoSimNode(Node):
+54:     """Step the standalone MuJoCo model and expose base feedback.
+55: 
+56:     Subscriptions:
+57:         ~/joint_cmd (sensor_msgs/msg/JointState): Named joint targets.
+58:         cmd_vel (geometry_msgs/msg/Twist): Bounded planar base velocity.
+59: 
+60:     Publishers:
+61:         joint_states (sensor_msgs/msg/JointState): Simulated joint state.
+62:         odom (nav_msgs/msg/Odometry): Base pose and velocity.
+63:         scan (sensor_msgs/msg/LaserScan): Ray-cast range data when scan_enabled.
+64: 
+65:     TF:
+66:         Optionally broadcasts odom -> base_link and the static LiDAR mount.
+67:         odom, base_link and laser are configurable frame defaults.
+68: 
+69:     Notes:
+70:         Requires a valid scene_path. Wheel dynamics, command limits and timeout
+71:         are simulation settings; this node is separate from ros2_control's backend.
+72:     """
+73:     def __init__(
+74:         self,
+75:         *,
+76:         step_observers: Iterable[StepObserver] | None = None,
+77:         **kwargs,
+78:     ) -> None:
+79:         super().__init__("mujoco_sim", **kwargs)
+80: 
+81:         self.declare_parameter('scene_path', '')
+82:         self.declare_parameter('publish_rate_hz', 60.0)
+83:         self.declare_parameter('headless', True)
+84:         self.declare_parameter('viewer_rate_hz', 20.0)
+85:         self.declare_parameter('viewer_shadows', False)
+86:         self.declare_parameter('base_body_name', 'chassis')
+87:         self.declare_parameter('lidar_site_name', 'lidar_site')
+88:         self.declare_parameter('odom_frame_id', 'odom')
+89:         self.declare_parameter('base_frame_id', 'base_link')
+90:         self.declare_parameter('laser_frame_id', 'laser')
+91:         self.declare_parameter('publish_odom_tf', True)
+92:         self.declare_parameter('scan_enabled', True)
+93:         self.declare_parameter('scan_rate_hz', 5.5)
+94:         self.declare_parameter('scan_sample_rate_hz', 8000.0)
+95:         self.declare_parameter('scan_samples', 0)
+96:         self.declare_parameter('scan_range_min', 0.15)
+97:         self.declare_parameter('scan_range_max', 12.0)
+98:         self.declare_parameter('initial_joint_names', Parameter.Type.STRING_ARRAY)
+99:         self.declare_parameter('initial_joint_positions', Parameter.Type.DOUBLE_ARRAY)
+100:         self.declare_parameter('max_linear_x', 0.3)
+101:         self.declare_parameter('max_linear_y', 0.3)
+102:         self.declare_parameter('max_angular_z', 0.8)
+103:         self.declare_parameter('cmd_vel_timeout_sec', 0.5)
+104:         self.declare_parameter('timeout_check_rate_hz', 20.0)
+105:         self.declare_parameter('wheel_radius', 0.0635)
+106:         self.declare_parameter('wheelbase_length', 0.35)
+107:         self.declare_parameter('track_width', 0.6038)
+108:         self.declare_parameter('max_wheel_speed', 10.815)
+109:         self.declare_parameter('base_drive_enabled', True)
+110:         self.declare_parameter('wheel_kp', 1.0)
+111:         self.declare_parameter('wheel_ki', 5.0)
+112:         self.declare_parameter('wheel_kd', 0.0)
+113:         self.declare_parameter('motor_voltage_limit', 10.8)
+114:         self.declare_parameter('motor_no_load_speed', 10.815)
+115: 
+116:         scene_path_value = self.get_parameter('scene_path').get_parameter_value().string_value
+117:         scene_path = Path(scene_path_value) if scene_path_value else default_scene_path()
+118:         publish_rate_hz = self.get_parameter('publish_rate_hz').get_parameter_value().double_value
+119:         self._headless = self.get_parameter('headless').get_parameter_value().bool_value
+120:         self._viewer_rate_hz = float(self.get_parameter('viewer_rate_hz').value)
+121:         self._base_body_name = self.get_parameter('base_body_name').get_parameter_value().string_value
+122:         self._lidar_site_name = self.get_parameter('lidar_site_name').get_parameter_value().string_value
+123:         self._odom_frame_id = self.get_parameter('odom_frame_id').get_parameter_value().string_value
+124:         self._base_frame_id = self.get_parameter('base_frame_id').get_parameter_value().string_value
+125:         self._laser_frame_id = self.get_parameter('laser_frame_id').get_parameter_value().string_value
+126:         self._publish_odom_tf = self.get_parameter('publish_odom_tf').get_parameter_value().bool_value
+127:         self._scan_enabled = self.get_parameter('scan_enabled').get_parameter_value().bool_value
+128:         self._scan_rate_hz = self.get_parameter('scan_rate_hz').get_parameter_value().double_value
+129:         scan_sample_rate_hz = (
+130:             self.get_parameter('scan_sample_rate_hz').get_parameter_value().double_value
+131:         )
+132:         requested_scan_samples = (
+133:             self.get_parameter('scan_samples').get_parameter_value().integer_value
+134:         )
+135:         self._scan_range_min = self.get_parameter('scan_range_min').get_parameter_value().double_value
+136:         self._scan_range_max = self.get_parameter('scan_range_max').get_parameter_value().double_value
+137:         initial_joint_names = list(
+138:             self.get_parameter_or(
+139:                 'initial_joint_names',
+140:                 Parameter('initial_joint_names', Parameter.Type.STRING_ARRAY, []),
+141:             ).get_parameter_value().string_array_value
+142:         )
+143:         initial_joint_positions = list(
+144:             self.get_parameter_or(
+145:                 'initial_joint_positions',
+146:                 Parameter('initial_joint_positions', Parameter.Type.DOUBLE_ARRAY, []),
+147:             ).get_parameter_value().double_array_value
+148:         )
+149:         self._command_limits = CommandLimits(
+150:             max_linear_x=float(self.get_parameter('max_linear_x').value),
+151:             max_linear_y=float(self.get_parameter('max_linear_y').value),
+152:             max_angular_z=float(self.get_parameter('max_angular_z').value),
+153:         )
+154:         self._cmd_vel_timeout_sec = float(
+155:             self.get_parameter('cmd_vel_timeout_sec').value
+156:         )
+157:         timeout_check_rate_hz = float(
+158:             self.get_parameter('timeout_check_rate_hz').value
+159:         )
+160:         self._mecanum_geometry = MecanumGeometry(
+161:             wheel_radius=float(self.get_parameter('wheel_radius').value),
+162:             wheelbase_length=float(self.get_parameter('wheelbase_length').value),
+163:             track_width=float(self.get_parameter('track_width').value),
+164:         )
+165:         self._wheel_speed_limit = WheelSpeedLimit(
+166:             max_abs=float(self.get_parameter('max_wheel_speed').value)
+167:         )
+168:         self._base_drive_enabled = bool(
+169:             self.get_parameter('base_drive_enabled').value
+170:         )
+171:         self._velocity_controller_config = VelocityControllerConfig(
+172:             gains=PidGains(
+173:                 kp=float(self.get_parameter('wheel_kp').value),
+174:                 ki=float(self.get_parameter('wheel_ki').value),
+175:                 kd=float(self.get_parameter('wheel_kd').value),
+176:             ),
+177:             voltage_limit=float(self.get_parameter('motor_voltage_limit').value),
+178:             no_load_speed=float(self.get_parameter('motor_no_load_speed').value),
+179:         )
+180: 
+181:         if publish_rate_hz <= 0:
+182:             raise ValueError('publish_rate_hz must be positive')
+183:         if (not are_finite_values((self._viewer_rate_hz,))
+184:                 or not 1.0 <= self._viewer_rate_hz <= 60.0):
+185:             raise ValueError('viewer_rate_hz must be finite and in [1, 60]')
+186:         if self._scan_enabled and self._scan_rate_hz <= 0:
+187:             raise ValueError('scan_rate_hz must be positive')
+188:         if self._scan_enabled and self._scan_range_min >= self._scan_range_max:
+189:             raise ValueError('scan_range_min must be less than scan_range_max')
+190:         timeout_values = (self._cmd_vel_timeout_sec, timeout_check_rate_hz)
+191:         if not are_finite_values(timeout_values) or any(
+192:             value <= 0.0 for value in timeout_values
+193:         ):
+194:             raise ValueError('command timeout values must be positive and finite')
+195: 
+196:         if not scene_path.exists():
+197:             raise FileNotFoundError(f"MuJoCo scene XML not found: {scene_path}")
+198: 
+199:         self._model, self._data = load_model(scene_path)
+200:         self._base_body_id = mujoco.mj_name2id(
+201:             self._model, mujoco.mjtObj.mjOBJ_BODY, self._base_body_name
+202:         )
+203:         if self._base_body_id < 0:
+204:             raise ValueError(f'MuJoCo body not found: {self._base_body_name}')
+205:         self._lidar_site_id = mujoco.mj_name2id(
+206:             self._model, mujoco.mjtObj.mjOBJ_SITE, self._lidar_site_name
+207:         )
+208:         if self._scan_enabled and self._lidar_site_id < 0:
+209:             raise ValueError(f'MuJoCo site not found: {self._lidar_site_name}')
+210:         self._mujoco_drive = (
+211:             MujocoMecanumDrive(
+212:                 self._model,
+213:                 self._velocity_controller_config,
+214:             )
+215:             if self._base_drive_enabled
+216:             else None
+217:         )
+218: 
+219:         initialize_joint_positions(
+220:             self._model,
+221:             self._data,
+222:             initial_joint_names,
+223:             initial_joint_positions,
+224:         )
+225:         mujoco.mj_forward(self._model, self._data)
+226:         self._simulation_context = MujocoSimulationContext(
+227:             model=self._model,
+228:             data=self._data,
+229:         )
+230:         self._step_observers = list(step_observers or ())
+231:         self._steps_per_tick = steps_per_tick(self._model.opt.timestep, publish_rate_hz)
+232:         self._scan_samples = 0
+233:         self._sim_time_at_last_scan = 0.0
+234:         self._current_chassis_command = stopped_command()
+235:         self._target_wheel_speeds = stopped_wheel_speeds()
+236:         self._last_cmd_vel_time: float | None = None
+237:         if self._scan_enabled:
+238:             self._scan_samples = scan_sample_count(
+239:                 requested_scan_samples, scan_sample_rate_hz, self._scan_rate_hz
+240:             )
+241:             self._sim_time_at_last_scan = -1.0 / self._scan_rate_hz
+242: 
+243:         self._joint_state_pub = self.create_publisher(JointState, 'joint_states', 10)
+244:         self._odom_pub = self.create_publisher(Odometry, 'odom', 10)
+245:         self._scan_pub = self.create_publisher(LaserScan, 'scan', 10)
+246:         self._tf_broadcaster = TransformBroadcaster(self)
+247:         self._static_tf_broadcaster = StaticTransformBroadcaster(self)
+248:         self.create_subscription(JointState, '~/joint_cmd', self._on_joint_cmd, 10)
+249:         self.create_subscription(Twist, 'cmd_vel', self._on_cmd_vel, 10)
+250:         self.create_timer(1.0 / publish_rate_hz, self._on_timer)
+251:         self.create_timer(1.0 / timeout_check_rate_hz, self._on_cmd_vel_timeout)
+252:         if self._scan_enabled:
+253:             self._static_tf_broadcaster.sendTransform(
+254:                 static_site_transform_msg(
+255:                     self._model,
+256:                     self._data,
+257:                     self._base_body_id,
+258:                     self._lidar_site_id,
+259:                     self.get_clock().now(),
+260:                     self._base_frame_id,
+261:                     self._laser_frame_id,
+262:                 )
+263:             )
+264: 
+265:         self._viewer = None
+266:         self._next_viewer_sync = 0.0
+267:         if not self._headless:
+268:             import mujoco.viewer as mujoco_viewer
+269: 
+270:             self._viewer = mujoco_viewer.launch_passive(self._model, self._data)
+271:             self._viewer.user_scn.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = bool(
+272:                 self.get_parameter('viewer_shadows').value
+273:             )
+274: 
+275:     def destroy_node(self) -> None:
+276:         if self._viewer is not None:
+277:             self._viewer.close()
+278: 
+279:         super().destroy_node()
+280: 
+281:     def _on_joint_cmd(self, msg: JointState) -> None:
+282:         apply_joint_cmd(self._model, self._data, msg)
+283: 
+284:     @property
+285:     def simulation_context(self) -> MujocoSimulationContext:
+286:         return self._simulation_context
+287: 
+288:     def add_step_observer(self, observer: StepObserver) -> None:
+289:         self._step_observers.append(observer)
+290: 
+291:     def _on_cmd_vel(self, msg: Twist) -> None:
+292:         all_axes = (
+293:             msg.linear.x,
+294:             msg.linear.y,
+295:             msg.linear.z,
+296:             msg.angular.x,
+297:             msg.angular.y,
+298:             msg.angular.z,
+299:         )
+300:         if not are_finite_values(all_axes):
+301:             self.get_logger().warning(
+302:                 'Ignoring non-finite cmd_vel and stopping the base'
+303:             )
+304:             self._stop_chassis_command()
+305:             return
+306: 
+307:         unsupported_axes = (msg.linear.z, msg.angular.x, msg.angular.y)
+308:         if any(value != 0.0 for value in unsupported_axes):
+309:             self.get_logger().warning(
+310:                 'Ignoring unsupported cmd_vel axes; only linear.x, linear.y, '
+311:                 'and angular.z are used'
+312:             )
+313: 
+314:         try:
+315:             chassis_command = bounded_command(
+316:                 ChassisCommand(
+317:                     linear_x=msg.linear.x,
+318:                     linear_y=msg.linear.y,
+319:                     angular_z=msg.angular.z,
+320:                 ),
+321:                 self._command_limits,
+322:             )
+323:             target_wheel_speeds = limited_wheel_speeds(
+324:                 wheel_speeds_from_chassis(
+325:                     chassis_command,
+326:                     self._mecanum_geometry,
+327:                 ),
+328:                 self._wheel_speed_limit,
+329:             )
+330:         except ValueError:
+331:             self.get_logger().warning(
+332:                 'Ignoring invalid cmd_vel and stopping the base'
+333:             )
+334:             self._stop_chassis_command()
+335:             return
+336: 
+337:         self._current_chassis_command = chassis_command
+338:         self._target_wheel_speeds = target_wheel_speeds
+339:         self._last_cmd_vel_time = time.monotonic()
+340: 
+341:     def _on_cmd_vel_timeout(self) -> None:
+342:         if self._last_cmd_vel_time is None:
+343:             return
+344:         if time.monotonic() - self._last_cmd_vel_time <= self._cmd_vel_timeout_sec:
+345:             return
+346: 
+347:         self.get_logger().warning('cmd_vel timed out; stopping the base')
+348:         self._stop_chassis_command()
+349: 
+350:     def _stop_chassis_command(self) -> None:
+351:         self._current_chassis_command = stopped_command()
+352:         self._target_wheel_speeds = stopped_wheel_speeds()
+353:         self._last_cmd_vel_time = None
+354:         if self._mujoco_drive is not None:
+355:             self._mujoco_drive.reset()
+356: 
+357:     def _on_timer(self) -> None:
+358:         for _ in range(self._steps_per_tick):
+359:             if self._mujoco_drive is not None:
+360:                 self._mujoco_drive.apply_control(
+361:                     self._data,
+362:                     self._target_wheel_speeds,
+363:                     self._model.opt.timestep,
+364:                 )
+365:             mujoco.mj_step(self._model, self._data)
+366:         stamp = self.get_clock().now()
+367:         for observer in self._step_observers:
+368:             observer.after_step(self._simulation_context, stamp)
+369:         self._joint_state_pub.publish(joint_state_msg(self._model, self._data, stamp))
+370:         self._odom_pub.publish(
+371:             odometry_msg(
+372:                 self._model,
+373:                 self._data,
+374:                 self._base_body_id,
+375:                 stamp,
+376:                 self._odom_frame_id,
+377:                 self._base_frame_id,
+378:             )
+379:         )
+380:         if self._publish_odom_tf:
+381:             self._tf_broadcaster.sendTransform(
+382:                 transform_msg(
+383:                     self._data,
+384:                     self._base_body_id,
+385:                     stamp,
+386:                     self._odom_frame_id,
+387:                     self._base_frame_id,
+388:                 )
+389:             )
+390:         should_publish_scan = (
+391:             self._scan_enabled
+392:             and self._data.time - self._sim_time_at_last_scan >= 1.0 / self._scan_rate_hz
+393:         )
+394:         if should_publish_scan:
+395:             self._scan_pub.publish(
+396:                 laser_scan_msg(
+397:                     self._model,
+398:                     self._data,
+399:                     self._lidar_site_id,
+400:                     self._base_body_id,
+401:                     stamp,
+402:                     self._laser_frame_id,
+403:                     self._scan_rate_hz,
+404:                     self._scan_samples,
+405:                     self._scan_range_min,
+406:                     self._scan_range_max,
+407:                 )
+408:             )
+409:             self._sim_time_at_last_scan = self._data.time
+410:         if self._viewer is not None and time.monotonic() >= self._next_viewer_sync:
+411:             self._viewer.sync()
+412:             self._next_viewer_sync = time.monotonic() + 1.0 / self._viewer_rate_hz
+413: 
+414: 
+415: def main(args: list[str] | None = None) -> None:
+416:     rclpy.init(args=args)
+417:     node = MujocoSimNode()
+418:     try:
+419:         rclpy.spin(node)
+420:     finally:
+421:         node.destroy_node()
+422:         rclpy.shutdown()
+423: 
+424: 
+425: if __name__ == "__main__":
+426:     main()

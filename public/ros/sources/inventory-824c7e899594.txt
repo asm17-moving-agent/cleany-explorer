@@ -1,0 +1,27 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/manipulation_monitor_node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: be9e9d62e8ab0fbfe9860110dabf2143a4c3020e3e4fb5b6e237ff86bb3599e6
+
+16: 
+17: class ManipulationMonitorNode(Node):
+18:     def __init__(self, **kwargs) -> None:
+19:         super().__init__('manipulation_monitor', **kwargs)
+20:         preview = Path(get_package_share_directory('cleany_skill_executor')) / 'docs/groot2_table_cleanup.xml'
+21:         self.declare_parameter('tree_xml', str(preview))
+22:         self.declare_parameter('monitor_port', 1666)
+23:         self.declare_parameter('event_topic', 'manipulation/execution_events')
+24:         self.projection = MonitorProjection(self.get_parameter('tree_xml').value)
+25:         port = self.get_parameter('monitor_port').value
+26:         if not 1 <= port <= 65535:
+27:             raise ValueError('monitor_port must be between 1 and 65535')
+28:         self.context_zmq = zmq.Context()
+34:             self.socket.close()
+35:             self.context_zmq.term()
+36:             raise
+37:         self.subscription = self.create_subscription(
+38:             ManipulationExecutionRecord, self.get_parameter('event_topic').value,
+39:             self._event, QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE,
+40:                                    durability=DurabilityPolicy.TRANSIENT_LOCAL))
+41:         self.timer = self.create_timer(0.02, self._poll)
+42:         self.get_logger().info(f'Local mock monitor ready: 127.0.0.1:{port}')

@@ -1,0 +1,59 @@
+ros2_ws/src/cleany_skill_executor/cleany_skill_executor/physical_grasp_selection_node.py
+Review: 2026-10-31
+HEAD: 707538de9d28291c679fcfd954f5587368d5a460
+Working-tree SHA-256: 5857e2ffbafcfbc8b4a27f99aefc5da0b6c2e6989f2d71295f6356f26a37954b
+
+75: 
+76: class GraspSelectionNode(Node):
+77:     def __init__(self, **kwargs) -> None:
+78:         super().__init__('grasp_selection_server', **kwargs)
+79:         defaults = {
+80:             'action_name': 'grasp/select_reachable',
+81:             'motion_backend': 'moveit',
+82:             'curobo_num_seeds': 32,
+83:             'curobo_ik_primary_seeds': 16,
+225:         self._adapter_lock = threading.RLock()
+226:         self._gpu_lease = GpuLease(str(self.get_parameter('gpu_lock_path').value))
+227:         callback_group = ReentrantCallbackGroup()
+228:         self.create_subscription(
+229:             JointState,
+230:             str(self.get_parameter('joint_state_topic').value),
+231:             self._on_joint_state,
+232:             20,
+233:             callback_group=callback_group,
+338:             raise ValueError('Grasp direction left preference requires planning_frame=base_link')
+339:         self._requires_description = (backend == 'curobo_ik_moveit'
+340:                                       or self._fixed_jaw_config is not None or prefer_direction)
+341:         self.create_subscription(String, '/robot_description', self._on_description,
+342:             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+343:             callback_group=callback_group)
+344:         self._geometry_cache = CollisionGeometryCache()
+345:         use_mesh = self.get_parameter('use_observed_collision_geometry').value
+346:         self._geometry_subscription = subscribe_collision_geometry(self, self._geometry_cache) if use_mesh else None
+410:                 ),
+411:             ),
+412:         )
+413:         self._server = ActionServer(
+414:             self,
+415:             SelectReachableGrasp,
+416:             str(self.get_parameter('action_name').value),
+417:             execute_callback=self._execute,
+418:             goal_callback=self._on_goal,
+424:         self._warmup_ready = not self._warmup_enabled
+425:         self._warmup_error = ''
+426:         self._warmup_description = ''
+427:         self._warmup_service = self.create_service(
+428:             Trigger, '/grasp/warmup_status', self._warmup_status, callback_group=callback_group)
+429:         self._warmup_timer = self.create_timer(1., self._try_warmup, callback_group=callback_group)
+430:         self._vlm_warmup_enabled = (backend == 'curobo_ik_moveit'
+431:             and self.get_parameter('curobo_ik_vlm_warmup_enabled').value)
+432:         self._vlm_warmup_lock = threading.Lock()
+435:         self._vlm_warmup_failed: set[str] = set()
+436:         self._vlm_warmup_preferred_arm = ''
+437:         self._vlm_warmup_description = ''
+438:         self._vlm_warmup_service = self.create_service(SetBool, '/grasp/vlm_warmup',
+439:             self._vlm_warmup_request, callback_group=callback_group)
+440:         self._vlm_warmup_timer = self.create_timer(.1, self._try_vlm_warmup,
+441:             callback_group=callback_group)
+442: 
+443:     def _on_description(self, message):
