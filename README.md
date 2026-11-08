@@ -2,6 +2,8 @@
 
 끌리니의 3D 모델, 부품 사양과 가격, ROS 연결을 살펴보는 웹앱입니다.
 
+[Cleany Explorer 열기](https://asm17-moving-agent.github.io/cleany-explorer/)
+
 ## 시작하기
 
 **필요 환경**은 Node.js 22.13 이상과 npm입니다. 저장소를 내려받은 뒤 아래 명령을 실행합니다.
@@ -71,6 +73,8 @@ npm run build
 ```
 
 자동 검사는 가격과 소계, 검색과 CSV, CAD 자산 무결성, ROS 연결과 환경 구분을 확인합니다. 빌드 결과는 `dist/`에 생성되며 `npm run preview`로 로컬에서 확인할 수 있습니다. 3D 코드와 모델은 3D 화면을 열 때 불러옵니다.
+
+GitHub Pages는 `main`에 변경사항이 반영되면 GitHub Actions에서 자동으로 테스트, 빌드와 배포합니다. 배포 빌드는 `/cleany-explorer/` 경로를 사용합니다.
 
 | 문서 | 내용 |
 | --- | --- |

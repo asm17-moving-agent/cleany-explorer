@@ -1,3 +1,4 @@
+import { publicPath } from './public-path';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
@@ -150,7 +151,7 @@ export class RobotViewer {
     this.invalidate();
   }
   async load(): Promise<void> {
-    const response = await fetch('/models/cleany.json');
+    const response = await fetch(publicPath('/models/cleany.json'));
     if (!response.ok) throw new Error('모델 정보를 불러오지 못했습니다.');
     const data: Model = await response.json();
     const date = data.snapshotDate.replaceAll('-', '.');
@@ -177,11 +178,11 @@ export class RobotViewer {
       let geometry: THREE.BufferGeometry;
       let texture: THREE.Texture | undefined;
       if (spec.type === 'mesh') {
-        if (!cache.has(spec.file!)) cache.set(spec.file!, loader.loadAsync(`/models/${spec.file}`));
+        if (!cache.has(spec.file!)) cache.set(spec.file!, loader.loadAsync(publicPath(`/models/${spec.file}`)));
         geometry = await cache.get(spec.file!)!;
         if (spec.region) geometry = selectMeshRegion(geometry, spec.region);
       } else if (spec.type === 'screen') {
-        texture = await new THREE.TextureLoader().loadAsync(`/models/${spec.texture}`);
+        texture = await new THREE.TextureLoader().loadAsync(publicPath(`/models/${spec.texture}`));
         texture.colorSpace = THREE.SRGBColorSpace;
         geometry = new THREE.BufferGeometry();
         geometry.setAttribute('position', new THREE.Float32BufferAttribute(spec.positions!, 3));

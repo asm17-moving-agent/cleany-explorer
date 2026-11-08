@@ -1,3 +1,4 @@
+import { publicPath } from './public-path';
 import './style.css';
 import { createIcons, Activity, ArrowUpRight, BatteryCharging, Box, Camera, ChevronRight, CircleDot, CircuitBoard, Cog, Cpu, Download, Expand, Info, Layers, ListFilter, Minus, Monitor, Plus, Radar, Rotate3d, RotateCcw, ScanEye, Search, SearchX, Tags, Wallet, Workflow, X } from 'lucide';
 const icons = { Activity, ArrowUpRight, BatteryCharging, Box, Camera, ChevronRight, CircleDot, CircuitBoard, Cog, Cpu, Download, Expand, Info, Layers, ListFilter, Minus, Monitor, Plus, Radar, Rotate3d, RotateCcw, ScanEye, Search, SearchX, Tags, Wallet, Workflow, X };
@@ -31,7 +32,7 @@ const app = document.querySelector<HTMLDivElement>('#app')!;
 app.innerHTML = `
 <a class="skip-link" href="#workspace">주요 콘텐츠로 이동</a>
 <header class="site-header">
-  <a class="brand" href="/" aria-label="Cleany 홈"><img src="/favicon.svg" alt=""/><span>cleany<span class="brand-dot">.</span></span><small>EXPLORER</small></a>
+  <a class="brand" href="${publicPath('/')}" aria-label="Cleany 홈"><img src="${publicPath('/favicon.svg')}" alt=""/><span>cleany<span class="brand-dot">.</span></span><small>EXPLORER</small></a>
   <nav class="main-nav" aria-label="주 탐색">
     <button class="nav-button active" data-view="explore" aria-pressed="true">${icon('box')}<span>3D 탐색</span></button>
     <button class="nav-button" data-view="connections" aria-pressed="false">${icon('workflow')}<span>ROS 연결도</span></button>
@@ -64,7 +65,7 @@ app.innerHTML = `
   <section id="table-view" class="table-view" hidden></section>
   <section id="connection-map" class="connection-map" aria-label="부품과 ROS 연결도" hidden></section>
 </main>
-<dialog id="info-dialog" aria-labelledby="info-title"><div class="dialog-head"><h2 id="info-title">모델과 데이터 기준</h2><button id="close-dialog" class="icon-button" aria-label="안내 닫기">${icon('x')}</button></div><div class="dialog-body"><p>CAD는 <span data-cad-source-date>2026.11.04</span>, ROS는 ${rosEvidence.reviewedAt.replaceAll('-', '.')} 소스 스냅샷입니다. 실시간 로봇 상태를 수신하거나 로봇을 제어하지 않습니다.</p><h3>모델</h3><p>FreeCAD 조립 자세에 양팔, PincOpen 집게, 센서, 바퀴, 외장과 전면 화면을 표시합니다. 케이스 벗기기로 내부 골조와 IMU를 볼 수 있습니다. 배터리, 컴퓨터와 드라이버는 위치 개념으로 표시합니다.</p><h3>사양과 가격</h3><p>확정 수준은 각 부품의 근거 상태에 표시합니다. 판매처 참고가와 견적은 실제 결제 금액과 다릅니다. 미등록 금액은 0원으로 계산하지 않으며 참고 소계는 완성 로봇 가격이 아닙니다.</p><a class="source-link" href="/models/cleany.json" target="_blank" rel="noreferrer">모델 데이터 ↗</a></div></dialog>
+<dialog id="info-dialog" aria-labelledby="info-title"><div class="dialog-head"><h2 id="info-title">모델과 데이터 기준</h2><button id="close-dialog" class="icon-button" aria-label="안내 닫기">${icon('x')}</button></div><div class="dialog-body"><p>CAD는 <span data-cad-source-date>2026.11.04</span>, ROS는 ${rosEvidence.reviewedAt.replaceAll('-', '.')} 소스 스냅샷입니다. 실시간 로봇 상태를 수신하거나 로봇을 제어하지 않습니다.</p><h3>모델</h3><p>FreeCAD 조립 자세에 양팔, PincOpen 집게, 센서, 바퀴, 외장과 전면 화면을 표시합니다. 케이스 벗기기로 내부 골조와 IMU를 볼 수 있습니다. 배터리, 컴퓨터와 드라이버는 위치 개념으로 표시합니다.</p><h3>사양과 가격</h3><p>확정 수준은 각 부품의 근거 상태에 표시합니다. 판매처 참고가와 견적은 실제 결제 금액과 다릅니다. 미등록 금액은 0원으로 계산하지 않으며 참고 소계는 완성 로봇 가격이 아닙니다.</p><a class="source-link" href="${publicPath('/models/cleany.json')}" target="_blank" rel="noreferrer">모델 데이터 ↗</a></div></dialog>
 <div id="toast" class="toast" role="status" hidden></div>
 `;
 const list = document.querySelector<HTMLDivElement>('#parts-list')!;
@@ -132,7 +133,7 @@ function renderDetail(id: PartId): void {
     </div>
     <section id="detail-content" role="tabpanel" aria-labelledby="detail-tab-${detailTab}" class="${detailTab === 'ros' ? 'ros-content' : 'spec-content'}">${detailTab === 'specs' ? specs : ''}</section>`;
   detail.querySelector('.part-map-link')!.addEventListener('click', () => { setView('connections'); connectionMap.selectPart(id); });
-  detail.querySelector('[data-part-evidence]')?.addEventListener('click', () => showDetails(`${part.name} · 근거`, `<p>${part.geometry} · ${part.status}</p><a class="source-link" href="${part.source}" target="_blank" rel="noreferrer">사양 출처 ↗</a><h3>가격 기준</h3>${renderPriceEvidence(part)}`));
+  detail.querySelector('[data-part-evidence]')?.addEventListener('click', () => showDetails(`${part.name} · 근거`, `<p>${part.geometry} · ${part.status}</p><a class="source-link" href="${publicPath(part.source)}" target="_blank" rel="noreferrer">사양 출처 ↗</a><h3>가격 기준</h3>${renderPriceEvidence(part)}`));
   const switchDetailTab = (next: typeof detailTab) => { detailTab = next; renderDetail(selected); detail.querySelector<HTMLElement>(`#detail-tab-${next}`)?.focus(); };
   detail.querySelectorAll<HTMLButtonElement>('[data-detail-tab]').forEach(button => {
     button.addEventListener('click', () => switchDetailTab(button.dataset.detailTab as typeof detailTab));

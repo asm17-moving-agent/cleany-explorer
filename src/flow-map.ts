@@ -1,3 +1,4 @@
+import { publicPath } from './public-path';
 import { executionFlow, flowLabels, flowProfiles, type FlowId, type ExecutionFlow } from './ros-relations.ts';
 import { filterEndpoints, kindLabels, rosEvidence, environmentText, type Environment, type RosEndpoint } from './ros.ts';
 import { escapeHtml, openEndpoint } from './ros-panel.ts';
@@ -104,7 +105,7 @@ export function mountFlowMap(host: HTMLElement, notify: (text: string)=>void) {
     if (el.hasAttribute('data-flow-detail')) {openEndpoint(current().endpoint,current().derived?'ROS 자동 생성 계약 · 실시간 확인 아님':'',notify);return;}
     if (el.hasAttribute('data-flow-proof')) {
       const edge=flow.edges[selectedEdge];
-      showDetails('연결 근거 · '+edge.label,`<p>${escapeHtml(edge.condition)}</p><div class="ros-source-links">${edge.sources.map(key=>{const s=rosEvidence.sources[key];return `<a href="${s.href}" target="_blank" rel="noreferrer">${escapeHtml(s.path)} ↗</a>`;}).join('')}</div>`);return;
+      showDetails('연결 근거 · '+edge.label,`<p>${escapeHtml(edge.condition)}</p><div class="ros-source-links">${edge.sources.map(key=>{const s=rosEvidence.sources[key];return `<a href="${publicPath(s.href)}" target="_blank" rel="noreferrer">${escapeHtml(s.path)} ↗</a>`;}).join('')}</div>`);return;
     }
     if (el.dataset.flow) {id=el.dataset.flow as FlowId;selected='';}
     if (el.dataset.flowProfile) profileId=el.dataset.flowProfile;
