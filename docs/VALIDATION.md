@@ -1,6 +1,32 @@
 # 검증 기록
 
+각 기록은 표시된 날짜와 코드 상태에서 수행한 검사입니다. 과거 기록의 가격과 항목 수는 당시 기준이며 현재 데이터는 [데이터 기준](DATA.md)에서 확인합니다. 기록에 언급된 `artifacts/`와 다운로드 파일은 로컬 산출물로, 이 저장소에 포함되지 않습니다. 이전 Explorer 저장소의 커밋 번호는 당시 작업 이력을 식별합니다.
+
+## 최근 확인
+
+2026-11-09에 공개 저장소의 `b493ce9` 소스와 문서 정리 작업을 macOS arm64, Node.js 26.5.0 환경에서 확인했습니다.
+
+| 검사 | 결과 |
+| --- | --- |
+| `npm test` | 35개 통과 |
+| `npm run build` | TypeScript 검사와 Vite 빌드 통과 |
+| 빌드 메시지 | 지연 로딩되는 3D JavaScript 청크의 500kB 크기 권고가 표시됨 |
+
+이번 확인은 자동 검사와 빌드 기준입니다. ROS 실물 연결과 모바일 화면은 실행하지 않았습니다.
+
+## 기록 찾아보기
+
+| 주제 | 기록 |
+| --- | --- |
+| ROS 경로와 흐름 | [환경별 경로 정정](#부품-연관-및-환경별-경로-정정), [연관 관계와 실행 흐름](#ros-연관-관계와-실행-흐름), [전체 목록](#ros-전체-목록과-환경별-연결도), [부품별 ROS 연결](#부품별-ros-연결), [연결선 겹침 제거](#부품별-연결선-겹침-제거) |
+| CAD와 부품 | [초기 CAD 탐색](#초기-cad-탐색), [양팔 어깨](#양팔-고정-어깨-포함), [Pan/Tilt 분리](#헤드-pantilt-분리), [모터 분류 정정](#pantilt-모터-분류-정정), [Pan 하우징](#pan-모터-주변-하우징-포함) |
+| 화면과 성능 | [최적화](#최적화와-구형-구현-정리), [연결도와 가독성](#연결도와-가독성-개선), [한 화면 UI](#한-화면-중심-ui-개편), [토픽 목록](#토픽-목록과-비교표) |
+| 가격 | [사용자 제공 가격 반영](#사용자-제공-가격-반영) |
+
 ## 부품 연관 및 환경별 경로 정정
+
+<details>
+<summary>검증 내용 펼치기</summary>
 
 2026-11-02, macOS / Node.js 26.5.0 / Chrome 1800×987 및 1280×720에서 Explorer HEAD `8b3ddd4e05040bb1d4449f0847eb415f76afddbd` 이후 로컬 변경을 검증했다. 입력은 원본 Cleany 작업 트리이며 commit과 파일별 hash는 `src/data/ros-sources.json`에 기록한다. 원본 로봇 구현, KB와 CAD를 수정하거나 원격에 업로드하지 않았다.
 
@@ -17,7 +43,12 @@
 
 수정 전 점검은 `artifacts/ros-content-audit-2026-11-02.json`, 수정 후 행렬과 화면 결과는 `artifacts/ros-fixes-checks.json`에 보존한다. 화면 근거는 `artifacts/ros-fixed-wrist-mapping.png`와 `artifacts/ros-fixed-base-mock.png`다. 이 파일들은 로컬 검증 산출물이며 저장소에 포함하지 않는다.
 
+</details>
+
 ## ROS 연관 관계와 실행 흐름
+
+<details>
+<summary>검증 내용 펼치기</summary>
 
 2026-11-01, macOS / Node.js 26.5.0 / Codex in-app browser 1280×720에서 Explorer HEAD `8b3ddd4e05040bb1d4449f0847eb415f76afddbd` 이후 로컬 변경을 검증했다. 원본 Cleany HEAD는 `707538de9d28291c679fcfd954f5587368d5a460`이며 작업 트리의 실제 입력과 hash는 `src/data/ros-sources.json`에 기록한다. 원본 구현·KB와 CAD 파일은 수정하지 않았다.
 
@@ -33,13 +64,23 @@
 
 초기 검사에서 부품별 설명 투영과 캐시된 부품 집계의 불일치를 수정했다. 브라우저에서는 흐름을 바꿀 때 작업 공간 폭이 내용에 맞춰 줄어드는 현상과 액션 선택 후 상세 패널의 이전 스크롤 위치를 수정했다. 최종 검사는 모두 통과했으며 실물 ROS, DDS 연결과 모바일은 실행하지 않았다. 원본 화면과 검증 요약은 로컬 `artifacts/ros-flow-overview.png`, `artifacts/ros-flow-validation.png`, `artifacts/ros-flow-wrist.png`, `artifacts/ros-flow-action.png`, `artifacts/ros-flow-checks.json`에 보존한다.
 
+</details>
+
 ## 사용자 제공 가격 반영
+
+<details>
+<summary>검증 내용 펼치기</summary>
 
 2026-11-01, macOS / Node.js 26.5.0 / Codex in-app browser 1280×720에서 Explorer HEAD `8b3ddd4e05040bb1d4449f0847eb415f76afddbd` 이후 로컬 변경을 검증했다. 입력은 사용자 제공 VAT 포함 금액 D435 572,000원, 휠 179,520원, 엣지 컴퓨터 2,689,720원, 라이다 129,800원이다. 휠은 4개 세트 총액으로 적용했으며 단위 가정을 데이터 기준과 가격 비고에 명시했다.
 
 카탈로그 검사 6개, TypeScript 검사와 Vite build가 통과했다. 세트 금액을 한 번만 합산하고 기존 모터 금액을 더한 참고 소계 3,926,240원, 가격 등록 5개 및 미등록 7개 그룹을 확인했다. 비용표의 가격 단위와 VAT, 휠 상세의 사용자 제공일 및 판매처 URL 없는 근거 표시를 브라우저에서 확인했다. 실제 다운로드한 `~/Downloads/cleany-components-2026-11-01.csv`의 네 가격, 가격 단위, 소계와 VAT도 대조했다. 실패한 기능 검사는 없으며 기존 3D chunk 용량 권고 경고는 유지된다. 화면 근거는 로컬 `artifacts/prices-2026-11-01.png`에 보존한다. 모바일은 검사하지 않았다.
 
+</details>
+
 ## 최적화와 구형 구현 정리
+
+<details>
+<summary>검증 내용 펼치기</summary>
 
 2026-10-31, macOS arm64 / Node.js 26.5.0 / Codex in-app browser 1280×720에서 검증했다. Explorer HEAD `8b3ddd4e05040bb1d4449f0847eb415f76afddbd` 이후 로컬 변경이며 커밋하지 않았다. 원본 CAD와 ROS 데이터 파일은 갱신하지 않았다.
 
@@ -54,7 +95,12 @@
 
 구형 연결도 CSS 129개 규칙, 중복 선언 20개, 중복 ROS 타입 및 미사용 export, Python 캐시와 참조 없는 과거 테스트 캡처를 정리했다. 검증 과정의 JSON 비교는 `undefined` 필드가 직렬화에서 생략되어 첫 비교가 실패했으며, 양쪽을 같은 JSON 형식으로 비교한 결과 일치했다. 기능 회귀는 발견하지 않았다. 모바일과 실물 ROS는 이번 검증 대상이 아니다. 화면 근거는 로컬 `artifacts/cleanup-connections.png`, 측정값과 HTTP 요청 원본은 `artifacts/cleanup-checks.json`이다. 기존 검증 기록에서 참조하는 캡처는 유지한다.
 
+</details>
+
 ## 초기 CAD 탐색
+
+<details>
+<summary>검증 내용 펼치기</summary>
 
 2026-10-26, macOS arm64 / Node.js 26.5.0 / Codex in-app browser에서 검증했다. 검증한 기능 소스는 `077b2bd4eab85928177e7dd2fd5304f5dd210afd`이며 이후 변경은 이 기록의 추가다. 하드웨어 구동이나 현물의 사양 검증은 수행하지 않았다.
 
@@ -72,7 +118,12 @@
 
 원본 화면 기록은 로컬 `artifacts/desktop-explorer.png`와 `artifacts/mobile-cost.png`에 보존한다. 다운로드 결과는 `~/Downloads/cleany-components-2026-10-26.csv`에 있다. 화면 기록과 다운로드는 저장소에 포함하지 않는다.
 
+</details>
+
 ## 부품별 ROS 연결
+
+<details>
+<summary>검증 내용 펼치기</summary>
 
 2026-10-31, macOS / Node.js 26.5.0 / Codex in-app browser에서 로컬 변경을 검증했다. Explorer HEAD `8b3ddd4e05040bb1d4449f0847eb415f76afddbd` 이후 커밋하지 않은 변경이며 원본 Cleany checkout은 읽기 전용으로 사용했다. 참조한 ROS 소스는 `src/data/ros-sources.json`에 HEAD와 파일별 hash로 기록했다. 실물 ROS 및 시뮬레이터는 실행하지 않았다.
 
@@ -88,7 +139,12 @@
 
 화면 근거는 로컬 `artifacts/ros-desktop.png`와 `artifacts/ros-mobile.png`에 있다. 로컬 개발 서버는 사용자 확인을 위해 `127.0.0.1:5178`에서 유지한다. 원격 등록, 업로드, 배포와 ROS 명령 전송은 수행하지 않았다.
 
+</details>
+
 ## 연결도와 가독성 개선
+
+<details>
+<summary>검증 내용 펼치기</summary>
 
 2026-10-31에 같은 로컬 환경에서 연결도와 전체 UI 스타일 변경을 검증했다. 커밋과 배포는 수행하지 않았다.
 
@@ -107,8 +163,12 @@
 
 화면 기록은 `artifacts/connections-desktop.png`, `artifacts/connections-mobile.png`, `artifacts/readability-desktop.png`에 보존한다. 글꼴 크기, 대비, 패널 너비와 줄바꿈을 CSS에서 조정했으며 CAD 자산과 ROS 소스는 변경하지 않았다. 연결도는 코드 스냅샷의 논리 경로를 보여주며 실행 중인 로봇에 연결하지 않는다.
 
+</details>
 
 ## 한 화면 중심 UI 개편
+
+<details>
+<summary>검증 내용 펼치기</summary>
 
 2026-10-31, macOS / Node.js 26.5.0 / Codex in-app browser에서 Explorer HEAD `8b3ddd4e05040bb1d4449f0847eb415f76afddbd` 이후 로컬 변경을 검증했다. CAD와 ROS 근거 데이터는 기존 스냅샷을 유지했다.
 
@@ -126,8 +186,12 @@
 
 처음에는 3D ROS 상세에서 긴 이름과 복수 구독자가 최대 53px, 비용표가 164px 넘쳤다. 중복 헤더 정보와 표의 여백을 줄인 뒤 같은 입력으로 다시 확인했다. 작은 높이의 창, 확대된 글꼴과 긴 출처 문서는 필요한 패널 안에서 스크롤할 수 있다. 화면 근거는 로컬 `artifacts/workspace-desktop.png`, `artifacts/workspace-connections.png`, `artifacts/workspace-mobile.png`에 남긴다. 로컬 개발 서버는 `127.0.0.1:5178`에서 유지한다.
 
+</details>
 
 ## 토픽 목록과 비교표
+
+<details>
+<summary>검증 내용 펼치기</summary>
 
 2026-10-31, 같은 로컬 checkout과 브라우저에서 우측 ROS 선택기를 목록으로 교체한 변경을 검증했다. 토픽은 발행 → 구독, 서비스와 액션은 호출 → 제공 순서로 표시한다. 기존 CAD, 사양, 가격과 ROS 근거 데이터는 변경하지 않았다.
 
@@ -142,8 +206,12 @@
 
 최초 목록 배치에서 팔 경로의 종류 필터와 검색으로 25–38px의 내부 넘침이 있었다. 4개 이하 목록에서 불필요한 필터와 검색을 숨긴 뒤 6개 대표 경로 전체가 한 화면에 들어오는 것을 재확인했다. 많은 연결은 목록 내부와 펼쳐보기 표 안에서 스크롤한다. 화면 근거는 `artifacts/topics-desktop.png`와 `artifacts/topics-comparison.png`에 남겼다.
 
+</details>
 
 ## 양팔 고정 어깨 포함
+
+<details>
+<summary>검증 내용 펼치기</summary>
 
 2026-10-31에 `base_link`의 `Base.stl`과 `Base_Motor.stl` 네 형상을 좌우 팔로 재분류했다. 모델 가져오기 도구에도 같은 규칙을 적용했으며 STL, 관절, 위치, 자세와 소스 스냅샷 메타데이터는 유지했다.
 
@@ -156,7 +224,12 @@
 
 화면 근거는 `artifacts/shoulder-right.png`, `artifacts/shoulder-left.png`, `artifacts/shoulders-exploded.png`에 남겼다.
 
+</details>
+
 ## 헤드 Pan/Tilt 분리
+
+<details>
+<summary>검증 내용 펼치기</summary>
 
 2026-10-31, macOS / Node.js 26.5.0 / Codex in-app browser에서 Explorer HEAD `8b3ddd4e05040bb1d4449f0847eb415f76afddbd` 이후 로컬 변경을 검증했다. 입력은 기존 CAD 스냅샷과 동일 SHA-256의 실물 control profile이다. 원본 Cleany checkout과 STL은 수정하지 않았다.
 
@@ -170,7 +243,12 @@
 
 부품 추가 직후 개발 서버의 중간 변경 상태에서 분해 offset 누락 오류가 발생했다. 두 offset을 추가한 최종 코드로 새로고침한 뒤 선택·분해·연결도 왕복을 확인했으며 19:54 UTC 이후 브라우저 오류는 없었다. 모바일은 사용자 요청에 따라 검사하지 않았다. 화면 근거는 `artifacts/head-pan-tilt.png`, `artifacts/head-pan-tilt-exploded.png`, `artifacts/head-tilt-connections.png`에 남겼다.
 
+</details>
+
 ## Pan/Tilt 모터 분류 정정
+
+<details>
+<summary>검증 내용 펼치기</summary>
 
 2026-10-31, 같은 Explorer checkout과 macOS / Node.js 26.5.0 / 데스크톱 브라우저 1280×720에서 사용자 피드백을 재검증했다. 앞선 분리 검사는 URDF 링크 이름을 그대로 선택 그룹으로 취급해 모터의 기구적 역할을 놓쳤다. 모델의 각 메시를 원본 변환으로 배치해 확인한 결과, `top_base_link`의 `topbase2.stl`은 아래쪽 Pan 모터이고 `head_pan_link`의 `tophead4.stl`은 가로축 Tilt 모터다. 두 category를 각각 Pan과 Tilt로 정정했다. 최신 분류는 `docs/DATA.md`의 표를 따른다.
 
@@ -181,7 +259,12 @@
 
 화면 근거는 `artifacts/head-pan-corrected.png`, `artifacts/head-assemblies-corrected.png`, `artifacts/head-tilt-corrected.png`에 남겼다.
 
+</details>
+
 ## Pan 모터 주변 하우징 포함
+
+<details>
+<summary>검증 내용 펼치기</summary>
 
 2026-10-31, Explorer HEAD `8b3ddd4e05040bb1d4449f0847eb415f76afddbd` 이후 로컬 변경을 macOS / Node.js 26.5.0 / 데스크톱 브라우저 1280×720에서 확인했다. 사용자 요청에 따라 `cad_frame/topbase1.stl`의 상단 하우징을 Pan 선택 범위에 추가했다. 원본 메시의 Z=0.9675 m 이음선은 가로지르는 삼각형이 없어, 정점이나 STL을 재생성하지 않고 위·아래 면을 선택 영역으로 분리했다.
 
@@ -194,8 +277,12 @@
 
 화면 근거는 `artifacts/pan-housing-exploded.png`와 `artifacts/pan-housing.png`에 남겼다.
 
+</details>
 
 ## ROS 전체 목록과 환경별 연결도
+
+<details>
+<summary>검증 내용 펼치기</summary>
 
 2026-10-31, Explorer HEAD `8b3ddd4e05040bb1d4449f0847eb415f76afddbd` 이후 로컬 변경을 macOS / Node.js 26.5.0 / Vite 7.3.7 / in-app browser 1280×720에서 검증했다. 입력은 Cleany HEAD `707538de9d28291c679fcfd954f5587368d5a460`의 작업 트리이며 원본 파일과 발췌문 hash를 `src/data/ros-sources.json`에 남겼다. 원본 구현 checkout은 읽기만 했다.
 
@@ -213,8 +300,12 @@
 
 화면 근거: `artifacts/ros-complete-overview.png`, `artifacts/ros-real-arm-actions.png`. 실시간 ROS/DDS 및 실제 로봇은 연결하지 않았으며, 외부 패키지 전체 API와 사용자 remap 결과는 이 정적 목록의 검증 범위가 아니다.
 
+</details>
 
 ## 부품별 연결선 겹침 제거
+
+<details>
+<summary>검증 내용 펼치기</summary>
 
 2026-10-31, 같은 로컬 작업 트리와 데스크톱 1280×720에서 검증했다. 기존 종류별 평행 곡선을 부품별 수평선 하나로 바꾸고 중앙 노드의 연결 위치를 분리했다. 데이터와 부품 매핑은 유지했다.
 
@@ -222,3 +313,5 @@
 - 종류 선택: 서비스는 9개 부품의 파선과 서비스 목록, 액션은 3개 부품의 점선과 액션 목록 표시. 하단 버튼과 우측 필터 선택 동기화 확인.
 - 기존 연결도 검사 3개와 TypeScript/Vite build 통과. 기존 500kB chunk 권고 경고 유지. 모바일은 검사하지 않음.
 - 화면 근거: `artifacts/ros-clear-connections.png`.
+
+</details>
